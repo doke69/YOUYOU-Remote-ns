@@ -1,5 +1,6 @@
 #include "native_display.hpp"
 #include "media.hpp"
+#include "config_store.hpp"
 #include "diagnostics.hpp"
 #include <algorithm>
 #include <array>
@@ -209,13 +210,11 @@ struct Renderer {
 };
 std::unique_ptr<Renderer> renderer;
 bool requested() {
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");std::string line;
-    bool enabled=false;
-    while(std::getline(file,line)) {
-        const auto comment=line.find('#');if(comment!=line.npos) line.erase(comment);
-        line.erase(std::remove_if(line.begin(),line.end(),[](unsigned char c){return c==' '||c=='\t'||c=='\r';}),line.end());
-        if(line=="native_display=1") enabled=true;
-    }
+    // Native display is the default now. An explicit native_display=0 keeps
+    // the SDL fallback available for troubleshooting, and holding Minus at
+    // launch still bypasses native display without changing the config.
+    const auto configured=ConfigStore::instance().value("native_display");
+    bool enabled=configured!="0";
     PadState pad;padInitializeDefault(&pad);padUpdate(&pad);
     return enabled && !(padGetButtons(&pad)&HidNpadButton_Minus);
 }
@@ -267,7 +266,15 @@ int copy(SDL_Renderer *r,SDL_Texture *texture,const SDL_Rect *src,const SDL_Rect
     const auto &image=it->second;SDL_Rect all{0,0,image->width,image->height};
     renderer->textured(image,src?*src:all,dst?*dst:all,{255,255,255,255});return 0;
 }
-int vsync(SDL_Renderer *r,int enabled) {if(!renderer) return SDL_RenderSetVSync(r,enabled);return R_SUCCEEDED(nwindowSetSwapInterval(nwindowGetDefault(),enabled?1:0))?0:-1;}
+int vsync(SDL_Renderer *r,int enabled) {
+    if(!renderer) return SDL_RenderSetVSync(r,enabled);
+    // Keep both the window and the deko3d swapchain interval in sync. The
+    // latter is what deko3d consults when it queues/acquires present images;
+    // setting only the native window was leaving 720p handheld present loops
+    // unthrottled on some units (observed 120 Hz instead of 60 Hz).
+    renderer->swapchain.setSwapInterval(enabled?1u:0u);
+    return R_SUCCEEDED(nwindowSetSwapInterval(nwindowGetDefault(),enabled?1:0))?0:-1;
+}
 bool acceptVideo(const Picture &picture) {
     if(!renderer) return false;
     if(picture.hardwareFrame) {

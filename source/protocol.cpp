@@ -137,7 +137,10 @@ static void message(Bytes &b, int field, const Bytes &s) {
 static void text(Bytes &b, int field, const std::string &s) {
     message(b, field, Bytes(s.begin(), s.end()));
 }
-Bytes connectOptions(int w, int h, int fps, int quality) {
+Bytes connectOptions(int w, int h, int fps, int quality, int customMbps) {
+    if (quality < 1 || quality > 6 || customMbps < 0 || customMbps > 100 ||
+        (quality == 6 && customMbps == 0) || (quality != 6 && customMbps != 0))
+        throw std::invalid_argument("Invalid custom capture bitrate");
     Bytes resolution, capture, decoder, out;
     integer(resolution, 1, w);
     integer(resolution, 2, h);
@@ -147,6 +150,7 @@ Bytes connectOptions(int w, int h, int fps, int quality) {
     integer(capture, 4, 2);
     message(capture, 5, resolution);
     message(capture, 6, resolution);
+    if (quality == 6) integer(capture, 8, uint64_t(customMbps) * 1000000u);
     integer(decoder, 1, fps);
     integer(decoder, 2, 1);
     integer(decoder, 3, w);

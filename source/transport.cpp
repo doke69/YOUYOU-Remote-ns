@@ -133,6 +133,7 @@ void Api::login(const Json &result) {
     sessionSaved_=saveSession();
 }
 namespace {
+constexpr int kSessionVersion=2;
 constexpr const char *sessionPath=
 #ifdef __SWITCH__
     "sdmc:/switch/UURemote-ns/session.json";
@@ -144,7 +145,7 @@ bool Api::saveSession(){
     if(token_.empty() || user_.empty() || device_.empty())return false;
     const auto temp=std::string(sessionPath)+".tmp";
     try{
-        const auto bytes=Json{{"version",1},{"client",client_},{"device",device_},{"token",token_},{"user",user_},{"nickname",nickname_}}.dump();
+        const auto bytes=Json{{"version",kSessionVersion},{"client",client_},{"device",device_},{"token",token_},{"user",user_},{"nickname",nickname_}}.dump();
         std::ofstream file(temp,std::ios::binary|std::ios::trunc);file.write(bytes.data(),bytes.size());file.flush();
         const bool good=bool(file);file.close();
         if(!good || file.fail()){std::remove(temp.c_str());return false;}
@@ -160,11 +161,16 @@ bool Api::restoreSession(){
         char buffer[16385];file.read(buffer,sizeof buffer);const auto size=file.gcount();
         if(size<=0 || size>16384)return false;
         const auto saved=Json::parse(buffer,buffer+size,nullptr,false);
-        if(!saved.is_object() || saved.value("version",0)!=1 || saved.value("client",std::string{})!=client_)return false;
+        if(!saved.is_object())return false;
+        const int version=saved.value("version",0);
+        if(version<1 || version>kSessionVersion)return false;
+        if(saved.value("client",std::string{})!=client_)return false;
         auto bounded=[&](const char *key,size_t limit){auto it=saved.find(key);return it!=saved.end() && it->is_string() && !it->get_ref<const std::string&>().empty() && it->get_ref<const std::string&>().size()<=limit;};
         if(!bounded("token",8192)||!bounded("user",256)||!bounded("device",256)||!bounded("nickname",512))return false;
         token_=saved["token"].get<std::string>();user_=saved["user"].get<std::string>();device_=saved["device"].get<std::string>();nickname_=saved["nickname"].get<std::string>();
-        sessionSaved_=true;return true;
+        sessionSaved_=true;
+        if(version<kSessionVersion)saveSession();
+        return true;
     }catch(...){return false;}
 }
 void Api::logout(){

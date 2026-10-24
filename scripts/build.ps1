@@ -1,4 +1,5 @@
-param([string]$Apk = $env:UU_REFERENCE_APK, [int]$Jobs = 6)
+param([string]$Apk = $env:UU_REFERENCE_APK, [int]$Jobs = 6,
+      [ValidateSet('ON','OFF')][string]$MediaDispatch='ON', [switch]$PrivatePackage)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
@@ -28,12 +29,21 @@ try {
     }
     if (-not $cmakeExe) { throw 'CMake not found: install CMake 3.21+ or place it under .tools/.' }
     $configure = @('-S', '.', '-B', 'build-nx', '-G', 'Ninja', '-DCMAKE_TOOLCHAIN_FILE=cmake/switch.cmake', '-DCMAKE_BUILD_TYPE=Release')
+    $version=[regex]::Match((Get-Content CMakeLists.txt -Raw),'project\(UURemote-ns VERSION ([\d.]+)').Groups[1].Value
+    if(!$version){throw 'Cannot determine source version'}
+    $configure += @("-DUU_BUILD_LABEL=$version","-DUU_MEDIA_DISPATCH=$MediaDispatch",'-DUU_SRTP_MBEDTLS=ON',
+        '-DUU_RECOVERY_FOCUS=OFF','-DUU_SWITCH_BATCH_RX=OFF','-DUU_RECEIVE_TIMESTAMPS=OFF',
+        '-DUU_TWCC_FOUNDATION=OFF','-DUU_TWCC_OBSERVE_CLIENT=OFF','-DUU_TWCC_SEND_EXPERIMENT=OFF')
     $localNinja = Join-Path $projectRoot '.tools/ninja/ninja.exe'
     if (Test-Path -LiteralPath $localNinja) { $configure += "-DCMAKE_MAKE_PROGRAM=$($localNinja.Replace('\','/'))" }
     & $cmakeExe @configure
     if ($LASTEXITCODE) { throw 'CMake configuration failed' }
     & $cmakeExe --build build-nx -j $Jobs
     if ($LASTEXITCODE) { throw 'Switch build failed' }
-    python scripts/package.py
-    if ($LASTEXITCODE) { throw 'Packaging failed' }
+    if($PrivatePackage){
+        python scripts/package.py --allow-private-signing-material
+        if ($LASTEXITCODE) { throw 'Packaging failed' }
+    }else{
+        Write-Output 'Local NRO built. It embeds locally supplied authentication material; no distribution ZIP generated.'
+    }
 } finally { Pop-Location }

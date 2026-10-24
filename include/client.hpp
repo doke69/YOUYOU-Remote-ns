@@ -9,10 +9,19 @@
 #include <rtc/rtc.hpp>
 #include <set>
 #include <optional>
+#ifdef UU_TWCC_OBSERVE_CLIENT
+#include "transport_feedback_attachment.hpp"
+#endif
 
 namespace uu {
 class TurnStreamBridge;
 struct Snapshot {
+    bool textPending=false;
+    uint64_t textRevision=0;
+    int textResult=0; // 0=idle, 1=pending, 2=paste submitted, 3=failed/cancelled.
+    std::string textNotice;
+    std::string activeDeviceId; // Session identity only; never a login credential.
+    bool textChannelReady=false;
     std::string stage = "idle", detail = "按 A 扫码登录，或按 X 使用短信验证码", qrUrl, nickname;
     Json devices = Json::array();
     bool authenticated = false, streaming = false;
@@ -44,6 +53,12 @@ class Client {
     std::unique_ptr<Api> api_;
     std::unique_ptr<SignalSocket> socket_;
     std::shared_ptr<rtc::PeerConnection> peer_;
+#ifdef UU_TWCC_OBSERVE_CLIENT
+    std::optional<twcc::NegotiationCapabilities> feedbackLocalCaps_, feedbackRemoteCaps_;
+    std::shared_ptr<twcc::FeedbackAttachment> feedbackObservation_;
+    void stopFeedbackObservation();
+    void refreshFeedbackObservation();
+#endif
     std::vector<std::shared_ptr<TurnStreamBridge>> turnBridges_;
     std::string turnUplinkMode_="udp";
     rtc::PeerConnection::IceState iceState_ = rtc::PeerConnection::IceState::New;
@@ -55,6 +70,10 @@ class Client {
     int nextAck_ = 1;
     std::map<int, std::string> acks_;
     std::set<int> heldKeys_, heldButtons_;
+    std::map<int,std::set<std::string>> mouseOwners_;
+    struct PendingText {uint64_t id;int64_t deadline;};
+    std::optional<PendingText> pendingText_;
+    void finishTextInput(int result,const char *notice);
     bool gamepadConnected_=false,nativeTouchActive_=false;
     uint64_t touchPackets_=0,touchFailures_=0;unsigned touchPoints_=0;
     std::deque<Json> earlySoac_;

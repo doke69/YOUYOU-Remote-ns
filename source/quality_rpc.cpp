@@ -51,18 +51,70 @@ Bytes simpleActionMessage(uint64_t seq,unsigned action,std::optional<bool> enabl
         action==16 || action==17 || action==18 || action==19) || (action==19)!=enabled.has_value())
         throw std::invalid_argument("Invalid system action");
     Bytes body,out;integer(body,1,action);
-    if(enabled)integer(body,5,*enabled?1:0);
+    // Mobile AutoLockScreen.h / G6 adapter: 1=enable, 2=disable; 0 is unspecified.
+    if(enabled)integer(body,5,*enabled?1:2);
     integer(out,1,seq);integer(out,2,nowMs());message(out,3,body);return out;
 }
-Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenId){
+Bytes clipboardTextRpc(uint64_t id,const std::string &text){
+    if(!id || text.empty() || text.size()>2048 || text.find('\0')!=std::string::npos)
+        throw std::invalid_argument("Invalid text input size");
+    // Validate UTF-8 before encoding a protobuf string; do not log its contents.
+    for(size_t i=0;i<text.size();){
+        const unsigned c=uint8_t(text[i++]);if(c<0x80)continue;
+        unsigned n=0,cp=0,min=0;
+        if(c>=0xc2 && c<=0xdf){n=1;cp=c&31;min=0x80;}
+        else if(c>=0xe0 && c<=0xef){n=2;cp=c&15;min=0x800;}
+        else if(c>=0xf0 && c<=0xf4){n=3;cp=c&7;min=0x10000;}
+        else throw std::invalid_argument("Invalid text encoding");
+        if(i+n>text.size())throw std::invalid_argument("Truncated text encoding");
+        while(n--){const unsigned b=uint8_t(text[i++]);if((b&0xc0)!=0x80)throw std::invalid_argument("Invalid text encoding");cp=(cp<<6)|(b&63);}
+        if(cp<min || cp>0x10ffff || (cp>=0xd800 && cp<=0xdfff))throw std::invalid_argument("Invalid text codepoint");
+    }
+    // Mobile ClipboardTextChangeReq: Main21 -> RpcRequest10 -> {type1=1,text2}.
+    Bytes change,header,rpc,out;integer(change,1,1);
+    message(change,2,Bytes(text.begin(),text.end()));integer(header,1,id);
+    message(rpc,1,header);message(rpc,10,change);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
+std::optional<TextRpcAck> parseTextRpcAck(const uint8_t *data,size_t size)noexcept{
+    if(!data || !size || size>65536)return {};
+    TextRpcAck out;bool response=false,header=false,id=false,body=false,status=false;
+    Reader outer(data,size);Field f;
+    while(outer.next(f))if(f.key==22){
+        if(response || f.wire!=2)return {};response=true;
+        Reader rpc(f.data,f.size);Field r;
+        while(rpc.next(r)){
+            if(r.key==1){
+                if(header || r.wire!=2)return {};header=true;
+                Reader h(r.data,r.size);Field v;
+                while(h.next(v))if(v.key==1){if(id || v.wire!=0 || !v.value)return {};id=true;out.requestId=v.value;}
+                if(!h.good())return {};
+            }else if(r.key==6){
+                if(body || r.wire!=2)return {};body=true;
+                Reader b(r.data,r.size);Field v;
+                while(b.next(v))if(v.key==1){if(status || v.wire!=0 || v.value>2)return {};status=true;out.status=unsigned(v.value);}
+                if(!b.good())return {};
+            }
+        }
+        if(!rpc.good())return {};
+    }
+    // CB_UNSPECIFIED=0 is never treated as success. CB_SUCCEEDED=1, FAILED=2.
+    if(!outer.good() || !response || !header || !id || !body)return {};
+    return out;
+}
+Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenId,int customMbps){
     if(!id || screenId<0 || !((w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080)) ||
-       (fps!=30&&fps!=60) || quality<1 || quality>5)throw std::invalid_argument("Invalid capture settings");
+       (fps!=30&&fps!=60) || quality<1 || quality>6 || customMbps<0 || customMbps>100 ||
+       (quality==6 && customMbps==0) || (quality!=6 && customMbps!=0))throw std::invalid_argument("Invalid capture settings");
     Bytes capture,header,rpc,out;
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
     // Connect auto-selection (-1) is not a valid online target. Use the
     // current ID advertised in Main.screens and validated against its list.
     integer(capture,4,unsigned(screenId));integer(capture,5,w);integer(capture,6,h);
-    // Do not guess private custom-bitrate units or change chroma settings.
+    // TV wire field 8; mobile custom-state -> capture uses bits/second.
+    // Keep chroma settings unchanged and do not treat this request as a
+    // guarantee that a static scene will generate the requested rate.
+    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
     integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
     integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
 }

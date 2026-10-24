@@ -25,3 +25,13 @@ diag/
 *.xci
 *.apk
 *.dksh
+*.nca
+*.nso
+*.npdm
+*.pfs0
+*.zip
+session.json*
+ui-state.json*
+telemetry.ini*
+*.pcap
+*.pcapng

@@ -1,10 +1,14 @@
 #include "background.hpp"
 #include "client.hpp"
+#include "config_store.hpp"
+#include "cpu_diagnostics.hpp"
 #include "diagnostics.hpp"
+#include "device_selection.hpp"
 #include "live_telemetry.hpp"
 #include "native_display.hpp"
 #include "qrcodegen.hpp"
 #include "rtc_diagnostics.hpp"
+#include "runtime_profile.hpp"
 #include <SDL_ttf.h>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +18,8 @@
 #include <memory>
 #include <list>
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <optional>
 #include <vector>
 #include <sys/stat.h>
@@ -51,10 +57,12 @@ void rect(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c) {
     SDL_Rect a{x, y, w, h};
     uu::display::fillRect(r, &a);
 }
+namespace tvui { void rounded(SDL_Renderer*,SDL_Rect,SDL_Color,int); }
 // Bounded LRU: avoid rasterizing CJK and allocating GPU textures every frame.
 struct TextEntry {
     SDL_Renderer *renderer; TTF_Font *font; std::string value; Uint32 tint;
     SDL_Texture *texture; int width, height; size_t bytes;
+    int inkTop=0,inkHeight=0;
 };
 std::list<TextEntry> textCache;
 size_t textCacheBytes=0;
@@ -62,27 +70,48 @@ void clearTextCache() {
     for(auto &entry:textCache) uu::display::destroyTexture(entry.texture);
     textCache.clear();textCacheBytes=0;
 }
-void text(SDL_Renderer *r, TTF_Font *f, const std::string &s, int x, int y, SDL_Color c = white,
-          int maxWidth = 1200) {
-    if(s.empty()) return;
+const TextEntry *cachedText(SDL_Renderer *r,TTF_Font *f,const std::string &s,SDL_Color c) {
+    if(s.empty()) return nullptr;
     const Uint32 tint=(Uint32(c.r)<<24)|(Uint32(c.g)<<16)|(Uint32(c.b)<<8)|c.a;
     auto entry=std::find_if(textCache.begin(),textCache.end(),[&](const TextEntry &e){
         return e.renderer==r && e.font==f && e.tint==tint && e.value==s;
     });
     if(entry==textCache.end()) {
         auto *surface=TTF_RenderUTF8_Blended(f,s.c_str(),c);
-        if(!surface) return;
+        if(!surface) return nullptr;
+        int inkTop=0,inkHeight=surface->h;
+        const bool mustLock=SDL_MUSTLOCK(surface);
+        if(surface->format->BytesPerPixel==4 && surface->format->Amask &&
+           (!mustLock || SDL_LockSurface(surface)==0)) {
+            auto inkRow=[&](int y) {
+                const auto *pixels=reinterpret_cast<const Uint32*>(
+                    static_cast<const Uint8*>(surface->pixels)+y*surface->pitch);
+                for(int x=0;x<surface->w;++x)
+                    if(pixels[x]&surface->format->Amask)return true;
+                return false;
+            };
+            int bottom=surface->h;
+            while(inkTop<bottom && !inkRow(inkTop))++inkTop;
+            while(bottom>inkTop && !inkRow(bottom-1))--bottom;
+            inkHeight=bottom-inkTop;
+            if(mustLock)SDL_UnlockSurface(surface);
+        }
         auto *texture=uu::display::textureFromSurface(r,surface);
         const int w=surface->w,h=surface->h;SDL_FreeSurface(surface);
-        if(!texture) return;
+        if(!texture) return nullptr;
         const size_t bytes=size_t(w)*h*4;
         while(!textCache.empty() && (textCache.size()>=192 || textCacheBytes+bytes>8u*1024u*1024u)) {
             textCacheBytes-=textCache.back().bytes;
             uu::display::destroyTexture(textCache.back().texture);textCache.pop_back();
         }
-        textCache.push_front({r,f,s,tint,texture,w,h,bytes});textCacheBytes+=bytes;
+        textCache.push_front({r,f,s,tint,texture,w,h,bytes,inkTop,inkHeight});textCacheBytes+=bytes;
     } else textCache.splice(textCache.begin(),textCache,entry);
-    const auto &e=textCache.front();
+    return &textCache.front();
+}
+void text(SDL_Renderer *r, TTF_Font *f, const std::string &s, int x, int y, SDL_Color c = white,
+          int maxWidth = 1200) {
+    const auto *entry=cachedText(r,f,s,c);if(!entry)return;
+    const auto &e=*entry;
     SDL_Rect src{0,0,std::min(e.width,maxWidth),e.height};
     SDL_Rect dst{x,y,src.w,src.h};uu::display::copy(r,e.texture,&src,&dst);
 }
@@ -123,7 +152,7 @@ void statsPanel(SDL_Renderer *renderer, TTF_Font *font, const uu::StreamStatsSna
     constexpr int x = 40, y = 92, width = 1160, height = 448;
     rect(renderer, x, y, width, height, {10, 15, 22, 232});
     rect(renderer, x, y, width, 2, accent);
-    text(renderer, font, "网络信息（B / R3 关闭）", x + 20, y + 12, accent);
+    text(renderer, font, "网络信息（B 关闭）", x + 20, y + 12, accent);
     rect(renderer,940,98,240,38,{49,53,60,255});
     text(renderer,font,persistent?"A 常驻信息：开":"A 常驻信息：关",950,103,white,220);
     const int lineX = x + 20, labelWidth = 96;
@@ -176,21 +205,47 @@ void statsPanel(SDL_Renderer *renderer, TTF_Font *font, const uu::StreamStatsSna
                         formatPercent(s.audio.lossPercent);
     line("音频", audio);
 }
-// Bounded cached text using the same live statistics as the detailed panel.
-// Frame rate means submitted frames here, never the sender/game frame rate.
-void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamStatsSnapshot &s,int quality) {
-    constexpr int x=874,y=506,w=402,h=187;
-    rect(renderer,x,y,w,h,{0,0,0,102});
-    const SDL_Color normal{199,199,199,166},warning{253,138,0,210},bad{250,75,90,225};
+// Compact bottom-left overlay with a subdued backdrop:
+// session time, transport, fps, realtime video Mbps, RTT, frame time, loss,
+// configured video bitrate.
+void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamStatsSnapshot &s,
+                        Uint32 elapsedSeconds) {
+    const SDL_Color normal{235,235,235,240},warning{253,138,0,235},bad{250,75,90,235};
     auto number=[](double v){if(v<0)return std::string("--");char out[32];std::snprintf(out,sizeof out,"%.1f",v);return std::string(out);};
-    const auto delay=s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("--");
-    (void)quality;
-    text(renderer,font,s.transport,x+8,y+8,normal,w-24);
-    text(renderer,font,number(s.presentFps)+" fps  "+formatMbps(s.video.bitrateMbps),x+8,y+36,normal,w-24);
-    text(renderer,font,delay+"  -- ms",x+8,y+64,s.rttMs>=150?bad:s.rttMs>=100?warning:normal,w-24);
-    text(renderer,font,formatPercent(s.video.lossPercent),x+8,y+92,s.video.lossPercent>=10?bad:s.video.lossPercent>=5?warning:normal,w-24);
-    text(renderer,font,number(s.decodeFps)+" fps  "+formatMillis(s.decodeMs),x+8,y+120,normal,w-24);
-    text(renderer,font,std::to_string(s.width)+"x"+std::to_string(s.height),x+8,y+148,normal,w-24);
+    auto duration=[&](Uint32 seconds){char out[32];std::snprintf(out,sizeof out,"%02u:%02u:%02u",
+        unsigned(seconds/3600),unsigned((seconds/60)%60),unsigned(seconds%60));return std::string(out);};
+    std::string path="UDP";
+    if(s.transport.find("私网地址直连")!=std::string::npos || s.transport.find("局域网直连")!=std::string::npos)path="UDP LAN";
+    else if(s.transport.find("TURN")!=std::string::npos || s.transport.find("远端中继")!=std::string::npos)path="TURN";
+    else if(s.transport.find("P2P")!=std::string::npos || s.transport.find("公网")!=std::string::npos)path="UDP WAN";
+    struct Row{std::string text;SDL_Color color;};
+    const Row rows[8]={
+        {duration(elapsedSeconds),normal},
+        {path,normal},
+        {number(s.presentFps)+" fps",normal},
+        {formatMbps(s.video.bitrateMbps),normal},
+        {s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("-- ms"),normal},
+        {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm.",normal},
+        {formatPercent(s.video.lossPercent)+" loss",
+            s.video.lossPercent>=10?bad:s.video.lossPercent>=5?warning:normal},
+        {s.maxBitrateMbps>0?std::to_string(s.maxBitrateMbps)+" Mbps":std::string("-- Mbps"),normal},
+    };
+    std::string display[8];int maxWidth=0;
+    for(int i=0;i<8;++i){
+        display[i]=rows[i].text;int w=0,h=0;if(TTF_SizeUTF8(font,display[i].c_str(),&w,&h)!=0)continue;
+        while(w>300 && !display[i].empty()){
+            size_t n=display[i].size()-1;while(n>0 && (static_cast<unsigned char>(display[i][n])&0xc0)==0x80)--n;
+            display[i].resize(n);TTF_SizeUTF8(font,display[i].c_str(),&w,&h);
+        }
+        maxWidth=std::max(maxWidth,w);
+    }
+    const int lineHeight=std::max(24,TTF_FontHeight(font)+2);
+    constexpr int lineCount=8,padX=12,padY=10;
+    const int panelW=std::min(340,maxWidth+padX*2),panelH=lineCount*lineHeight+padY*2;
+    const int panelX=16,panelY=720-16-panelH;
+    tvui::rounded(renderer,{panelX,panelY,panelW,panelH},SDL_Color{0,0,0,115},5);
+    for(int i=0;i<8;++i)
+        text(renderer,font,display[i],panelX+padX,panelY+padY+i*lineHeight,rows[i].color,panelW-padX*2);
 }
 std::optional<std::string> numericInput(const char *title, const std::string &value, int minimum,
                                         int maximum) {
@@ -219,6 +274,27 @@ std::optional<std::string> numericInput(const char *title, const std::string &va
     return std::nullopt;
 #endif
 }
+std::optional<std::string> textInput(const std::string &value) {
+#ifdef __SWITCH__
+    // One explicit native editor, never SDL's inline keyboard plus our own UI.
+    SDL_StopTextInput();
+    SwkbdConfig keyboard{};
+    if(R_FAILED(swkbdCreate(&keyboard,0)))return std::nullopt;
+    swkbdConfigMakePresetDefault(&keyboard);
+    swkbdConfigSetType(&keyboard,SwkbdType_Normal);
+    swkbdConfigSetHeaderText(&keyboard,"输入发送到电脑的文字");
+    swkbdConfigSetInitialText(&keyboard,value.c_str());
+    swkbdConfigSetStringLenMax(&keyboard,512);
+    swkbdConfigSetOkButtonText(&keyboard,"完成");
+    std::array<char,2049> buffer{};
+    const auto result=swkbdShow(&keyboard,buffer.data(),buffer.size());
+    swkbdClose(&keyboard);
+    if(R_FAILED(result))return std::nullopt;
+    return std::string(buffer.data());
+#else
+    (void)value;return std::nullopt;
+#endif
+}
 struct SmsForm {
     std::string country = "86", mobile, code;
     int selected = 1;
@@ -227,33 +303,56 @@ struct SmsForm {
     }
 };
 struct Fonts {
-    TTF_Font *normal = nullptr, *small = nullptr, *large = nullptr, *hint = nullptr;
+    // Keep both files in memory for the complete lifetime of all font faces.
+    // FreeType seeks/reads its stream during layout as well as rasterization.
+    std::vector<unsigned char> regularBytes, boldBytes;
+    TTF_Font *normal = nullptr, *small = nullptr, *large = nullptr, *hint = nullptr,
+             *brand = nullptr;
     Fonts() {
 #ifdef __SWITCH__
-        PlFontData data{};
-        if (R_FAILED(plGetSharedFontByType(&data, PlSharedFontType_ChineseSimplified)))
-            throw std::runtime_error("Cannot load system font");
-        auto load = [&](int size) {
-            return TTF_OpenFontRW(SDL_RWFromConstMem(data.address, int(data.size)), 1, size);
-        };
+        const std::string root="romfs:/fonts/";
 #else
-        const char *env = std::getenv("UU_FONT");
-        std::string path = env ? env : "C:/Windows/Fonts/msyh.ttc";
-        auto load = [&](int size) { return TTF_OpenFont(path.c_str(), size); };
+        // Packaged desktop builds use RomFS; source-tree previews use assets.
+        const std::string root=std::ifstream("romfs/fonts/NotoSansSC-Regular.otf").good()
+                                   ? "romfs/fonts/" : "assets/fonts/";
 #endif
+        auto readFont=[](const std::string &path) {
+            std::ifstream file(path,std::ios::binary|std::ios::ate);
+            if(!file)throw std::runtime_error("Cannot open bundled font");
+            const auto length=file.tellg();
+            if(length<=0 || length>32*1024*1024)
+                throw std::runtime_error("Invalid bundled font size");
+            std::vector<unsigned char> bytes(static_cast<size_t>(length));
+            file.seekg(0);
+            if(!file.read(reinterpret_cast<char*>(bytes.data()),std::streamsize(bytes.size())))
+                throw std::runtime_error("Cannot read bundled font");
+            return bytes;
+        };
+        regularBytes=readFont(root+"NotoSansSC-Regular.otf");
+        boldBytes=readFont(root+"NotoSansSC-Bold.otf");
+        auto load = [&](int size) {
+            return TTF_OpenFontRW(SDL_RWFromConstMem(regularBytes.data(),int(regularBytes.size())),1,size);
+        };
         normal = load(26);
         small = load(21);
         large = load(48);
         hint = load(16);
-        if (!normal || !small || !large || !hint)
-            throw std::runtime_error(TTF_GetError());
+        brand = TTF_OpenFontRW(SDL_RWFromConstMem(boldBytes.data(),int(boldBytes.size())),1,34);
+        if (!normal || !small || !large || !hint || !brand) {
+            const std::string error=TTF_GetError();
+            close();
+            throw std::runtime_error("Cannot load bundled Noto Sans SC font: "+error);
+        }
     }
-    ~Fonts() {
-        TTF_CloseFont(normal);
-        TTF_CloseFont(small);
-        TTF_CloseFont(large);
-        TTF_CloseFont(hint);
+    void close() {
+        for(auto **font:{&normal,&small,&large,&hint,&brand}) {
+            if(*font)TTF_CloseFont(*font);
+            *font=nullptr;
+        }
     }
+    ~Fonts() { close(); }
+    Fonts(const Fonts&)=delete;
+    Fonts& operator=(const Fonts&)=delete;
 };
 std::string read(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
@@ -262,6 +361,7 @@ std::string read(const std::string &path) {
 #include "tv_frontend.inc"
 #include "live_frontend.inc"
 #include "touch_gestures.inc"
+#include "phone_mouse.inc"
 #include "native_touch.inc"
 
 std::optional<uu::Json> qualityMenu(SDL_Renderer *renderer, Fonts &fonts, const uu::Snapshot &state) {
@@ -408,7 +508,21 @@ int main(int, char **) {
         consoleExit(nullptr);
         return 0;
     }
-    socketInitializeDefault();
+    // Reserve the BSD backing pool before sockets are created. Raising only
+    // SO_RCVBUF later failed with ENOBUFS and left the video socket at 0xA500.
+    // Keep TCP, session count and efficiency defaults; libnx sizes the backing
+    // transfer memory from this configuration (about 10MiB with current SDK).
+    SocketInitConfig streamSockets = *socketGetDefaultInitConfig();
+    streamSockets.udp_rx_buf_size = 1u << 20;
+    streamSockets.udp_tx_buf_size = 1u << 20;
+    Result socketResult = socketInitialize(&streamSockets);
+    if (R_FAILED(socketResult)) {
+        uu::diagnostic(("bsd-stream-pool-init-failed-" + std::to_string(socketResult)).c_str());
+        // A bounded fallback keeps login usable if the larger pool cannot be
+        // allocated. Actual per-socket telemetry will expose the smaller pool.
+        socketResult = socketInitializeDefault();
+        if (R_SUCCEEDED(socketResult)) uu::diagnostic("bsd-stream-pool-default-fallback");
+    } else uu::diagnostic("bsd-stream-pool-udp-rx-tx-1048576");
     nifmInitialize(NifmServiceType_User);
     sslInitialize(0);
     romfsInit();
@@ -447,11 +561,17 @@ int main(int, char **) {
 #endif
     int result = 0;
     try {
+#ifdef __SWITCH__
+        if (R_FAILED(socketResult))
+            throw std::runtime_error("Network initialization failed (code " + std::to_string(socketResult) + ")");
+#endif
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
             throw std::runtime_error(SDL_GetError());
         if (TTF_Init() != 0)
             throw std::runtime_error(TTF_GetError());
         curl_global_init(CURL_GLOBAL_DEFAULT);
+        uu::ensureDefaultConfig();
+        uu::ConfigStore::instance().reload();
         {
 #ifdef __SWITCH__
             // Docked/TV mode uses a 1080p window; handheld (and Switch Lite,
@@ -527,6 +647,17 @@ int main(int, char **) {
             if (key.size() != 24)
                 throw std::runtime_error("Missing signing.key: run scripts/extract_key.py and rebuild");
             uu::diagnostic("app-start-" UU_VERSION);
+            uu::diagnostic("ui-font-source-memory");
+#ifdef UU_SRTP_MBEDTLS
+            uu::diagnostic("srtp-payload-backend-mbedtls");
+#ifdef UU_SWITCH_BATCH_RX
+            uu::diagnostic("udp-receive-mode-batch-experimental");
+#else
+            uu::diagnostic("udp-receive-mode-single");
+#endif
+#else
+            uu::diagnostic("srtp-payload-backend-portable");
+#endif
 #ifdef __SWITCH__
             uu::diagnostic(("console-" + productModelText + "-" + operationModeLabel() + "-fw" +
                             (firmwareText.empty() ? std::string("?") : firmwareText))
@@ -559,7 +690,9 @@ int main(int, char **) {
                 media->setYuvOutput(nativeNv12);
                 media->setNativeOutput(uu::display::active());
                 uu::diagnostic(nativeNv12?"display-native-nv12-enabled":"display-native-nv12-unavailable-rgba");
+                uu::diagnostic(uu::display::active()?"display-native-output=1":"display-native-output=0");
                 uu::LiveTelemetry telemetry;
+                Uint32 lastCpuLedgerSample=0;
                 Uint32 texFormat=0;
                 bool actualVsync=(rendererInfo.flags & SDL_RENDERER_PRESENTVSYNC)!=0;
                 const bool requestedVsync=client.snapshot().vsync;
@@ -572,17 +705,24 @@ int main(int, char **) {
                      statsVisible = false, persistentNetwork = false;
                 int selected = 0, texW = 0, texH = 0;
                 uint64_t serial = 0, lastHeld = 0;
+                // One transient NV12 import failure must not permanently switch
+                // the session to the CPU conversion path. Retry a few frames,
+                // then latch the existing fallback for this session.
+                unsigned nativeImportFailures = 0;
+                bool nativeFallback = false;
                 unsigned lastArrowMask=0;
                 bool nativePadRequested=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
                 Uint32 nativePadSentAt=0,plusAt=0,minusAt=0;std::string lastNativePad;
+                bool homePlusPending=false;Uint32 homePlusAt=0;
                 auto padPacket=[&](uint32_t buttons,int lx,int ly,int rx,int ry,int lt,int rt){
                     return uu::Json{{"action","gpd_update"},{"index",0},{"buttons",buttons},{"left_trigger",lt},{"right_trigger",rt},
                         {"left_thumb_x",lx},{"left_thumb_y",ly},{"right_thumb_x",rx},{"right_thumb_y",ry}};
                 };
-                StreamTouch streamTouch;NativeTouch nativeTouch;
+                StreamTouch streamTouch;NativeTouch nativeTouch;PhoneMouse phoneMouse;
                 float cursorX = .5f, cursorY = .5f, focusY = 230;
                 Uint32 previous = SDL_GetTicks(), lastScroll = 0, lastPointer = 0;
                 Uint32 presentWindow=SDL_GetTicks();
+                Uint32 streamingSince=0;
                 uint64_t presentedFrames=0;
                 double presentFps=-1;
                 const double counterToUs=1000000.0/SDL_GetPerformanceFrequency();
@@ -595,6 +735,7 @@ int main(int, char **) {
                 uint64_t leadSamples=0;
                 double cpuUs=0,uploadUs=0,presentUs=0,maxCpuUs=0;
                 uint64_t renderLoops=0,uploadCount=0,slowLoops=0;
+                uint64_t lastDecoded=0,lastPublished=0,lastSelected=0,lastEmpty=0,lastNoReady=0,lastFuture=0;
                 uu::StreamStatsSnapshot panelStats; Uint32 panelStatsAt=0;
                 SDL_Texture *video = nullptr;
                 std::string qrUrl;
@@ -630,7 +771,7 @@ int main(int, char **) {
                         if (event.type == SDL_WINDOWEVENT &&
                             event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                             client.command("release");
-                            streamTouch.cancel(send);nativeTouch.cancel(send);minusPending=false;
+                            streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;homePlusPending=false;
                             touchHeld = false;
                         }
                         if (event.type == SDL_KEYDOWN && !event.key.repeat) {
@@ -686,7 +827,20 @@ int main(int, char **) {
                     c.up |= pressed & HidNpadButton_Up;
                     c.down |= pressed & HidNpadButton_Down;
                     c.left|=pressed&HidNpadButton_Left;c.right|=pressed&HidNpadButton_Right;
-                    if(!liveUi.gamepadMode())c.help |= pressed & HidNpadButton_Plus;
+                    // Exit only from the home page and only after a fresh hold.
+                    // Leave the normal scope so Client/Media/GPU cleanup runs
+                    // before libnx returns control to the launching loader.
+                    const bool homeExitAllowed=state.authenticated && !state.streaming && liveUi.atHome();
+                    if(homeExitAllowed) {
+                        if(pressed&HidNpadButton_Plus){homePlusPending=true;homePlusAt=now;}
+                        if(!(c.held&HidNpadButton_Plus))homePlusPending=false;
+                        if(homePlusPending && Uint32(now-homePlusAt)>=850) {
+                            uu::diagnostic("home-hold-plus-normal-exit");
+                            running=false;
+                            break;
+                        }
+                    } else homePlusPending=false;
+                    if(!homeExitAllowed && !liveUi.gamepadMode())c.help |= pressed & HidNpadButton_Plus;
                     else if(state.streaming){
                         if(pressed&HidNpadButton_Plus){plusPending=true;plusAt=now;}
                         if(plusPending && (c.held&HidNpadButton_Plus) && now-plusAt>=600){c.help=true;plusPending=false;}
@@ -695,7 +849,7 @@ int main(int, char **) {
                     // R3 belongs to the active keyboard mapping; network details are in More.
                     if(!liveUi.gamepadMode())c.keyboard |= pressed & HidNpadButton_StickL;
                     // Minus is mapped to a remote key; disconnect is confirmed in the toolbar.
-                    c.exit |= !state.streaming && (pressed & HidNpadButton_Plus);
+                    c.exit |= !state.authenticated && !state.streaming && (pressed & HidNpadButton_Plus);
                     auto stick = padGetStickPos(&pad, 0), right = padGetStickPos(&pad, 1);
                     auto axis = [](int v) {
                         float n = v / 32767.f;
@@ -719,6 +873,18 @@ int main(int, char **) {
                         input.toolbar=c.help;input.network=c.stats;input.qualityMenu=c.quality;input.keyboard=c.keyboard;input.disconnect=c.disconnect;input.held=c.held;
                         captureMenuInput=liveUi.input(input,state,menuTouchHeld);
                         if(captureMenuInput){c.confirm=c.back=c.refresh=c.logout=c.up=c.down=c.help=c.stats=c.quality=c.keyboard=c.disconnect=false;c.mx=c.my=c.scroll=0;c.held=0;}
+                        std::string draft;
+                        if(liveUi.takeKeyboardEdit(draft)){
+                            streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);
+                            client.command("release");
+#ifdef __SWITCH__
+                            liveUi.finishKeyboardEdit(textInput(draft));
+#else
+                            // Desktop host uses its IME in the single draft field.
+                            SDL_StartTextInput();
+#endif
+                            previous=SDL_GetTicks();continue;
+                        }
                         c.exit=false;
                     }
                     persistentNetwork=liveUi.networkOverlay;
@@ -795,11 +961,13 @@ int main(int, char **) {
                         hidGetTouchScreenStates(&touch, 1);
                         if(liveUi.takeZoomReset())streamTouch.resetZoom();
                         if(liveUi.multitouch()){
+                            phoneMouse.cancel(send);
                             streamTouch.cancel(send);streamTouch.resetZoom();
                             nativeTouch.update(touch,now,captureNetworkInput,viewport,send);
                         }else{
                             nativeTouch.cancel(send);
-                            streamTouch.update(touch,now,captureNetworkInput,liveUi.trackpad(),liveUi.pointerSpeed(),viewport,cursorX,cursorY,send);
+                            streamTouch.cancel(send);streamTouch.resetZoom();
+                            phoneMouse.update(touch,now,captureNetworkInput,liveUi.pointerSpeed(),viewport,cursorX,cursorY,send);
                         }
 #else
                         if (c.confirm) {
@@ -814,7 +982,7 @@ int main(int, char **) {
                     } else {
                         nativePadRequested=false;lastNativePad.clear();plusPending=startPulse=false;
                         if (wasStreaming) {
-                            streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);minusPending=false;
+                            streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;
                             uu::display::resetVideo();
                             if (video) {
                                 uu::display::destroyTexture(video);
@@ -822,6 +990,8 @@ int main(int, char **) {
                             }
                             serial = 0;
                             texW = texH = 0;
+                            nativeImportFailures = 0;
+                            nativeFallback = false;
                             overlay = false;
                             touchHeld = false;
                         }
@@ -889,6 +1059,8 @@ int main(int, char **) {
                         }
                     }
                     lastHeld = c.held;
+                    if(state.streaming && !wasStreaming) streamingSince=SDL_GetTicks();
+                    if(!state.streaming) streamingSince=0;
                     wasStreaming = state.streaming;
                     color(renderer, {13, 19, 25, 255});
                     uu::display::clear(renderer);
@@ -905,16 +1077,32 @@ int main(int, char **) {
                         if(p.serial && uu::display::active()) {
                             const auto started=SDL_GetPerformanceCounter();
                             const bool accepted=uu::display::acceptVideo(p);
-                            if(!accepted && p.hardwareFrame) {
-                                media->setNativeOutput(false);
-                                uu::diagnostic("display-deko-import-failed-cpu-fallback");
+                            bool consume=true;
+                            if(accepted) {
+                                nativeImportFailures=0;
+                                submittedNewFrame=true;++uploadCount;
+                            } else if(p.hardwareFrame) {
+                                if(nativeFallback) {
+                                    // Already latched for this session: consume the
+                                    // hardware frame and let the decoder produce
+                                    // CPU-readable frames from now on.
+                                } else if(++nativeImportFailures>=6) {
+                                    nativeFallback=true;
+                                    media->setNativeOutput(false);
+                                    uu::diagnostic("display-deko-import-failed-cpu-fallback");
+                                } else {
+                                    // Retry the same newest frame next vsync instead
+                                    // of discarding it on a transient import error.
+                                    consume=false;
+                                }
                             }
-                            submittedNewFrame=accepted;if(accepted) ++uploadCount;
                             frameUploadUs=(SDL_GetPerformanceCounter()-started)*counterToUs;uploadUs+=frameUploadUs;
-                            serial=p.serial;texFormat=p.pixelFormat;
-                            const float scale=std::min(1280.f/p.width,720.f/p.height);
-                            viewport={int((1280-p.width*scale)/2),int((720-p.height*scale)/2),
-                                      int(p.width*scale),int(p.height*scale)};
+                            if(consume) {
+                                serial=p.serial;texFormat=p.pixelFormat;
+                                const float scale=std::min(1280.f/p.width,720.f/p.height);
+                                viewport={int((1280-p.width*scale)/2),int((720-p.height*scale)/2),
+                                          int(p.width*scale),int(p.height*scale)};
+                            }
                         }
                         if (p.serial && !uu::display::active()) {
                             if (!video || p.width != texW || p.height != texH || p.pixelFormat!=texFormat) {
@@ -957,20 +1145,17 @@ int main(int, char **) {
                         else if (video)
                             uu::display::copy(renderer, video, nullptr, &touchView);
                         else
-                            text(renderer, fonts.normal, "等待电脑发送画面…", 470, 330, muted);
-                        int x = touchView.x + int(cursorX * touchView.w),
-                            y = touchView.y + int(cursorY * touchView.h);
-                        rect(renderer, x - 5, y, 11, 2, accent);
-                        rect(renderer, x, y - 5, 2, 11, accent);
+                            text(renderer, fonts.normal, "等待电脑发送画面...", 470, 330, muted);
+
                         if (overlay) {
                             std::string hints =
-                                "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc  ·  − 断开  ·  + 隐藏  ·  R3 网络信息";
+                                "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc";
 #ifdef __SWITCH__
                             if (appletGetOperationMode() == AppletOperationMode_Console)
                                 hints += "  ·  TV 模式触屏不可用";
 #endif
                             rect(renderer, 0, 0, 1280, 68, {13, 19, 25, 225});
-                            text(renderer, fonts.normal, "UU远程", 28, 18);
+                            text(renderer, fonts.normal, "YOUYOU远程", 28, 18);
                             text(renderer, fonts.small, hints, 200, 24, muted);
                             rect(renderer, 0, 650, 1280, 70, {13, 19, 25, 225});
                             text(renderer, fonts.small,
@@ -987,15 +1172,16 @@ int main(int, char **) {
                             if(!panelStatsAt || Uint32(now-panelStatsAt)>=250) {
                                 panelStats=client.streamStats();panelStats.presentFps=presentFps;panelStatsAt=now;
                             }
-                            if(persistentNetwork && !liveUi.active())compactNetworkInfo(renderer,fonts.hint,panelStats,state.quality);
+                            if(persistentNetwork && !liveUi.active())compactNetworkInfo(renderer,fonts.hint,panelStats,
+                                streamingSince?Uint32((now-streamingSince)/1000):0U);
                         }
+                        if(!liveUi.multitouch() && !liveUi.captures())phoneMouse.draw(renderer,fonts);
                         liveUi.draw(renderer,fonts,state,panelStats);
                     } else {
                         if(state.authenticated)liveUi.draw(renderer,fonts,state,panelStats);
                         else {
                         if(!state.authenticated)tvui::loginHeader(renderer,fonts);
                         else tvui::brand(renderer,fonts);
-                        text(renderer, fonts.small, "NINTENDO SWITCH  v" UU_VERSION, 270, 55, tvui::label);
                         text(renderer, fonts.small, state.authenticated ? state.nickname : "尚未登录", 930,
                              55, muted, 280);
                         if(state.authenticated)rect(renderer, 62, 127, 1156, 1, {44, 56, 67, 255});
@@ -1011,7 +1197,7 @@ int main(int, char **) {
                             int remaining=int(std::max<int64_t>(0,(state.smsRetryAt-uu::monotonicMs()+999)/1000));
                             tvui::smsLogin(renderer,fonts,sms,remaining,busy);
                         } else if (state.stage == "login") {
-                            tvui::centered(renderer,fonts.normal,"手机扫码登录 uu远程",116);
+                            tvui::centered(renderer,fonts.normal,"手机扫码登录 YOUYOU远程",116);
                             tvui::centered(renderer,fonts.small,"登录与电脑端相同的 UU远程账号",162,tvui::label);
                             tvui::rounded(renderer,{506,227,268,268},tvui::panel,12);
                             tvui::rounded(renderer,{520,241,240,240},SDL_Color{255,255,255,255},6);
@@ -1099,12 +1285,7 @@ int main(int, char **) {
                         } else
                             statusText(renderer, fonts.small, state.detail,
                                        state.stage == "error" ? SDL_Color{255, 157, 141, 255} : muted);
-                        rect(renderer, 62, 653, 1156, 1, {44, 56, 67, 255});
-                        text(renderer, fonts.small,
-                             state.authenticated ? "A 确认  B 返回  Y 刷新  X 退出账号  L3 画质  R3 界面预览"
-                                                 : "A 确认  B 返回  X 切换登录方式  R3 界面预览",
-                             62, 690, muted);
-                        text(renderer, fonts.small, "+ 退出", 1120, 690, muted);
+
 #ifdef __SWITCH__
                         if(state.authenticated)text(renderer, fonts.small, deviceSummary(), 62, 105, {118, 122, 130, 255}, 1050);
 #endif
@@ -1113,6 +1294,39 @@ int main(int, char **) {
                     const auto presentStarted=SDL_GetPerformanceCounter();
                     uu::display::present(renderer);
                     const auto presentFinished=SDL_GetPerformanceCounter();
+                    // Some handheld/native-window combinations accept swap interval
+                    // 1 but do not block presentImage at 60 Hz (observed as a 120 Hz
+                    // UI loop with pacing-refresh=0). Cap the loop at 60 Hz only when
+                    // vsync is requested and the measured loop is clearly faster;
+                    // a working 60 Hz present path is left untouched.
+                    const double loopElapsedUs=(presentFinished-loopStarted)*counterToUs;
+                    static double nextFrameDeadlineUs=0.0;
+                    if(state.vsync && loopElapsedUs < 14000.0) {
+                        static bool frameLimitLogged=false;
+                        if(!frameLimitLogged){uu::diagnostic("display-vsync-framelimit-engaged");uu::diagnostic("display-vsync-precise-pacing");frameLimitLogged=true;}
+                        constexpr double targetFrameUs=16666.6666667;
+                        const double nowUs=presentFinished*counterToUs;
+                        if(nextFrameDeadlineUs<=0.0 || nowUs>nextFrameDeadlineUs+targetFrameUs*3.0)
+                            nextFrameDeadlineUs=nowUs+targetFrameUs;
+                        const double remainingUs=nextFrameDeadlineUs-nowUs;
+                        if(remainingUs>0.0) {
+#ifdef __SWITCH__
+                            // SDL_Delay rounds to whole milliseconds; on Switch that
+                            // turns a 16.666 ms target into ~17 ms (57-58 Hz). Sleep
+                            // with nanosecond precision and keep an absolute deadline
+                            // so scheduler overshoot is corrected next frame.
+                            svcSleepThread(int64_t(remainingUs*1000.0));
+#else
+                            SDL_Delay(Uint32(std::ceil(remainingUs/1000.0)));
+#endif
+                        }
+                        nextFrameDeadlineUs+=targetFrameUs;
+                        // The software cap makes the observed cadence 60 Hz; let
+                        // the existing refresh/lead estimator use it as well.
+                        actualVsync=true;
+                    } else {
+                        nextFrameDeadlineUs=0.0;
+                    }
                     if(actualVsync && previousSwap) {
                         const auto intervalMs=(presentFinished-previousSwap)*counterToUs/1000.0;
                         // 50/60Hz only; menus, disconnects and missed swaps must
@@ -1126,10 +1340,39 @@ int main(int, char **) {
                     } else {stableSwaps=0;refreshPeriodMs=0;irregularSwaps=0;}
                     previousSwap=actualVsync?presentFinished:0;
                     const auto presentedAt=SDL_GetTicks();
-                    if(telemetry.observe(presentedAt,state.streaming,submittedNewFrame,frameUploadUs))
+                    // Keep target and measured rate in the local log so a
+                    // preset that only acts as a cap is distinguishable from
+                    // a request that never reached the sender.
+                    static Uint32 lastRateLogSample=0;
+                    if(state.streaming && (!lastRateLogSample || presentedAt-lastRateLogSample>=5000)){
+                        const auto rate=client.streamStats();
+                        char rateLine[192];
+                        std::snprintf(rateLine,sizeof rateLine,
+                            "stream-rate actual-mbps=%.3f target-mbps=%d loss=%.2f nack=%llu rtx=%llu feedback=%d",
+                            rate.video.bitrateMbps,rate.maxBitrateMbps,rate.video.lossPercent,
+                            (unsigned long long)rate.nackSent,(unsigned long long)rate.rtxRecovered,
+                            rate.bitrateFeedbackSent?1:0);
+                        uu::diagnostic(rateLine);
+                        lastRateLogSample=presentedAt;
+                    }
+                    const double telemetryWorkUs=(presentStarted-loopStarted)*counterToUs;
+                    const double telemetryPresentUs=(presentFinished-presentStarted)*counterToUs;
+                    const double telemetryLoopUs=(presentFinished-loopStarted)*counterToUs;
+                    if(telemetry.observe(presentedAt,state.streaming,submittedNewFrame,frameUploadUs,
+                                         telemetryWorkUs,telemetryPresentUs,telemetryLoopUs,
+                                         liveUi.active(),statsVisible||persistentNetwork))
                         telemetry.publish(client.streamStats(),actualVsync,texFormat==SDL_PIXELFORMAT_NV12,
                                           refreshPeriodMs,stableSwaps,uu::display::active(),uu::display::directFrames(),
                                           uu::display::mapHits(),uu::display::mapImports(),uu::display::mapCached());
+                    // CPU diagnostics must not depend on the optional telemetry
+                    // UDP sender. When telemetry is disabled, mark the UI role
+                    // here and emit a local ledger every 5 s; when telemetry is
+                    // enabled, publish() already drives the same collector.
+                    if(!telemetry.enabled() && (!lastCpuLedgerSample || presentedAt-lastCpuLedgerSample>=5000)){
+                        uu_cpu_mark(2);
+                        (void)uu::cpuDiagnosticsSnapshot();
+                        lastCpuLedgerSample=presentedAt;
+                    }
                     if (state.streaming) {
                         const auto workUs=(presentStarted-loopStarted)*counterToUs;
                         cpuUs+=workUs;presentUs+=(presentFinished-presentStarted)*counterToUs;
@@ -1148,6 +1391,27 @@ int main(int, char **) {
                             uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,"pacing-window-refresh-us-%.0f-lead-avg-us-%.0f-stable-%u",
                                 refreshPeriodMs*1000,leadSamples?leadSumMs*1000/leadSamples:0,stableSwaps);
+                            uu::diagnostic(timing);
+                            const auto mediaStats=media->stats();
+                            auto delta=[](uint64_t current,uint64_t previous){
+                                return current>=previous?current-previous:current;
+                            };
+                            const auto decoded=delta(mediaStats.decodedTotal,lastDecoded);
+                            const auto published=delta(mediaStats.publishedTotal,lastPublished);
+                            const auto selected=delta(mediaStats.pictureSelected,lastSelected);
+                            const auto empty=delta(mediaStats.pictureEmpty,lastEmpty);
+                            const auto noReady=delta(mediaStats.pictureEmptyNoReady,lastNoReady);
+                            const auto future=delta(mediaStats.pictureEmptyFuture,lastFuture);
+                            lastDecoded=mediaStats.decodedTotal;lastPublished=mediaStats.publishedTotal;
+                            lastSelected=mediaStats.pictureSelected;lastEmpty=mediaStats.pictureEmpty;
+                            lastNoReady=mediaStats.pictureEmptyNoReady;lastFuture=mediaStats.pictureEmptyFuture;
+                            std::snprintf(timing,sizeof timing,
+                                "video-frame decoded=%llu published=%llu selected=%llu empty=%llu no-ready=%llu future=%llu gap-max=%d loops=%llu uploads=%llu",
+                                (unsigned long long)decoded,(unsigned long long)published,
+                                (unsigned long long)selected,(unsigned long long)empty,
+                                (unsigned long long)noReady,(unsigned long long)future,
+                                mediaStats.pictureFutureGapMaxMs,
+                                (unsigned long long)renderLoops,(unsigned long long)uploadCount);
                             uu::diagnostic(timing);
                             leadSumMs=0;leadSamples=0;
                             cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;

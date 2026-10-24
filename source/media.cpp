@@ -1,5 +1,10 @@
+#include "cpu_diagnostics.hpp"
 #include "media.hpp"
+#include "config_store.hpp"
 #include "diagnostics.hpp"
+#ifdef __SWITCH__
+#include "live_telemetry.hpp"
+#endif
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -32,9 +37,27 @@ struct DecoderResources {
         av_frame_free(&cpu);av_frame_free(&frame);avcodec_free_context(&context);
     }
 };
+// Diagnostic-only scope timer: accumulates wall time into a per-access-unit
+// nanosecond counter. No waits, fences or locks are added by this helper.
+struct StageTimer {
+    int64_t &nanos;
+    std::chrono::steady_clock::time_point started;
+    StageTimer(int64_t &target, std::chrono::steady_clock::time_point start)
+        : nanos(target), started(start) {}
+    ~StageTimer() {
+        nanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count();
+    }
+};
 int64_t mediaClockMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void atomicMax(std::atomic<uint64_t> &target, uint64_t value) {
+    auto current=target.load(std::memory_order_relaxed);
+    while(value>current && !target.compare_exchange_weak(
+        current,value,std::memory_order_relaxed,std::memory_order_relaxed)) {}
 }
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -131,22 +154,8 @@ std::string trim(std::string value) {
 std::string decoderPreference() {
     if (const char *env = std::getenv("UU_DECODER"); env && *env)
         return trim(env);
-#ifdef __SWITCH__
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");
-#else
-    std::ifstream file("config.ini");
-#endif
-    std::string line;
-    while (std::getline(file, line)) {
-        if (auto comment = line.find('#'); comment != std::string::npos)
-            line.erase(comment);
-        const auto equals = line.find('=');
-        if (equals == std::string::npos)
-            continue;
-        if (trim(line.substr(0, equals)) == "decoder")
-            return trim(line.substr(equals + 1));
-    }
-    return "auto";
+    const auto configured = ConfigStore::instance().value("decoder");
+    return configured.empty() ? std::string("auto") : configured;
 }
 bool prefersHardware(const std::string &preference) {
     std::string value = preference;
@@ -157,56 +166,14 @@ bool prefersHardware(const std::string &preference) {
 bool diagEnabled() {
     if (const char *env = std::getenv("UU_DIAG"); env && *env)
         return std::string(env) != "0" && std::string(env) != "off";
-#ifdef __SWITCH__
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");
-#else
-    std::ifstream file("config.ini");
-#endif
-    std::string line;
-    while (std::getline(file, line)) {
-        if (auto comment = line.find('#'); comment != std::string::npos)
-            line.erase(comment);
-        const auto equals = line.find('=');
-        if (equals == std::string::npos)
-            continue;
-        if (trim(line.substr(0, equals)) == "diag") {
-            const auto value = trim(line.substr(equals + 1));
-            return !value.empty() && value != "0" && value != "off" && value != "no";
-        }
-    }
-    return false;
+    const auto value = ConfigStore::instance().value("diag");
+    return !value.empty() && value != "0" && value != "off" && value != "no";
 }
 bool strictReceiverEnabled() {
-#ifdef __SWITCH__
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");
-#else
-    std::ifstream file("config.ini");
-#endif
-    std::string line;
-    while (std::getline(file, line)) {
-        if (auto comment = line.find('#'); comment != std::string::npos) line.erase(comment);
-        const auto equals = line.find('=');
-        if (equals != std::string::npos && trim(line.substr(0, equals)) == "receiver")
-            return trim(line.substr(equals + 1)) != "legacy";
-    }
-    return true;
+    return ConfigStore::instance().value("receiver") != "legacy";
 }
 int mediaConfigInt(const std::string &key, int fallback, int low, int high) {
-#ifdef __SWITCH__
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");
-#else
-    std::ifstream file("config.ini");
-#endif
-    std::string line;
-    while (std::getline(file,line)) {
-        if (auto comment=line.find('#');comment!=std::string::npos) line.erase(comment);
-        const auto equals=line.find('=');
-        if (equals!=std::string::npos && trim(line.substr(0,equals))==key) {
-            try {return std::clamp(std::stoi(trim(line.substr(equals+1))),low,high);}
-            catch (...) {return fallback;}
-        }
-    }
-    return fallback;
+    return ConfigStore::instance().integer(key,fallback,low,high);
 }
 const char *diagDirectory() {
 #ifdef __SWITCH__
@@ -220,8 +187,21 @@ const char *diagDirectory() {
 struct Media::Impl {
     std::mutex mutex, audioMutex, decodeStateMutex;
     std::condition_variable cv;
-    struct EncodedUnit { Bytes bytes; int64_t timestamp = AV_NOPTS_VALUE; bool hevc = false; };
+    struct PacketFree { void operator()(AVPacket *value) const noexcept { av_packet_free(&value); } };
+    using PacketRef = std::unique_ptr<AVPacket, PacketFree>;
+    struct EncodedUnit {
+        PacketRef packet;
+        size_t byteSize=0;
+        int64_t timestamp=AV_NOPTS_VALUE;
+        bool hevc=false;
+        int64_t enqueuedMs=0;
+        std::optional<bool> validatedKeyframe;
+    };
     std::deque<EncodedUnit> queue;
+    size_t queueBytes = 0, queueHighFrames = 0, queueHighBytes = 0;
+    int64_t queueWaitLastMs = 0, queueWaitMaxMs = 0;
+    std::atomic<uint64_t> auBytesTotal{0}, auMaxBytes{0}, auOversize{0}, auCountDiag{0};
+    std::atomic<uint64_t> decodeMaxUs{0}, decodeGt8{0}, decodeGt16{0}, decodeGt33{0};
     Picture latest;
     std::deque<Picture> ready;
     size_t readyBytes = 0;
@@ -231,6 +211,9 @@ struct Media::Impl {
     int64_t highestInputTimestamp = 0, clockTimestamp = 0, clockWallMs = 0;
     int64_t lastPresentedTimestamp = AV_NOPTS_VALUE;
     uint64_t presentationSkipped = 0, clockResets = 0, missingTimestamps = 0;
+    uint64_t pictureEmpty = 0, pictureEmptyNoReady = 0, pictureEmptyFuture = 0;
+    uint64_t pictureSelected = 0;
+    int pictureFutureGapMaxMs = 0;
     uint64_t skipDue = 0, skipBound = 0;
     int selectedLateMs = 0;
     double framePeriodMs = 16.667;
@@ -243,8 +226,10 @@ struct Media::Impl {
     int maxDueShiftMs=0;
     std::deque<std::string> playoutTrace;
     void tracePicture(const Picture &picture, int64_t now, const char *reason, int64_t targetMs = 0) {
-        if(!diag_) return;
-        if(playoutTrace.size()>=1500) playoutTrace.pop_front();
+        // Bounded numeric-only trace, independent of the AU/video dump switch.
+        // 6000 rows (~60-100 s at 60 fps) is still a few hundred KiB and makes
+        // the presentation-drop trigger analyzable after a reset.
+        if(playoutTrace.size()>=6000) playoutTrace.pop_front();
         playoutTrace.push_back(std::to_string(picture.mediaTimestamp)+","+std::to_string(picture.decodedMs)+","+
             std::to_string(picture.dueMs)+","+std::to_string(now)+","+reason+","+std::to_string(targetMs?targetMs:now)+","+std::to_string(picture.originalDueMs));
     }
@@ -279,6 +264,7 @@ struct Media::Impl {
     uint64_t auCount_ = 0;
     Picture diagnosticPicture_;
     bool diagnosticHevc_ = false;
+    bool hintedCodecPublished_ = false;
     std::atomic<bool> decoderFailed{false};
     enum class AudioStatus { Ready, Unavailable, QueueFailed };
     std::atomic<AudioStatus> audioStatus{AudioStatus::Ready};
@@ -319,20 +305,28 @@ struct Media::Impl {
         flushDiagnostics();
     }
     void flushDiagnostics() {
-        if (!diag_ || auDump_.empty())
+        const bool haveTiming = !playoutTrace.empty();
+        const bool haveMediaDump = diag_ && !auDump_.empty();
+        if (!haveTiming && !haveMediaDump)
             return;
 #ifdef _WIN32
         _mkdir(diagDirectory());
 #else
         mkdir(diagDirectory(), 0777);
 #endif
+        // Numeric timing is independent of AU/video dump. It contains only
+        // timestamps/selection reasons, never pixels, endpoints or accounts.
+        if (haveTiming) {
+            std::ofstream timing(std::string(diagDirectory()) + "/playout_frames.csv");
+            timing << "media_timestamp_90khz,decoded_ms,due_ms,selected_ms,result,target_present_ms,raw_due_ms\n";
+            for(const auto &row:playoutTrace) timing << row << '\n';
+        }
+        if (!haveMediaDump)
+            return;
         std::ofstream file(std::string(diagDirectory()) + (diagnosticHevc_?"/video.h265":"/video.h264"), std::ios::binary);
         if (file)
             file.write(reinterpret_cast<const char *>(auDump_.data()), std::streamsize(auDump_.size()));
         std::ofstream info(std::string(diagDirectory()) + "/media_info.txt");
-        std::ofstream timing(std::string(diagDirectory()) + "/playout_frames.csv");
-        timing << "media_timestamp_90khz,decoded_ms,due_ms,selected_ms,result,target_present_ms,raw_due_ms\n";
-        for(const auto &row:playoutTrace) timing << row << '\n';
         // Snapshot after conversion and before SDL upload: distinguishes the
         // decoded image from a renderer/texture stride or synchronisation issue.
         if (diagnosticPicture_.pixels) {
@@ -393,16 +387,33 @@ struct Media::Impl {
     }
     // Parse the Annex-B access unit for SPS/SEI/IDR so the network panel can
     // show profile/level, the encoder signature and count keyframes.
-    void inspect(const Bytes &data, bool hevc) {
+    void inspect(const uint8_t *data, size_t length, bool hevc, std::optional<bool> validatedKeyframe) {
         diagnosticHevc_=hevc;
-        if (data.size() < 5)
+        if (length < 5) return;
+        if (hevc && validatedKeyframe.has_value()) {
+            // The strict assembler already parsed every NAL and proved this AU.
+            // This only avoids a second scan for UI diagnostics; FFmpeg still
+            // parses/validates the encoded packet normally.
+            if (!hintedCodecPublished_) {
+                std::lock_guard lock(mutex);
+                codecText="H.265 Main";hintedCodecPublished_=true;
+            }
+            // Preserve requested compressed dumps without rescanning their NALs.
+            if (diag_) {
+                ++auCount_;
+                if (auDump_.size()+length<=auLimit_)
+                    auDump_.insert(auDump_.end(),data,data+length);
+            }
+            if (*validatedKeyframe) ++keyframeCount;
             return;
+        }
+        if (!hevc) hintedCodecPublished_=false;
         std::string codec, encoder;
         bool idr = false;
         size_t pos = 0;
-        while (pos + 3 < data.size()) {
+        while (pos + 3 < length) {
             size_t start = size_t(-1), startLength = 0;
-            for (size_t i = pos; i + 2 < data.size(); ++i) {
+            for (size_t i = pos; i + 2 < length; ++i) {
                 if (data[i] != 0 || data[i + 1] != 0)
                     continue;
                 if (data[i + 2] == 1) {
@@ -410,7 +421,7 @@ struct Media::Impl {
                     startLength = 3;
                     break;
                 }
-                if (i + 3 < data.size() && data[i + 2] == 0 && data[i + 3] == 1) {
+                if (i + 3 < length && data[i + 2] == 0 && data[i + 3] == 1) {
                     start = i;
                     startLength = 4;
                     break;
@@ -419,11 +430,11 @@ struct Media::Impl {
             if (start == size_t(-1))
                 break;
             const size_t begin = start + startLength;
-            size_t end = data.size();
-            for (size_t i = begin + 1; i + 2 < data.size(); ++i) {
+            size_t end = length;
+            for (size_t i = begin + 1; i + 2 < length; ++i) {
                 if (data[i] != 0 || data[i + 1] != 0)
                     continue;
-                if (data[i + 2] == 1 || (i + 3 < data.size() && data[i + 2] == 0 && data[i + 3] == 1)) {
+                if (data[i + 2] == 1 || (i + 3 < length && data[i + 2] == 0 && data[i + 3] == 1)) {
                     end = i;
                     break;
                 }
@@ -432,7 +443,7 @@ struct Media::Impl {
                 pos = end;
                 continue;
             }
-            const uint8_t *nal = data.data() + begin;
+            const uint8_t *nal = data + begin;
             const size_t size = end - begin;
             const int type = hevc?(nal[0]>>1)&63:nal[0]&31;
             if(hevc) {
@@ -451,14 +462,14 @@ struct Media::Impl {
                         encoder = classified;
                 }
             }
-            if (end == data.size())
+            if (end == length)
                 break;
             pos = end;
         }
         if (diag_) {
             ++auCount_;
-            if (auDump_.size() + data.size() <= auLimit_)
-                auDump_.insert(auDump_.end(), data.begin(), data.end());
+            if (auDump_.size() + length <= auLimit_)
+                auDump_.insert(auDump_.end(), data, data + length);
         }
         if (idr)
             ++keyframeCount;
@@ -517,6 +528,7 @@ struct Media::Impl {
             return opened;
     }
     void decode() {
+        uu_cpu_mark(1);
         DecoderResources resources;
         AVCodecID activeCodec=AV_CODEC_ID_H264;
         auto *&frame=resources.frame;frame=av_frame_alloc();
@@ -524,6 +536,14 @@ struct Media::Impl {
         auto *&packet=resources.packet;packet=av_packet_alloc();
         auto *&sws=resources.scaler;
         auto *&ctx=resources.context;
+        // Diagnostic stage EMAs (microseconds): send, receive/drain, frame
+        // processing + publish. Existing decodeMs semantics are unchanged.
+        double stageSendUs=0, stageRecvUs=0, stagePublishUs=0;
+        auto ema=[](double value,double sample){return value<=0?sample:value+(sample-value)*0.15;};
+        // Session epoch for the local stage EMAs. Media::reset() increments
+        // generation() while holding decodeStateMutex; this loop re-reads it
+        // under the same lock, so a reconnect cannot blend old-session EMAs.
+        uint64_t stageEpoch=generation.load();
         if (!frame || !cpu || !packet) {
             std::lock_guard lock(mutex);
             error = "视频解码器内存不足";
@@ -547,12 +567,24 @@ struct Media::Impl {
                     continue;
                 unit = std::move(queue.front());
                 queue.pop_front();
+                if(unit.byteSize<=queueBytes) queueBytes-=unit.byteSize; else queueBytes=0;
+                const auto dequeuedMs=mediaClockMs();
+                queueWaitLastMs=unit.enqueuedMs?std::max<int64_t>(0,dequeuedMs-unit.enqueuedMs):0;
+                queueWaitMaxMs=std::max(queueWaitMaxMs,queueWaitLastMs);
                 currentGeneration = generation.load();
             }
             // Serialize reset/diagnostic snapshots with the decode unit. Do
             // not hold the queue mutex across codec calls.
             std::lock_guard decodeStateLock(decodeStateMutex);
-            if (currentGeneration != generation.load())
+            const uint64_t activeGeneration=generation.load();
+            if(activeGeneration!=stageEpoch) {
+                // New session: clear local EMA state. reset() already cleared
+                // the published atomics under this same lock, so the next
+                // publish() must not republish blended values.
+                stageSendUs=stageRecvUs=stagePublishUs=0;
+                stageEpoch=activeGeneration;
+            }
+            if (currentGeneration != activeGeneration)
                 continue;
             const auto wanted=unit.hevc?AV_CODEC_ID_HEVC:AV_CODEC_ID_H264;
             if(wanted!=activeCodec) {
@@ -564,16 +596,28 @@ struct Media::Impl {
                 presentationSkipped+=ready.size();ready.clear();readyBytes=0;
                 havePlayoutClock=false;codecText=unit.hevc?"H.265 Main":"H.264";
             }
-            const auto &data=unit.bytes;
+            uu_cpu_mark(1);
             av_packet_unref(packet);
-            if (av_new_packet(packet, int(data.size())) < 0)
-                continue;
-            inspect(data,unit.hevc);
-            std::copy(data.begin(), data.end(), packet->data);
+            av_packet_move_ref(packet,unit.packet.get());
+            inspect(packet->data,size_t(packet->size),unit.hevc,unit.validatedKeyframe);
             packet->pts=unit.timestamp;
             packet->dts=AV_NOPTS_VALUE;
+            // Nanosecond stage accumulators for this access unit:
+            // sendNs = avcodec_send_packet wall time (both EAGAIN attempts);
+            // recvNs = every avcodec_receive_frame call, including EAGAIN/error
+            // returns (its blocking time includes NVTEGRA post-process wait);
+            // publishNs = from a successful receive return through frame
+            // handling, queue publication and av_frame_unref (RAII timer).
+            int64_t sendNs=0, recvNs=0, publishNs=0;
             auto drain = [&] {
-                while (avcodec_receive_frame(ctx, frame) == 0) {
+                while (true) {
+                    const auto receiveStarted=std::chrono::steady_clock::now();
+                    const int receiveResult=avcodec_receive_frame(ctx,frame);
+                    const auto frameReceived=std::chrono::steady_clock::now();
+                    recvNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               frameReceived-receiveStarted).count();
+                    if(receiveResult!=0) break;
+                    StageTimer publishTimer(publishNs,frameReceived);
                     ++decodedTotal;
 #ifdef __SWITCH__
                     hardwareFrame=frame->format==AV_PIX_FMT_NVTEGRA;
@@ -767,10 +811,17 @@ struct Media::Impl {
                 }
             };
             const auto decodeStart = std::chrono::steady_clock::now();
-            int result = avcodec_send_packet(ctx, packet);
+            auto timedSend = [&](AVPacket *value) {
+                const auto sendStarted=std::chrono::steady_clock::now();
+                const int sent=avcodec_send_packet(ctx,value);
+                sendNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now()-sendStarted).count();
+                return sent;
+            };
+            int result = timedSend(packet);
             if (result == AVERROR(EAGAIN)) {
                 drain();
-                result = avcodec_send_packet(ctx, packet);
+                result = timedSend(packet);
             }
             if (result >= 0)
                 drain();
@@ -782,8 +833,18 @@ struct Media::Impl {
                                           std::chrono::steady_clock::now() - decodeStart)
                                           .count();
             const double millis = double(decodeMicros) / 1000.0;
+            atomicMax(decodeMaxUs, uint64_t(std::max<int64_t>(0,decodeMicros)));
+            if(decodeMicros>8000) ++decodeGt8;
+            if(decodeMicros>16000) ++decodeGt16;
+            if(decodeMicros>33000) ++decodeGt33;
             const double previous = decodeMs.load();
             decodeMs = previous <= 0 ? millis : previous + (millis - previous) * 0.15;
+            stageSendUs=ema(stageSendUs,double(sendNs)/1000.0);
+            stageRecvUs=ema(stageRecvUs,double(recvNs)/1000.0);
+            stagePublishUs=ema(stagePublishUs,double(publishNs)/1000.0);
+#ifdef __SWITCH__
+            LiveTelemetry::setDecodeStages(stageSendUs,stageRecvUs,stagePublishUs);
+#endif
         }
     done:
         return;
@@ -791,18 +852,40 @@ struct Media::Impl {
 };
 Media::Media() : impl_(std::make_unique<Impl>()) {}
 Media::~Media() = default;
-void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::optional<uint32_t> timestamp, bool hevc) {
-    if (!size || size > 2 * 1024 * 1024 || impl_->decoderFailed.load())
+void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::optional<uint32_t> timestamp, bool hevc,
+                  std::optional<bool> validatedKeyframe) {
+    if (!size || !data || impl_->decoderFailed.load() || generation != impl_->generation.load())
         return;
+    // Allocate the FFmpeg-owned padded packet once, before taking the shared
+    // queue/UI mutex. Ownership moves to the decoder without another AU copy.
+    Impl::PacketRef owned;
+    if (size <= 2 * 1024 * 1024) {
+        owned.reset(av_packet_alloc());
+        if (!owned || av_new_packet(owned.get(),int(size))<0) return;
+        std::copy(data,data+size,owned->data);
+    }
     {
         std::lock_guard lock(impl_->mutex);
         if (generation != impl_->generation.load())
             return;
+        // Count only accepted-generation submissions; stale callbacks must not
+        // contaminate a new epoch's AU/queue diagnostics.
+        impl_->auBytesTotal.fetch_add(size, std::memory_order_relaxed);
+        impl_->auCountDiag.fetch_add(1, std::memory_order_relaxed);
+        atomicMax(impl_->auMaxBytes, size);
+        if (size > 2 * 1024 * 1024) {
+            impl_->auOversize.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         // A too-deep queue means decoding is behind: drop the backlog and ask
         // for a fresh IDR instead of feeding broken references to the decoder.
-        if (impl_->queue.size() >= 16) {
+        constexpr size_t maxQueuedFrames = 32;
+        constexpr size_t maxQueuedBytes = 8u * 1024u * 1024u;
+        const bool bytesLimit = impl_->queueBytes > maxQueuedBytes ||
+            size > maxQueuedBytes - impl_->queueBytes;
+        if (impl_->queue.size() >= maxQueuedFrames || bytesLimit) {
             impl_->droppedUnits += impl_->queue.size();
-            impl_->queue.clear();
+            impl_->queue.clear();impl_->queueBytes=0;
             impl_->clear = true;
             impl_->keyframeRequested = true;
             impl_->presentationSkipped+=impl_->ready.size();impl_->ready.clear();impl_->readyBytes=0;
@@ -815,7 +898,10 @@ void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::op
             if(!impl_->haveInputTimestamp || extended>impl_->highestInputTimestamp) impl_->highestInputTimestamp=extended;
             impl_->haveInputTimestamp=true;
         }
-        impl_->queue.push_back(Impl::EncodedUnit{Bytes(data,data+size),extended,hevc});
+        impl_->queue.push_back(Impl::EncodedUnit{std::move(owned),size,extended,hevc,mediaClockMs(),validatedKeyframe});
+        impl_->queueBytes += size;
+        impl_->queueHighFrames = std::max(impl_->queueHighFrames, impl_->queue.size());
+        impl_->queueHighBytes = std::max(impl_->queueHighBytes, impl_->queueBytes);
     }
     impl_->cv.notify_one();
 }
@@ -848,7 +934,19 @@ Picture Media::picture(uint64_t after, int presentationLeadMs) {
         // SDL uploads/draws and waits for VSync. Never wait here or extrapolate
         // an undecoded frame. One refresh interval is the maximum lookahead.
         const auto target=now+std::clamp(presentationLeadMs,0,20);
-        if(impl_->ready.empty() || impl_->ready.front().dueMs>target+2) return {};
+        if(impl_->ready.empty()) {
+            ++impl_->pictureEmpty;++impl_->pictureEmptyNoReady;
+            return {};
+        }
+        const auto gapMs=impl_->ready.front().dueMs-target;
+        // A frame due a few milliseconds after the nominal presentation target
+        // is still preferable to dropping this vsync completely. Keep the
+        // allowance below half a 60 Hz frame to avoid visibly early motion.
+        if(gapMs>4) {
+            ++impl_->pictureEmpty;++impl_->pictureEmptyFuture;
+            impl_->pictureFutureGapMaxMs=int(std::max<int64_t>(impl_->pictureFutureGapMaxMs,gapMs));
+            return {};
+        }
         // Preserve frame cadence when only one frame behind. Coalescing every
         // pair of eligible frames turns small scheduling jitter into sustained
         // frame loss. Catch up only beyond one source-frame period (+2ms),
@@ -861,6 +959,7 @@ Picture Media::picture(uint64_t after, int presentationLeadMs) {
         }
         impl_->readyBytes-=impl_->ready.front().pixelBytes();
         impl_->latest=std::move(impl_->ready.front());impl_->ready.pop_front();
+        ++impl_->pictureSelected;
         impl_->selectedLateMs=int(std::max<int64_t>(0,target-impl_->latest.dueMs));
         impl_->tracePicture(impl_->latest,now,"selected",target);
         impl_->lastPresentedTimestamp=impl_->latest.mediaTimestamp;
@@ -901,6 +1000,8 @@ void Media::reset() {
         impl_->haveInputTimestamp=false;impl_->havePlayoutClock=false;
         impl_->lastPresentedTimestamp=AV_NOPTS_VALUE;
         impl_->presentationSkipped=0;impl_->clockResets=0;impl_->missingTimestamps=0;
+        impl_->pictureEmpty=0;impl_->pictureEmptyNoReady=0;impl_->pictureEmptyFuture=0;
+        impl_->pictureSelected=0;impl_->pictureFutureGapMaxMs=0;
         impl_->skipDue=0;impl_->skipBound=0;impl_->selectedLateMs=0;
         impl_->framePeriodMs=16.667;impl_->cadenceTimestamp=AV_NOPTS_VALUE;
         impl_->smoothedTimestamp=AV_NOPTS_VALUE;impl_->smoothedDueMs=0;
@@ -911,15 +1012,23 @@ void Media::reset() {
         impl_->height = 0;
         impl_->lastFrameMs = 0;
         impl_->lastDecodedMs = 0;
+        impl_->auBytesTotal=0;impl_->auMaxBytes=0;impl_->auOversize=0;impl_->auCountDiag=0;impl_->auCount_ = 0;
+        impl_->queueBytes=0;impl_->queueHighFrames=0;impl_->queueHighBytes=0;
+        impl_->queueWaitLastMs=0;impl_->queueWaitMaxMs=0;
+        impl_->decodeMaxUs=0;impl_->decodeGt8=0;impl_->decodeGt16=0;impl_->decodeGt33=0;
         impl_->cleanFrames = 0;
         impl_->decodeErrors = 0;
         impl_->droppedUnits = 0;
         impl_->keyframeRequested = true;
         impl_->fps = 0;
         impl_->decodeMs = 0;
+#ifdef __SWITCH__
+        LiveTelemetry::clearDecodeStages();
+#endif
         impl_->fpsFrames = 0;
         impl_->fpsWindow = 0;
         impl_->codecText = "—";
+        impl_->hintedCodecPublished_=false;
         impl_->encoderText = "—";
     }
     impl_->cv.notify_one();
@@ -975,7 +1084,19 @@ MediaStats Media::stats() {
     out.keyframeCount = impl_->keyframeCount.load();
     out.pacing=impl_->pacing;out.playoutDelayMs=impl_->playoutDelayMs;
     out.readyFrames=int(impl_->ready.size());out.presentationSkipped=impl_->presentationSkipped;
+    out.pictureEmpty=impl_->pictureEmpty;out.pictureEmptyNoReady=impl_->pictureEmptyNoReady;
+    out.pictureEmptyFuture=impl_->pictureEmptyFuture;out.pictureSelected=impl_->pictureSelected;
+    out.pictureFutureGapMaxMs=impl_->pictureFutureGapMaxMs;
     out.clockResets=impl_->clockResets;out.missingTimestamps=impl_->missingTimestamps;
+    out.auMaxBytes=impl_->auMaxBytes.load();out.auBytesTotal=impl_->auBytesTotal.load();
+    out.auCount=impl_->auCountDiag.load();out.auOversize=impl_->auOversize.load();
+    out.queueHighFrames=impl_->queueHighFrames;out.queueHighBytes=impl_->queueHighBytes;
+    out.queueWaitLastMs=int(impl_->queueWaitLastMs);out.queueWaitMaxMs=int(impl_->queueWaitMaxMs);
+    out.oldestQueueWaitMs=impl_->queue.empty()?0:int(std::max<int64_t>(0,mediaClockMs()-impl_->queue.front().enqueuedMs));
+    out.decodeMaxMs=double(impl_->decodeMaxUs.load())/1000.0;
+    out.decodeGt8=impl_->decodeGt8.load();out.decodeGt16=impl_->decodeGt16.load();out.decodeGt33=impl_->decodeGt33.load();
+    const auto last=impl_->lastDecodedMs.load();
+    out.lastDecodedAgeMs=last?mediaClockMs()-last:-1;
     return out;
 }
 uint64_t Media::keyframeCount() {

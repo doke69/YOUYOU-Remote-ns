@@ -59,6 +59,22 @@ struct StreamStatsSnapshot {
     int receiverPending = 0, receiverBlockedMs = 0, nackRetryMs = 45;
     double repairRttMs = 0;
     uint64_t nackRepeated = 0, receiverPli = 0;
+    // Schema-12 diagnostic-only snapshots. These are cached under statsMutex;
+    // UI code never reads decoder-worker fields directly.
+    uint64_t auMaxBytes = 0, auBytesTotal = 0, auCount = 0, auOversize = 0;
+    uint64_t queueHighFrames = 0, queueHighBytes = 0;
+    int queueWaitLastMs = 0, queueWaitMaxMs = 0, oldestQueueWaitMs = 0;
+    double decodeMaxMs = 0;
+    uint64_t decodeGt8 = 0, decodeGt16 = 0, decodeGt33 = 0;
+    int64_t lastDecodedAgeMs = 0;
+    // Passive strict-receiver processing counters (cumulative; wall time).
+    uint64_t rxBufferedBytes=0, rxBufferedHigh=0;
+    uint64_t rxInputMessages=0, rxInputBatches=0, rxMaxBatch=0;
+    uint64_t rxIncomingCalls=0, rxTickCalls=0;
+    uint64_t rxIncomingTotalUs=0, rxIncomingMaxUs=0, rxTickTotalUs=0, rxTickMaxUs=0;
+    uint64_t rxMemoryBoundRetires=0, rxMaxFrameBytes=0;
+    bool repairPaced=false;
+    uint64_t nackSequences=0,nackBudgetDeferrals=0,nackExpiredScans=0;
 };
 
 // RTP level accounting for a single media track. Inserted at the end of the

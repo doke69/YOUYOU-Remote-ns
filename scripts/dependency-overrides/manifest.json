@@ -1,18 +1,188 @@
 [
   {
+    "dependency": "libdatachannel",
+    "path": "cmake/Modules/FindMbedTLS.cmake",
+    "upstream_sha256": "e2c531f0c6fba152cff36f872bbbf56041d1c19be0a6a4bf84f1f1f40676a2f6",
+    "sha256": "d11e9b8daf0700886a8b21c9a128627efc331f83ffd73e57282e472cb1e42e63"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "include/rtc/message.hpp",
+    "upstream_sha256": "2bc6dbd21b83e682f999fb24eb70a2d68f5699cf53c520fc1fde9572d710de6a",
+    "sha256": "0e00fa5933d79c2b9d853850ef33ef6acda290522420c9c12119a90209f57b23"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/candidate.cpp",
+    "upstream_sha256": "bc8c2890ea9058157d4883e87c0a520a63defc0776633c31deaa4eabacb44b2c",
+    "sha256": "6846f66c0980f062e36ed9cae48f2b41f7f79f0904011755b243b0aab03d1657"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/description.cpp",
+    "upstream_sha256": "940aa1e9eba8e1d3d45d082ee336e783a491f7b50770b52bc75ed71bfe021c9b",
+    "sha256": "377594f9e76b5626f3365cf9f2a89deaf89188f2fe602154bd34da7b0fab5204"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/dtlssrtptransport.cpp",
+    "upstream_sha256": "02116bedf7e9789fcbd8d0e25422cb5d74c0b1c3fe2fe998e61d32d11d46ad6d",
+    "sha256": "aa779fba24265431738e7d45c243964ca1f7a8b286a2d6156909afba5c553789"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/dtlssrtptransport.hpp",
+    "upstream_sha256": "fdc4c4ba47528adb1320169f3d74bd7e2e72116733a10bcc9137d07fae884a8f",
+    "sha256": "a4ee0fc21da8d9499111453d2bd6d5d663633080223eff9d622d69095c25df03"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/dtlstransport.cpp",
+    "upstream_sha256": "516e7d10f3ae05808655923c3e1a99ba54de937459fe73c15fb08e6951c1fd83",
+    "sha256": "e37e4fa40f58224234692b7c91d49075ebddad95a367a18ebcd52d0a737005be"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/icetransport.cpp",
+    "upstream_sha256": "188e80af004d813aaecec66470e886794acf552728535f3148c5a6fc3ffb79ae",
+    "sha256": "39be742e691891d04d5b04b761de51f6452e6dbd2f9d22233f119f55afc29d3b"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/init.cpp",
+    "upstream_sha256": "2dae3e2e10e987236e862761f30d55546db3e9d7d882882e0660c13185683eca",
+    "sha256": "4091dff552ce878445bed9755872111defaf8e938e9ac70a23147b26d3f80f90"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/peerconnection.cpp",
+    "upstream_sha256": "3dcbb89a28f950ab2babd17f9d20cc5e8d422985943786ef508dfeafdbae5bb2",
+    "sha256": "72f05e456c3108cabcbb3000ce7599eb04c3a4d9801c50b71b60537299acdc07"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/queue.hpp",
+    "upstream_sha256": "fb06e88752c40742d083e8a197260652614bd5fa307cebea1e3baaad2e72eae1",
+    "sha256": "3ce826c4ad6878c9d49217b1e7764ad298602d0654e59542c94f1ce7cafd88c2"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/sctptransport.cpp",
+    "upstream_sha256": "249e15005558a2d7762362a390f88de87182dd278c719ded6e1f0c71a2bedc3c",
+    "sha256": "93739cb5989da71e1d4f47216a22f167ff41e69a24aca279c7adf6ced13fc9bb"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/socket.hpp",
+    "upstream_sha256": "11d5709be57127941a5f52d6fc2b2786520bfa971a6d936ece74558f79860481",
+    "sha256": "3ab057de8317a24ea95891c6fd4775bf94958627a78da75d70ce85cd94e52266"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/threadpool.cpp",
+    "upstream_sha256": "e8b5dd8ac13f89dfc1e92e23230d0fa44bfad262c9ce06fc1a5847977f3be9a9",
+    "sha256": "37e7dcafdfa9e6643efb1f7df3a38a6954178a9bc36b44c71f960b517a7a861e"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/threadpool.hpp",
+    "upstream_sha256": "674ca23a8f662534fe14c9e9cc278c297d5f65464831e4c1f36bc7b6e001f1a6",
+    "sha256": "fa77c0e062d7c71e87dd397f5f85dbde790b9265089da39d3778bbffd400fc10"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/tls.cpp",
+    "upstream_sha256": "5254805e958b73f97ca4a53eef63d43657b43d077670a66277d42b2c57804b4b",
+    "sha256": "2072fb5a1c0f5a0cd731b6f5895605c7bc4a86e28300eedb96acf66378114fb6"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/utils.cpp",
+    "upstream_sha256": "391a96960426e62a8a5e3aaa3e2d39f2796588e60075a72b1824ef69894c2133",
+    "sha256": "1e50065a666b47b5dd15ad6299140160ad8ab491b7b2d9f3324aca1434d0adbe"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/utils.hpp",
+    "upstream_sha256": "94b47d23cda29c305d100a7fe4215dc4a3c53db9e074b9a038c45f3d5aba41d5",
+    "sha256": "96a3fa8cd599545ec20fd2c68cb41fed460ef51fce45c4e4d00addae4c02fa10"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/message.cpp",
+    "upstream_sha256": "5875e8355c2a0ee05307cdce96e51d3b38378ca3c7f11c4b99fbf7f6b7d566bb",
+    "sha256": "aa6084d1b0f7a60aa7bc515114b6f2895651c9346ec6e37df4aa0b6d84ea28bc"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/rtcpreceivingsession.cpp",
+    "upstream_sha256": "561deaf604f468b20538a36c5d994fc5f2f63c0d1d63481578d2d9caf956a780",
+    "sha256": "da2ba9d466c46c3d8e5138ad4e3f60ba1772de56c09225d942e9226714f840b9"
+  },
+  {
+    "dependency": "libjuice",
     "path": "deps/libjuice/src/agent.c",
+    "upstream_sha256": "04d59845ec2fdbc7a9f19043a294a2f554a841a3ab226bdd7db8fc64a5dece5e",
     "sha256": "a2ebab6591bdec8b2f936927ffa11eec44a898a51dfea780a464e8c674b61742"
   },
   {
+    "dependency": "libjuice",
     "path": "deps/libjuice/src/agent.h",
+    "upstream_sha256": "9d729bbf5fd7088984aaafe81cbe974f8c85ba685aec193a9bc86fb3c4ec2284",
     "sha256": "66387f649b79a3ea257685ac1a0e37a2bdb9288e4845b06e1e68e33e7475a3c7"
   },
   {
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/conn_poll.c",
+    "upstream_sha256": "d0a86b4a781d06e26cd06a0ed886c995b8bf2f094a610d393b066d62bdc0a049",
+    "sha256": "b5f5ae2ed5b16154ad7bbdc5c390e23143fe0a3b3a5629922cd814a5c6d1a04b"
+  },
+  {
+    "dependency": "libjuice",
     "path": "deps/libjuice/src/ice.c",
+    "upstream_sha256": "f8e6a361831cf9e9b83e71ec38ff222a8928f7a28f9b971b0d449c50d4a1e130",
     "sha256": "c37d7aa82c48890bf37544ea8306487debacf34b416f01ba2d48cdf29515c1cb"
   },
   {
-    "path": "src/candidate.cpp",
-    "sha256": "6846f66c0980f062e36ed9cae48f2b41f7f79f0904011755b243b0aab03d1657"
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/random.c",
+    "upstream_sha256": "6d5cd3305d0e6eb1d5388d7287f9c2f1d7efeec4dc4f5b8e12312814cbf0ef7f",
+    "sha256": "15700084760eefdace3c9cbc8fdbf3665845fdb26752d3898c98a37e4e4e499e"
+  },
+  {
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/socket.h",
+    "upstream_sha256": "2f2f5a1e5c98f6ebc3548c1132c093c33640915f3f7f633dbe29ef2d9958b506",
+    "sha256": "6d51fc1e6a576888bb168c4878eea464f99b95dc2e68a2c1e435c7871b7c675e"
+  },
+  {
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/udp.c",
+    "upstream_sha256": "0ba72cd827d67c52e86e33ff385ce14df9d7b868727dd174d303eefcec0cc09b",
+    "sha256": "490e80390374fda988773b9fe8efcbe77b1017e66c6d9fa3feec7d1db6418f8e"
+  },
+  {
+    "dependency": "usrsctp",
+    "path": "deps/usrsctp/usrsctplib/user_environment.c",
+    "upstream_sha256": "06159d0127b1f1c520d9ddcb5e9113aee09a355510efff09ed4514035ed5e8bc",
+    "sha256": "34ce5f799decfe3814a9dd70dc36a935a0d86b787d65dd4ad8b8de951e323012"
+  },
+  {
+    "dependency": "usrsctp",
+    "path": "deps/usrsctp/usrsctplib/user_socket.c",
+    "upstream_sha256": "70b4cf1da6b90c7dd6d44d1b92c94e86c9c3cc3df90308008c140b03ea212431",
+    "sha256": "be9f23658b919388e545cc104ab091eb54c3866f023cdb8808f92e7c865d9da8"
+  },
+  {
+    "dependency": "usrsctp",
+    "path": "deps/usrsctp/usrsctplib/usrsctp.h",
+    "upstream_sha256": "c0b203501a7d18c4b162a08d521abccf491a867a592cd59b2fa0874622e42c21",
+    "sha256": "19f6458b2e3bdfda207a02460f9deb7ab07714a6c8dada777ec76d6e81b88e1b"
+  },
+  {
+    "dependency": "libsrtp",
+    "path": "deps/libsrtp/cmake/FindMbedTLS.cmake",
+    "upstream_sha256": "247d0c454e012744245c8692085e0a6df451f0f83d255766eec136fc8182ac98",
+    "sha256": "b1844644404524881e23ae801c0784a48442af0e5429c9a94a87f0b83eec6e2a"
   }
 ]

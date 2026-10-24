@@ -1,4 +1,5 @@
 #include "stream_stats.hpp"
+#include "config_store.hpp"
 #include "protocol.hpp"
 
 #include <algorithm>
@@ -23,22 +24,7 @@ std::string trim(std::string value) {
 std::string configValue(const std::string &wanted) {
     if (const char *env = std::getenv("UU_DIAG"); env && *env && wanted == "diag")
         return trim(env);
-#ifdef __SWITCH__
-    std::ifstream file("sdmc:/switch/UURemote-ns/config.ini");
-#else
-    std::ifstream file("config.ini");
-#endif
-    std::string line;
-    while (std::getline(file, line)) {
-        if (auto comment = line.find('#'); comment != std::string::npos)
-            line.erase(comment);
-        const auto equals = line.find('=');
-        if (equals == std::string::npos)
-            continue;
-        if (trim(line.substr(0, equals)) == wanted)
-            return trim(line.substr(equals + 1));
-    }
-    return {};
+    return ConfigStore::instance().value(wanted);
 }
 bool diagEnabled() {
     const auto value = configValue("diag");

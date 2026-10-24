@@ -21,7 +21,13 @@ struct Picture {
     // a 720p RGBA buffer while holding the decode queue mutex every frame.
     std::shared_ptr<const Bytes> pixels;
     std::shared_ptr<const AVFrame> hardwareFrame;
-    size_t pixelBytes() const { return pixels ? pixels->size() : 0; }
+    // Hardware frames carry no CPU buffer but still pin decoder surfaces. Give
+    // them a conservative NV12 size so the ready-queue byte bound is not inert.
+    size_t pixelBytes() const {
+        if (pixels) return pixels->size();
+        if (hardwareFrame) return size_t(width > 0 ? width : 0) * size_t(height > 0 ? height : 0) * 3 / 2;
+        return 0;
+    }
     int64_t mediaTimestamp = INT64_MIN, dueMs = 0, decodedMs = 0, originalDueMs = 0;
 };
 struct MediaStats {
@@ -41,6 +47,19 @@ struct MediaStats {
     bool pacing = false;
     int playoutDelayMs = 0, readyFrames = 0;
     uint64_t presentationSkipped = 0, clockResets = 0, missingTimestamps = 0;
+    // Presentation selection diagnostics: empty means picture() returned no
+    // new frame; future means the next due frame was too far ahead of target.
+    uint64_t pictureEmpty = 0, pictureEmptyNoReady = 0, pictureEmptyFuture = 0;
+    uint64_t pictureSelected = 0;
+    int pictureFutureGapMaxMs = 0;
+    // Diagnostic-only access-unit / queue / decode timing. Maxima and >threshold
+    // counters are session-cumulative until Media::reset().
+    uint64_t auMaxBytes = 0, auBytesTotal = 0, auCount = 0, auOversize = 0;
+    uint64_t queueHighFrames = 0, queueHighBytes = 0;
+    int queueWaitLastMs = 0, queueWaitMaxMs = 0, oldestQueueWaitMs = 0;
+    double decodeMaxMs = 0;
+    uint64_t decodeGt8 = 0, decodeGt16 = 0, decodeGt33 = 0;
+    int64_t lastDecodedAgeMs = 0;
 };
 class Media {
     struct Impl;
@@ -50,7 +69,8 @@ class Media {
     Media();
     ~Media();
     void video(const uint8_t *data, size_t size, uint64_t generation,
-               std::optional<uint32_t> timestamp = std::nullopt, bool hevc = false);
+               std::optional<uint32_t> timestamp = std::nullopt, bool hevc = false,
+               std::optional<bool> validatedKeyframe = std::nullopt);
     void audio(const uint8_t *data, size_t size, uint64_t generation);
     uint64_t generation() const;
     Picture picture(uint64_t after, int presentationLeadMs = 0);

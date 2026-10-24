@@ -22,7 +22,8 @@ public:
         // Retire lost IDs for this snapshot before reusing them on a later update.
         // A replacement finger must not silently inherit a contact that just ended.
         for(const auto &f:fingers)if(f.id>=0 && f.id<10)used[f.id]=true;
-        for(int i=0;i<t.count && next.size()<10;++i){const auto p=t.touches[i];
+        const int count=std::clamp(int(t.count),0,int(std::size(t.touches)));
+        for(int i=0;i<count && next.size()<10;++i){const auto p=t.touches[i];
             auto old=std::find_if(fingers.begin(),fingers.end(),[&](const Finger &f){return f.physical==p.finger_id;});
             const int x=int(p.x),y=int(p.y);
             if(old==fingers.end() && (x<v.x || y<v.y || x>=v.x+v.w || y>=v.y+v.h))continue;
