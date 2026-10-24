@@ -22,6 +22,7 @@ struct Snapshot {
     std::string textNotice;
     std::string activeDeviceId; // Session identity only; never a login credential.
     bool textChannelReady=false;
+    bool controlChannelReady=false;
     std::string stage = "idle", detail = "按 A 扫码登录，或按 X 使用短信验证码", qrUrl, nickname;
     Json devices = Json::array();
     bool authenticated = false, streaming = false;

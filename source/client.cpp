@@ -691,6 +691,8 @@ void Client::handle(const Event &event) {
         deadline_ = monotonicMs() + 45000;
     } else if(e=="text-channel-state") {
         std::lock_guard lock(stateMutex_);state_.textChannelReady=data.get<bool>();
+    } else if(e=="control-channel-state") {
+        std::lock_guard lock(stateMutex_);state_.controlChannelReady=data.get<bool>();
     } else if(e=="text-input-cancel") {
         if(pendingText_)finishTextInput(3,"已取消文字发送");
     } else if(e=="text-input") {
@@ -734,7 +736,7 @@ void Client::handle(const Event &event) {
         if(data.contains("deviceId") && data.at("deviceId").get<std::string>()!=connectedDeviceId_){
             inform("连接电脑已变化，未应用上一台电脑的设置");return;
         }
-        const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+        const auto channel=channels_.find(systemActionChannel);
         if(!snapshot().streaming || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
             inform("电脑控制通道尚未就绪，未发送操作");return;
         }
@@ -742,9 +744,10 @@ void Client::handle(const Event &event) {
         const auto enabled=data.contains("enabled")?std::optional<bool>(data.at("enabled").get<bool>()):std::nullopt;
         const auto bytes=simpleActionMessage(nextQualityRpc_++,action,enabled);
         try {
-            if(channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size()))inform("操作请求已发送，请确认电脑端结果");
-            else inform("操作请求已排队，等待电脑端处理");
-        }catch(...){inform("电脑控制操作发送失败");}
+            const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+            diagnostic(("system-action-control-"+std::to_string(action)+(sent?"-sent":"-queued")).c_str());
+            if(!data.value("quiet",false))inform(sent?"操作请求已发送，请确认电脑端结果":"操作请求已排队，等待电脑端处理");
+        }catch(...){diagnostic("system-action-control-send-failed");inform("电脑控制操作发送失败");}
     } else if (e == "input") {
         input(data);
     } else if (e == "release") {
@@ -1161,12 +1164,13 @@ void Client::beginPeer(const Json &result) {
     for (const auto *label : {"CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
                               "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"}) {
         auto channel=peer_->createDataChannel(label);channels_[label]=channel;
-        if(std::string(label)=="TEXT_DATA_CHANNEL"){
+        if(std::string(label)=="TEXT_DATA_CHANNEL" || std::string(label)==systemActionChannel){
             std::weak_ptr<Inbox> inbox=inbox_;const auto generation=generation_;
-            auto stateChanged=[inbox,generation](bool ready){
+            const std::string eventName=std::string(label)==systemActionChannel?"control-channel-state":"text-channel-state";
+            auto stateChanged=[inbox,generation,eventName](bool ready){
                 if(auto queue=inbox.lock()){
                     std::lock_guard lock(queue->mutex);
-                    queue->events.push_back({"text-channel-state",ready,generation});queue->cv.notify_one();
+                    queue->events.push_back({eventName,ready,generation});queue->cv.notify_one();
                 }
             };
             channel->onOpen([stateChanged]{stateChanged(true);});
@@ -1523,6 +1527,7 @@ void Client::disconnect() {
         state_.streaming = false;
         state_.activeDeviceId.clear();
         state_.textChannelReady=false;
+        state_.controlChannelReady=false;
     }
 }
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {

@@ -7,7 +7,7 @@ class LiveFrontend {
     int scheme=1,draft=1,fps=60,resolution=720,codec=0,quality=2,bufferMs=8,touchMode=1,inputMode=0,xboxLayout=0,volume=100,mouseSpeed=1;
     int selectedDevice=0,deviceOffset=0,touchTarget=-1,touchStartY=0,hit=-1,pointerX=0,pointerY=0;
     uu::DeviceSelection deviceSelection;
-    bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=false,restoreSound=false;
+    bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true;
     bool nativeMultitouch=true;Uint32 modeNoticeUntil=0;
     bool keyboardEditRequested=false,sendingText=false,legacyQuality=false;
     uu::Json safetyProfiles=uu::Json::object();std::string safetyDevice;bool safetyApplied=false;
@@ -127,21 +127,24 @@ class LiveFrontend {
         sendingText=false;
     }
     void loadSafety(const std::string &id){
-        safetyDevice=id;safetyApplied=false;autoLock=false;remoteMute=false;restoreSound=true;
-        const auto it=safetyProfiles.find(id);
-        if(it!=safetyProfiles.end()){
-            autoLock=it->value("auto_lock",false);remoteMute=it->value("remote_mute",false);restoreSound=it->value("restore_sound",true);
-        }
+        safetyDevice=id;safetyApplied=false;
+        const auto settings=uu::safetySettingsFor(safetyProfiles,id);
+        autoLock=settings.autoLock;remoteMute=settings.remoteMute;restoreSound=settings.restoreSound;
     }
     bool setSafety(const char *key,bool value,const uu::Snapshot &s){
-        if(!s.streaming || !s.textChannelReady || s.activeDeviceId.empty() || s.activeDeviceId!=safetyDevice){notice="电脑控制通道尚未就绪，请稍后重试";return false;}
+        if(!s.streaming || !s.controlChannelReady || s.activeDeviceId.empty() || s.activeDeviceId!=safetyDevice){notice="电脑控制通道尚未就绪，请稍后重试";return false;}
         if(!safetyProfiles.contains(safetyDevice) && safetyProfiles.size()>=16){notice="已保存16台电脑的安全设置，未添加新设置";return false;}
         safetyProfiles[safetyDevice][key]=value;save();return true;
     }
-    void safetyAction(unsigned action,const uu::Snapshot &s,std::optional<bool> enabled={}){
+    void safetyAction(unsigned action,const uu::Snapshot &s,std::optional<bool> enabled={},bool quiet=false){
         uu::Json data={{"action",action},{"deviceId",s.activeDeviceId}};
         if(enabled)data["enabled"]=*enabled;
+        if(quiet)data["quiet"]=true;
         client.command("system-action",std::move(data));
+    }
+    void applyRemoteSound(const uu::Snapshot &s,bool quiet=false){
+        for(auto action:uu::remoteSoundActions(remoteMute,restoreSound))
+            safetyAction(action,s,std::nullopt,quiet);
     }
     void push(Page p){touchTarget=-1;touchDown=false;hit=-1;stack.push_back({p,0});notice.clear();}
     void back(){
@@ -230,11 +233,11 @@ class LiveFrontend {
             autoLock=!autoLock;safetyAction(19,s,autoLock);notice="断开后锁屏的设置已发送，请以电脑端为准";break;
         case 752:
             if(!setSafety("remote_mute",!remoteMute,s))break;
-            remoteMute=!remoteMute;safetyAction(remoteMute?(restoreSound?18:17):16,s);notice="电脑声音设置已发送，请以电脑端为准";break;
+            remoteMute=!remoteMute;applyRemoteSound(s);notice="电脑声音设置已发送，请以电脑端为准";break;
         case 753:
             if(!setSafety("restore_sound",!restoreSound,s))break;
             restoreSound=!restoreSound;
-            if(remoteMute)safetyAction(restoreSound?18:17,s);
+            if(remoteMute)safetyAction(uu::remoteSoundAction(remoteMute,restoreSound),s);
             notice=remoteMute?"声音恢复设置已发送，请以电脑端为准":"已保存；开启电脑静音后生效";break;
         case 754:networkOverlay=!networkOverlay;save();break;
         case 760:
@@ -310,13 +313,12 @@ public:
                 connectedAt=SDL_GetTicks();
             }
         }
-        if(!s.streaming || !s.textChannelReady)safetyApplied=false;
-        if(s.streaming && s.textChannelReady && !safetyApplied){
-            const auto profile=safetyProfiles.find(s.activeDeviceId);
-            if(profile!=safetyProfiles.end()){
-                if(profile->contains("auto_lock"))safetyAction(19,s,autoLock);
-                if(profile->contains("remote_mute"))safetyAction(remoteMute?(restoreSound?18:17):16,s);
-            }
+        if(!s.streaming || !s.controlChannelReady)safetyApplied=false;
+        if(s.streaming && s.controlChannelReady && !s.activeDeviceId.empty() && !safetyApplied){
+            // Apply the full effective policy, including unsaved defaults. A
+            // restore-only saved profile must still select temporary mute.
+            safetyAction(19,s,autoLock,true);
+            applyRemoteSound(s,true);
             safetyApplied=true;
         }
         if(sendingText && s.textRevision>textRevisionAtSend && !s.textPending && s.textResult>=2){

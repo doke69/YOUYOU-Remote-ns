@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(UURemote-ns VERSION 0.3.9 LANGUAGES C CXX)
+project(UURemote-ns VERSION 0.3.10 LANGUAGES C CXX)
 set(UU_BUILD_LABEL "${PROJECT_VERSION}" CACHE STRING "Version label for a local review candidate")
 set(UU_UI_ASSET_DIR "${CMAKE_SOURCE_DIR}/romfs/ui-tv" CACHE PATH "Curated UI asset source directory (brand.rgba is excluded)")
 set(CMAKE_CXX_STANDARD 17)

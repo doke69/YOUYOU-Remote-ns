@@ -2,6 +2,8 @@
 #include "protocol.hpp"
 #include <optional>
 namespace uu {
+// Main.Message.simple_action belongs to CONTROL, not the clipboard/RPC TEXT channel.
+inline constexpr const char *systemActionChannel="CONTROL_DATA_CHANNEL";
 struct CaptureRpcAck {uint64_t requestId=0;unsigned errors=0,entries=0;int errorCode=0;bool capture=false;unsigned otherFields=0;};
 struct ScreenSourceInfo {int screenId=-1;unsigned count=0;};
 struct TextRpcAck {uint64_t requestId=0;unsigned status=0;};

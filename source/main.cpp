@@ -4,6 +4,7 @@
 #include "cpu_diagnostics.hpp"
 #include "diagnostics.hpp"
 #include "device_selection.hpp"
+#include "safety_settings.hpp"
 #include "live_telemetry.hpp"
 #include "native_display.hpp"
 #include "qrcodegen.hpp"

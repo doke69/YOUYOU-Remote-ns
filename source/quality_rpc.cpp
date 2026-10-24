@@ -48,11 +48,12 @@ Bytes nativeTouchMessage(uint64_t seq,int type,const Json &points){
 }
 Bytes simpleActionMessage(uint64_t seq,unsigned action,std::optional<bool> enabled) {
     if(!seq || !(action==2 || action==9 || action==10 || action==12 || action==13 ||
-        action==16 || action==17 || action==18 || action==19) || (action==19)!=enabled.has_value())
+        action==14 || action==16 || action==17 || action==18 || action==19) || (action==19)!=enabled.has_value())
         throw std::invalid_argument("Invalid system action");
     Bytes body,out;integer(body,1,action);
-    // Mobile AutoLockScreen.h / G6 adapter: 1=enable, 2=disable; 0 is unspecified.
-    if(enabled)integer(body,5,*enabled?1:2);
+    // Mobile AutoLockScreen.h: true takes const 2, false branches to const 1.
+    // Confirmed independently by the Linux host's SET_AUTO_LOCK decoder.
+    if(enabled)integer(body,5,*enabled?2:1);
     integer(out,1,seq);integer(out,2,nowMs());message(out,3,body);return out;
 }
 Bytes clipboardTextRpc(uint64_t id,const std::string &text){
