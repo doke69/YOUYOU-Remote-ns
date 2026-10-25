@@ -31,6 +31,6 @@ The native client protocol is ported from the user-provided local UURemote-web r
 - scripts/dependency-overrides contains modified libdatachannel/libjuice source under MPL-2.0, retaining upstream notices and original pinned archive references.
 - shaders/ and the geometric UI fallback are project adaptation code. Reference APKs, extracted UU TV textures and branding, credentials, and Nintendo firmware are not included in this source import.
 
-## Current source publication (0.3.9)
+## Current source publication (0.3.44)
 
 Attributions and research-only references: [docs/credits.md](docs/credits.md). Distribution boundaries: [docs/distribution.md](docs/distribution.md). Verified dependency overlays retain individual upstream notices and are recorded in scripts/dependency-overrides/manifest.json. Fonts are unmodified Noto Sans SC under OFL-1.1. No official UU UI textures or fonts are included in this source snapshot.

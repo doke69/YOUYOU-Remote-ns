@@ -12,6 +12,7 @@
 - [源码构建](docs/build.md)
 - [进度和已知限制](docs/project-status.md)
 - [0.3.44 更新说明](docs/releases/v0.3.44.md) · [历史记录](CHANGELOG.md)
+- [维护与发布核对清单](docs/release-process.md)
 - [来源、引用与致谢](docs/credits.md)
 
 ## 已有功能
