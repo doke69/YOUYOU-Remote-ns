@@ -31,6 +31,191 @@
 
 namespace uu {
 namespace {
+bool verboseDiagnostics() {
+    static const bool enabled=ConfigStore::instance().integer("diag_verbose",0,0,1)!=0;
+    return enabled;
+}
+// Diagnostic-only, bounded JSON shape summary. String values are never
+// printed; only keys, numeric/boolean values, string lengths and array sizes.
+std::string jsonShape(const Json &value,unsigned depth=0) {
+    if(depth>5)return "...";
+    if(value.is_object()) {
+        std::string out="{";unsigned count=0;
+        for(auto it=value.begin();it!=value.end() && count<32 && out.size()<1600;++it,++count) {
+            if(out.size()>1)out+=",";
+            out+=it.key()+":";
+            const auto key=it.key();
+            const bool allowString=key=="type" || key=="capture_impl" || key=="encoder_impl" ||
+                key=="video_codec" || key=="codec" || key=="codec_name" || key=="chroma_sampling" ||
+                key=="resolution_type" || key=="profile" || key=="level";
+            if(allowString && it.value().is_string()) {
+                auto text=it.value().get<std::string>();
+                if(text.size()>48)text.resize(48);
+                out+="\""+text+"\"";
+            } else out+=jsonShape(it.value(),depth+1);
+        }
+        if(count<value.size())out+=",...";
+        out+="}";return out;
+    }
+    if(value.is_array()) {
+        std::string out="[";unsigned count=0;
+        for(const auto &item:value) {
+            if(count>=8){out+=",...";break;}
+            if(count)out+=",";
+            out+=jsonShape(item,depth+1);++count;
+        }
+        out+="]";return out;
+    }
+    if(value.is_number_integer())return std::to_string(value.get<long long>());
+    if(value.is_number_unsigned())return std::to_string(value.get<unsigned long long>());
+    if(value.is_number_float()){
+        char out[32];std::snprintf(out,sizeof out,"%.3f",value.get<double>());return out;
+    }
+    if(value.is_boolean())return value.get<bool>()?"true":"false";
+    if(value.is_string()) {
+        const auto text=value.get<std::string>();
+        if(!text.empty() && (text.front()=='{' || text.front()=='[')) {
+            try { const auto nested=Json::parse(text); return "json-string("+jsonShape(nested,depth+1)+")"; }
+            catch(...) {}
+        }
+        return "string("+std::to_string(text.size())+")";
+    }
+    if(value.is_null())return "null";
+    return "?";
+}
+std::string streamerDataShape(const uint8_t *data,size_t size) {
+    if(!data || !size)return "empty";
+    if(size>65536)return "oversize-"+std::to_string(size);
+    try {
+        const auto value=Json::parse(std::string(reinterpret_cast<const char *>(data),size));
+        return jsonShape(value);
+    }catch(...) {
+        return "non-json-size-"+std::to_string(size);
+    }
+}
+// Diagnostic-only flattened path/value dump for forward_setting. Known safe
+// strings may be shown; all other strings are reduced to their length.
+void jsonFlatten(const Json &value,const std::string &path,std::string &out,unsigned depth=0) {
+    if(out.size()>2800 || depth>8)return;
+    if(value.is_object()) {
+        unsigned count=0;
+        for(auto it=value.begin();it!=value.end() && count<32 && out.size()<2800;++it,++count) {
+            const auto child=path.empty()?it.key():path+"."+it.key();
+            jsonFlatten(it.value(),child,out,depth+1);
+        }
+        return;
+    }
+    if(value.is_array()) {
+        unsigned count=0;
+        for(const auto &item:value) {
+            if(count>=32 || out.size()>2800)break;
+            jsonFlatten(item,path+"["+std::to_string(count)+"]",out,depth+1);++count;
+        }
+        return;
+    }
+    if(out.size()>1)out+=";";
+    out+=path+"=";
+    if(value.is_number_integer())out+=std::to_string(value.get<long long>());
+    else if(value.is_number_unsigned())out+=std::to_string(value.get<unsigned long long>());
+    else if(value.is_number_float()){char b[32];std::snprintf(b,sizeof b,"%.3f",value.get<double>());out+=b;}
+    else if(value.is_boolean())out+=value.get<bool>()?"true":"false";
+    else if(value.is_string()) {
+        const auto text=value.get<std::string>();
+        const bool safe=path.find("type")!=std::string::npos || path.find("codec")!=std::string::npos ||
+            path.find("impl")!=std::string::npos || path.find("profile")!=std::string::npos ||
+            path.find("level")!=std::string::npos || path.find("resolution_type")!=std::string::npos;
+        if(safe && text.size()<=48)out+=text;else out+="string("+std::to_string(text.size())+")";
+    }else if(value.is_null())out+="null";else out+="?";
+}
+// Bounded, read-only summary of PC capability values. Never includes client_id,
+// tokens, ICE credentials or arbitrary strings.
+struct ForwardSettingInfo {
+    std::string display,codecs,capture,encoder;
+    int track=-1;
+    std::string summary() const {
+        std::string out;
+        auto append=[&](const std::string &value){
+            if(value.empty())return;
+            if(!out.empty())out+=";";
+            out+=value;
+        };
+        append(display);
+        append(codecs);
+        std::string sender;
+        if(!capture.empty())sender+="capture-"+capture;
+        if(!encoder.empty()){if(!sender.empty())sender+="-";sender+="encoder-"+encoder;}
+        if(track>=0){if(!sender.empty())sender+="-";sender+="track"+std::to_string(track);}
+        append(sender);
+        return out;
+    }
+};
+std::optional<ForwardSettingInfo> parseForwardSetting(const Json &event) {
+    if(!event.is_array() || event.size()<2 || !event[1].is_object())return std::nullopt;
+    const auto &root=event[1];
+    if(!root.contains("data") || !root["data"].is_object())return std::nullopt;
+    const auto &data=root["data"];
+    ForwardSettingInfo out;
+    if(data.contains("device_capability") && data["device_capability"].is_object()){
+        const auto &cap=data["device_capability"];
+        if(cap.contains("display_info") && cap["display_info"].is_array()){
+            unsigned n=0;
+            for(const auto &d:cap["display_info"]){
+                if(n++>=8)break;
+                if(!d.is_object())continue;
+                if(!out.display.empty())out.display+=";";
+                out.display+="id"+std::to_string(d.value("id",0))+
+                    "-fps"+std::to_string(d.value("fps",0))+
+                    "-hdr"+std::to_string(d.value("hdr",0))+
+                    "-type"+std::to_string(d.value("type",0));
+            }
+        }
+        if(cap.contains("video_codec_capability") && cap["video_codec_capability"].is_array()){
+            unsigned n=0;
+            for(const auto &c:cap["video_codec_capability"]){
+                if(n++>=12)break;
+                if(!c.is_object())continue;
+                if(!out.codecs.empty())out.codecs+=";";
+                out.codecs+="codec"+std::to_string(c.value("video_codec",0))+
+                    "-impl"+std::to_string(c.value("codec_impl",0))+
+                    "-bit"+std::to_string(c.value("bit_depth",0))+
+                    "-chroma"+std::to_string(c.value("chroma_sampling",0))+
+                    "-"+std::to_string(c.value("width",0))+"x"+std::to_string(c.value("height",0));
+            }
+        }
+    }
+    if(data.contains("sender_para_info") && data["sender_para_info"].is_object()){
+        const auto &sender=data["sender_para_info"];
+        out.capture=sender.value("capture_impl",std::string{});
+        out.encoder=sender.value("encoder_impl",std::string{});
+        out.track=sender.value("video_track_index",-1);
+    }
+    if(out.display.empty() && out.codecs.empty() && out.capture.empty() &&
+       out.encoder.empty() && out.track<0)return std::nullopt;
+    return out;
+}
+// Client capability sent to the PC through the control event's streamer_data.
+// Resolution is a separate concept from the quality/bitrate preset; these
+// entries bound the encoder output to what the Switch can actually present.
+std::string clientCapabilityJson(int width,int height,int fps,int quality) {
+    auto display=[&](int id){
+        return Json{{"id",id},{"width",width},{"height",height},{"fps",fps},
+                    {"hdr",-2},{"type",0},{"dpi_scale",100}};
+    };
+    auto capability=[&](int codec,int w,int h){
+        return Json{{"video_codec",codec},{"codec_impl",1},{"bit_depth",8},
+                    {"chroma_sampling",1},{"max_width",w},{"max_height",h},
+                    {"width",w},{"height",h},{"max_frame_quality",quality},
+                    {"result",0}};
+    };
+    Json cap;
+    cap["remote_display_info"]=Json::array({display(0)});
+    cap["local_display_info"]=Json::array({display(0)});
+    cap["frame_quality_capability"]=Json::array({
+        capability(1,1280,720),capability(2,1280,720),
+        capability(1,1920,1080),capability(2,1920,1080)
+    });
+    return cap.dump();
+}
 // RTP and RTX have independent SSRC/sequence spaces (RFC 4588). The stock
 // receiving session keeps one sequence counter; only feed the primary stream
 // into that counter, while preserving raw RTX for the assembler downstream.
@@ -133,14 +318,6 @@ int configInt(const std::string &key, int fallback, int minimum, int maximum) {
 bool diagEnabled() {
     const auto value = configValue("diag");
     return !value.empty() && value != "0" && value != "off" && value != "no";
-}
-const char *transportLabel(const rtc::Candidate &local, const rtc::Candidate &remote) {
-    using Type = rtc::Candidate::Type;
-    if (local.type() == Type::Relayed || remote.type() == Type::Relayed)
-        return "TURN 中继";
-    if (local.type() == Type::Host && remote.type() == Type::Host)
-        return "局域网直连";
-    return "P2P 直连";
 }
 const char *protocolLabel(rtc::Candidate::TransportType type) {
     using Type = rtc::Candidate::TransportType;
@@ -400,6 +577,7 @@ void Client::run() {
                 reconnectAttempts_=0;connectedSince_=0;
             }
             tickQuality();
+            tickVideoScale();
             if(pendingText_ && monotonicMs()>=pendingText_->deadline)
                 finishTextInput(3,"电脑未确认文字同步，请重试；尚未粘贴");
             if (strictVideo_)
@@ -513,10 +691,59 @@ void Client::handle(const Event &event) {
         const int screen=data.at("screen").get<int>();
         if(screen!=activeScreenId_){
             activeScreenId_=screen;
+            pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+            setVideoScaleNotice("屏幕信息已更新，等待核对视频尺寸");
             diagnostic(("quality-current-screen-"+std::to_string(screen)+"-count-"+std::to_string(data.at("count").get<unsigned>())).c_str());
             if(pendingQuality_ && pendingQuality_->screenId!=screen)
                 fallbackQuality("电脑屏幕已变化，正在重新连接…");
         }
+    } else if(e=="capture-setting-sync") {
+        const int syncFps=data.value("fps",0)==1?30:(data.value("fps",0)==2?60:0);
+        const int syncQuality=data.value("quality",0);
+        const int syncWidth=data.value("width",0),syncHeight=data.value("height",0);
+        const int64_t syncBitrate=data.value("bitrate",int64_t(0));
+        const int syncMbps=int(syncBitrate>0?(syncBitrate+500000)/1000000:0);
+        {
+            std::lock_guard lock(stateMutex_);
+            state_.appliedFps=syncFps;state_.appliedQuality=syncQuality;
+            state_.appliedWidth=syncWidth;state_.appliedHeight=syncHeight;
+            state_.appliedBitrateMbps=syncMbps;
+            state_.appliedValid=syncFps||syncQuality||syncWidth||syncHeight;
+            if(state_.appliedValid){
+                state_.settingAccepted=true;
+                state_.settingApplied=((!syncFps||syncFps==streamFps_) &&
+                    (!syncQuality||syncQuality==streamQuality_) &&
+                    (!syncWidth||syncWidth==streamWidth_) &&
+                    (!syncHeight||syncHeight==streamHeight_) &&
+                    (!syncMbps||!maxBitrateMbps_||syncMbps==maxBitrateMbps_));
+                state_.settingRejected=false;
+                state_.settingErrorCode=0;
+                state_.settingSource="sync";
+            }
+        }
+        const bool matches=((!syncFps||syncFps==streamFps_) &&
+                            (!syncQuality||syncQuality==streamQuality_) &&
+                            (!syncWidth||syncWidth==streamWidth_) &&
+                            (!syncHeight||syncHeight==streamHeight_) &&
+                            (!syncMbps||!maxBitrateMbps_||syncMbps==maxBitrateMbps_));
+        diagnostic(("capture-setting-sync-fps-"+std::to_string(syncFps)+
+                    "-quality-"+std::to_string(syncQuality)+
+                    "-chroma-"+std::to_string(data.value("chroma",0))+
+                    "-bitrate-"+std::to_string(syncBitrate)+
+                    "-resolution-"+std::to_string(syncWidth)+"x"+std::to_string(syncHeight)+
+                    "-type-"+std::to_string(data.value("resolution_type",0))+
+                    "-pixel-"+std::to_string(data.value("pixel_width",0))+"x"+std::to_string(data.value("pixel_height",0))+
+                    "-orientation-"+std::to_string(data.value("orientation",0))+
+                    "-target-fps-"+std::to_string(streamFps_)+
+                    "-quality-"+std::to_string(streamQuality_)+
+                    "-resolution-"+std::to_string(streamWidth_)+"x"+std::to_string(streamHeight_)+
+                    "-matches-"+std::to_string(matches?1:0)).c_str());
+    } else if(e=="screen-wire") {
+        if(verboseDiagnostics())diagnostic(("screen-wire-"+data.get<std::string>()).c_str());
+    } else if(e=="streamer-data") {
+        if(verboseDiagnostics())diagnostic(("streamer-data-"+data.get<std::string>()).c_str());
+    } else if(e=="channel-data") {
+        diagnostic(("channel-data-"+data.value("label",std::string("?"))+"-"+data.value("shape",std::string("?"))).c_str());
     } else if (e == "quality-settings") {
         const int width = data.at("width").get<int>(), height = data.at("height").get<int>();
         const int fps = data.at("fps").get<int>(), quality = data.at("quality").get<int>();
@@ -531,6 +758,7 @@ void Client::handle(const Event &event) {
         const bool hevc=data.value("hevc",hevc_);
         if(pendingQuality_){std::lock_guard lock(stateMutex_);state_.qualityNotice="正在更新画质，请稍候";return;}
         const QualityValues target{width,height,fps,quality,maxBitrate,playoutDelay,vsync,hevc};
+        const bool resolutionChanged=width!=streamWidth_ || height!=streamHeight_;
         const bool captureChanged=width!=streamWidth_ || height!=streamHeight_ || fps!=streamFps_ || quality!=streamQuality_ ||
             ((quality==6 || streamQuality_==6) && maxBitrate!=maxBitrateMbps_);
         const bool capChanged=maxBitrate!=maxBitrateMbps_;
@@ -549,6 +777,14 @@ void Client::handle(const Event &event) {
             catch(...){reconnectQuality(target,"在线更新未完成，正在重连应用…");}
             return;
         }
+        if(resolutionChanged){
+            // PC 4.42 acknowledges ResolutionSettingRequest but does not apply
+            // the new capture geometry until the capture session is rebuilt.
+            // Reconnect explicitly instead of stalling for a timeout.
+            diagnostic("resolution-change-explicit-reconnect");
+            reconnectQuality(target,"分辨率变化需要重建编码会话…");
+            return;
+        }
         const auto it=channels_.find("TEXT_DATA_CHANNEL");
         if(it==channels_.end() || !it->second->isOpen() || it->second->bufferedAmount()>65536){
             reconnectQuality(target,"设置通道尚未就绪，正在重连应用…");return;
@@ -558,16 +794,58 @@ void Client::handle(const Event &event) {
             reconnectQuality(target,"尚未收到电脑屏幕信息，正在重连应用…");return;
         }
         const auto id=nextQualityRpc_++;
-        const auto bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
-        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_};
-        {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";}
+        const bool qualityOnly=!resolutionChanged;
+        const bool fpsChanged=fps!=streamFps_;
+        const bool qualityChanged=quality!=streamQuality_;
+        const bool customBitrateChanged=((quality==6 || streamQuality_==6) && maxBitrate!=maxBitrateMbps_);
+        Bytes bytes;
+        std::string rpcMode;
+        QualityRpcKind rpcKind=QualityRpcKind::QualityOnly;
+        if(qualityOnly && fpsChanged && !qualityChanged && !customBitrateChanged && fpsSettingSupported_){
+            // Protocol-native FpsSettingRequest: frame rate only. This is safe
+            // for custom-bitrate (q6) sessions because it carries no bitrate or
+            // resolution field.
+            bytes=fpsSettingRpc(id,fps);
+            rpcMode="fps-setting";rpcKind=QualityRpcKind::Fps;
+        }else if(qualityOnly && qualityChanged && !fpsChanged && !customBitrateChanged && quality!=6 && streamQuality_!=6 && qualitySettingSupported_){
+            // Protocol-native VideoQualitySettingReqeust: frame quality only.
+            bytes=videoQualitySettingRpc(id,quality);
+            rpcMode="video-quality-setting";rpcKind=QualityRpcKind::VideoQuality;
+        }else if(qualityOnly){
+            bytes=qualityUpdateRpc(id,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
+            rpcMode="quality-only";rpcKind=QualityRpcKind::QualityOnly;
+        }else{
+            bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
+            rpcMode="capture";rpcKind=QualityRpcKind::Capture;
+        }
+        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_,rpcKind,false};
+        {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";
+         state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
+         state_.settingErrorCode=0;state_.settingSource="pending";}
         try{
             if(!it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
                 fallbackQuality("设置发送受阻，正在重连应用…");return;
             }
-            ++qualitySent_;diagnostic(("quality-rpc-sent-"+std::to_string(id)).c_str());
+            ++qualitySent_;
+            diagnostic((rpcMode+"-rpc-sent-"+std::to_string(id)).c_str());
         }catch(...){fallbackQuality("设置发送失败，正在重连应用…");}
     } else if(e=="quality-rpc-ack") {
+        if(pendingVideoScale_ && data.at("id").get<uint64_t>()==pendingVideoScale_->id){
+            if(pendingVideoScale_->acknowledged)return;
+            if(data.value("errors",0u) || data.value("other",0u)){
+                pendingVideoScale_.reset();
+                setVideoScaleNotice("电脑未接受视频缩放，桌面设置保持不变");
+                diagnostic("video-scale-not-accepted");return;
+            }
+            const auto media=media_->stats();
+            pendingVideoScale_->acknowledged=true;
+            pendingVideoScale_->deadline=monotonicMs()+5000;
+            pendingVideoScale_->mediaEpoch=media.epoch;
+            pendingVideoScale_->publishedBefore=media.publishedTotal;
+            nextVideoScaleCheck_=0;
+            setVideoScaleNotice("电脑已应答，正在核对实际视频尺寸");
+            diagnostic("video-scale-acknowledged");return;
+        }
         if(!pendingQuality_ || pendingQuality_->acknowledged || data.at("id").get<uint64_t>()!=pendingQuality_->id)return;
         const bool capture=data.value("capture",false);
         const auto errors=data.value("errors",0u),other=data.value("other",0u);
@@ -578,6 +856,52 @@ void Client::handle(const Event &event) {
                     "-other-"+std::to_string(other)).c_str());
         if(errors || other){
             diagnostic("quality-rpc-response-not-accepted");
+            {
+                std::lock_guard lock(stateMutex_);
+                state_.settingAccepted=false;state_.settingApplied=false;
+                state_.settingRejected=true;state_.settingErrorCode=data.value("code",0);
+                state_.settingSource="ack";
+            }
+            const auto failedKind=pendingQuality_?pendingQuality_->kind:QualityRpcKind::QualityOnly;
+            // A rejected fps/quality/bitrate update must not tear down a working
+            // stream. Keep the old encoder settings, surface rejected state, and
+            // let the user retry or reconnect explicitly.
+            if(pendingQuality_ && failedKind==QualityRpcKind::QualityOnly){
+                pendingQuality_.reset();++qualityFailed_;
+                {std::lock_guard lock(stateMutex_);
+                 state_.qualityPending=false;
+                 state_.qualityNotice="电脑拒绝在线设置，保持当前串流";}
+                qualityNoticeUntil_=monotonicMs()+8000;
+                diagnostic("quality-update-rejected-stream-kept");
+                return;
+            }
+            if(pendingQuality_ && !pendingQuality_->retried){
+                const auto kind=pendingQuality_->kind;
+                if(kind==QualityRpcKind::Fps || kind==QualityRpcKind::VideoQuality){
+                    if(kind==QualityRpcKind::Fps)fpsSettingSupported_=false;
+                    if(kind==QualityRpcKind::VideoQuality)qualitySettingSupported_=false;
+                    const auto target=pendingQuality_->target;
+                    pendingQuality_.reset();
+                    const auto retryId=nextQualityRpc_++;
+                    Bytes retry;
+                    try{
+                        retry=qualityUpdateRpc(retryId,target.fps,target.quality,activeScreenId_,
+                                               target.quality==6?target.cap:0);
+                    }catch(...){reconnectQuality(target,"兼容设置构造失败，正在重连应用…");return;}
+                    pendingQuality_=PendingQuality{target,retryId,monotonicMs()+5000,false,false,activeScreenId_,
+                        QualityRpcKind::QualityOnly,true};
+                    {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在重试兼容设置…";}
+                    auto channel=channels_.find("TEXT_DATA_CHANNEL");
+                    if(channel==channels_.end() || !channel->second->isOpen() ||
+                       !channel->second->send(reinterpret_cast<const std::byte *>(retry.data()),retry.size())){
+                        fallbackQuality("兼容设置通道不可用，正在重连应用…");return;
+                    }
+                    ++qualitySent_;
+                    diagnostic(("setting-unsupported-fallback-quality-update-"+
+                                std::to_string(retryId)).c_str());
+                    return;
+                }
+            }
             fallbackQuality("电脑未确认在线设置，正在重连应用…");return;
         }
         // Original CaptureSettingResp leaves errors empty when the optional
@@ -585,6 +909,12 @@ void Client::handle(const Event &event) {
         // acknowledgment, not evidence of actual encoder FPS or quality.
         pendingQuality_->headerOnly=!capture;
         ++qualityAcked_;pendingQuality_->acknowledged=true;pendingQuality_->deadline=monotonicMs()+5000;
+        {
+            std::lock_guard lock(stateMutex_);
+            state_.settingAccepted=true;state_.settingApplied=false;
+            state_.settingRejected=false;state_.settingErrorCode=0;
+            state_.settingSource="ack";
+        }
         diagnostic(("quality-rpc-acked-"+std::to_string(pendingQuality_->id)).c_str());
         if(video_)video_->requestKeyframe();
         finishQuality();
@@ -941,6 +1271,8 @@ void Client::dispatch(const SioPacket &p) {
         auto event = it->second;
         acks_.erase(it);
         auto value = ackValue(p.data, event);
+        if(verboseDiagnostics() && event!="soac")
+            diagnostic(("socket-ack-"+event+"-id-"+std::to_string(p.id)+"-shape-"+jsonShape(p.data)).c_str());
         if (event == "room") {
             auto publisher = value.at("publisher");
             remote_ = publisher.is_object() ? publisher.value("client_id", publisher.value("id", Json{}))
@@ -948,28 +1280,51 @@ void Client::dispatch(const SioPacket &p) {
             if ((!remote_.is_string() && !remote_.is_number()) || remote_ == "")
                 throw std::runtime_error("房间内没有在线电脑");
             control_ = uuid();
-            auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_,streamQuality_==6?maxBitrateMbps_:0);
+            auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_,streamQuality_==6?maxBitrateMbps_:0,hevc_);
             options.insert(options.begin(), 4);
             diagnostic(("stream-options-" + std::to_string(streamWidth_) + "x" +
                         std::to_string(streamHeight_) + "-" + std::to_string(streamFps_) + "fps-q" +
                         std::to_string(streamQuality_) + "-cap" +
                         (streamQuality_==6?std::to_string(maxBitrateMbps_):std::string("auto")) +
-                        "-kf" + std::to_string(keyframeIntervalMs_))
+                        "-kf" + std::to_string(keyframeIntervalMs_) +
+                        (hevc_?"-decoder-cap-h265":"-decoder-cap-h264"))
                            .c_str());
             setState("negotiating", "正在申请远控权限…");
             // Preserve room ICE configuration if control does not repeat it.
             ice_ = value.value("iceServers", Json::array());
             emit("control",
                  {{"app_data", {{"_placeholder", true}, {"num", 0}}},
-                  {"streamer_data", ""},
+                  {"streamer_data", clientCapabilityJson(streamWidth_,streamHeight_,streamFps_,streamQuality_)},
                   {"app_control_id", control_}},
                  "control", options);
+            diagnostic(("client-capability-json-bytes-"+
+                        std::to_string(clientCapabilityJson(streamWidth_,streamHeight_,streamFps_,streamQuality_).size())).c_str());
         } else if (event == "control")
             beginPeer(value);
     } else if (p.type == 2 || p.type == 5) {
         if (!p.data.is_array() || p.data.empty() || !p.data[0].is_string())
             throw std::runtime_error("Invalid signaling event");
         auto event = p.data[0].get<std::string>();
+        if(verboseDiagnostics() && event!="soac")
+            diagnostic(("socket-event-"+event+"-id-"+std::to_string(p.id)+"-shape-"+jsonShape(p.data)).c_str());
+        if(event=="forward_setting") {
+            if(const auto info=parseForwardSetting(p.data)){
+                const auto summary=info->summary();
+                if(!summary.empty())diagnostic(("forward-setting-summary-"+summary).c_str());
+                std::lock_guard lock(stateMutex_);
+                state_.serverDisplayInfo=info->display;
+                state_.serverCodecInfo=info->codecs;
+                state_.serverCaptureImpl=info->capture;
+                state_.serverEncoderImpl=info->encoder;
+                state_.serverVideoTrack=info->track;
+                state_.serverCapabilityValid=true;
+            }
+            if(verboseDiagnostics()) {
+                std::string flat;
+                jsonFlatten(p.data,"",flat);
+                if(!flat.empty())diagnostic(("forward-setting-"+flat).c_str());
+            }
+        }
         if (event == "soac" && p.data.size() > 1) {
             if (peer_)
                 handleSoac(p.data[1]);
@@ -1178,19 +1533,45 @@ void Client::beginPeer(const Json &result) {
         }
         {
             const bool acceptRpc=std::string(label)=="TEXT_DATA_CHANNEL" || std::string(label)=="FILE_DATA_CHANNEL";
+            const bool streamerData=std::string(label)=="STREAMER_DATA_CHANNEL";
+            const std::string labelText=label;
+            const bool traceChannel=labelText!="TEXT_DATA_CHANNEL" && labelText!="FILE_DATA_CHANNEL";
             std::weak_ptr<Inbox> inbox=inbox_;const auto generation=generation_;
-            channel->onMessage([inbox,generation,acceptRpc](rtc::message_variant message) {
+            channel->onMessage([inbox,generation,acceptRpc,streamerData,labelText,traceChannel](rtc::message_variant message) {
                 const uint8_t *bytes=nullptr;size_t size=0;
                 if(auto *binary=std::get_if<rtc::binary>(&message)){bytes=reinterpret_cast<const uint8_t *>(binary->data());size=binary->size();}
                 else if(auto *text=std::get_if<std::string>(&message)){bytes=reinterpret_cast<const uint8_t *>(text->data());size=text->size();}
                 const auto screens=parseScreenSources(bytes,size);
+                const auto settingSync=parseCaptureSettingSync(bytes,size);
                 const auto ack=acceptRpc?parseCaptureRpcAck(bytes,size):std::optional<CaptureRpcAck>{};
                 const auto textAck=acceptRpc?parseTextRpcAck(bytes,size):std::optional<TextRpcAck>{};
-                if(!screens && !ack && !textAck)return;
+                std::string streamerShape,channelShape;
+                if(verboseDiagnostics() && streamerData)
+                    streamerShape=streamerDataShape(bytes,size);
+                if(verboseDiagnostics() && traceChannel && size && !screens && !ack && !textAck)
+                    channelShape=streamerDataShape(bytes,size);
+                if(!streamerShape.empty())
+                    diagnostic(("streamer-data-"+streamerShape).c_str());
+                if(!channelShape.empty())
+                    diagnostic(("channel-data-"+labelText+"-"+channelShape).c_str());
+                if(!screens && !ack && !textAck && !settingSync)return;
                 if(auto queue=inbox.lock()){
                     std::lock_guard lock(queue->mutex);
                     if(queue->events.size()>124)return;
                     if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
+                    if(settingSync)queue->events.push_back({"capture-setting-sync",
+                        {{"fps",settingSync->fps},{"quality",settingSync->quality},
+                         {"chroma",settingSync->chroma},{"bitrate",settingSync->maxCustomBitrate},
+                         {"width",settingSync->width},{"height",settingSync->height},
+                         {"resolution_type",settingSync->resolutionType},
+                         {"dpi_scale",settingSync->dpiScale},
+                         {"pixel_width",settingSync->pixelWidth},
+                         {"pixel_height",settingSync->pixelHeight},
+                         {"orientation",settingSync->orientation}},generation});
+                    if(screens && verboseDiagnostics()){
+                        const auto summary=screenSourceWireSummary(bytes,size);
+                        if(!summary.empty())queue->events.push_back({"screen-wire",summary,generation});
+                    }
                     if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
                     if(textAck)queue->events.push_back({"text-input-ack",{{"id",textAck->requestId},{"status",textAck->status}},generation});
                     queue->cv.notify_one();
@@ -1477,6 +1858,8 @@ void Client::disconnect() {
     feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
 #endif
     pendingQuality_.reset();
+    pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+    setVideoScaleNotice("");
     {std::lock_guard lock(stateMutex_);state_.qualityPending=false;}
     connectedSince_=0;
     if (strictVideo_)
@@ -1528,6 +1911,13 @@ void Client::disconnect() {
         state_.activeDeviceId.clear();
         state_.textChannelReady=false;
         state_.controlChannelReady=false;
+        state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
+        state_.settingErrorCode=0;state_.settingSource="none";
+        state_.appliedFps=0;state_.appliedQuality=0;state_.appliedWidth=0;state_.appliedHeight=0;
+        state_.appliedBitrateMbps=0;state_.appliedValid=false;
+        state_.serverCapabilityValid=false;
+        state_.serverDisplayInfo.clear();state_.serverCodecInfo.clear();
+        state_.serverCaptureImpl.clear();state_.serverEncoderImpl.clear();state_.serverVideoTrack=-1;
     }
 }
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
@@ -1538,8 +1928,13 @@ void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice
     const bool fixedUiPreset=q.quality==6 && (q.cap==5 || q.cap==12 || q.cap==20 || q.cap==30);
     if(q.quality!=6 || fixedUiPreset)saveQuality(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
     media_->setPlayoutDelay(q.delay);
+    const bool sizeChanged=q.width!=streamWidth_ || q.height!=streamHeight_;
     streamWidth_=q.width;streamHeight_=q.height;streamFps_=q.fps;streamQuality_=q.quality;
     maxBitrateMbps_=q.cap;hevc_=q.hevc;
+    if(sizeChanged){
+        pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+        setVideoScaleNotice("视频尺寸设置已变化，等待重新缩放");
+    }
     if(hotCap && q.quality!=6) {bitrateFeedbackSent_=true;diagnostic("quality-remb-hot-updated");}
     {std::lock_guard lock(stateMutex_);
         state_.width=q.width;state_.height=q.height;state_.fps=q.fps;state_.quality=q.quality;
@@ -1559,7 +1954,10 @@ void Client::finishQuality() {
     const auto q=pendingQuality_->target;const auto media=media_->stats();
     if((q.width!=streamWidth_ || q.height!=streamHeight_) && (media.width!=q.width || media.height!=q.height))return;
     try {
-        commitQuality(q,q.quality!=6 && q.cap!=maxBitrateMbps_,"电脑已应答画质设置");
+        const char *notice=pendingQuality_->headerOnly
+            ? "电脑已接收，等待实际状态"
+            : "电脑已确认画质设置";
+        commitQuality(q,q.quality!=6 && q.cap!=maxBitrateMbps_,notice);
         diagnostic(pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
         pendingQuality_.reset();
     }catch(...){fallbackQuality("在线设置未完成，正在重连应用…");}
@@ -1572,10 +1970,92 @@ void Client::fallbackQuality(const char *notice) {
 void Client::tickQuality() {
     if(pendingQuality_){
         finishQuality();
-        if(pendingQuality_ && monotonicMs()>=pendingQuality_->deadline)fallbackQuality("在线设置超时，正在重连应用…");
+        if(pendingQuality_ && monotonicMs()>=pendingQuality_->deadline)
+            fallbackQuality("在线设置超时，正在重连应用…");
     }
     if(qualityNoticeUntil_ && monotonicMs()>=qualityNoticeUntil_ && !pendingQuality_){
         std::lock_guard lock(stateMutex_);state_.qualityNotice.clear();qualityNoticeUntil_=0;
+    }
+}
+void Client::setVideoScaleNotice(const std::string &notice) {
+    std::lock_guard lock(stateMutex_);
+    state_.videoScaleNotice=notice;
+}
+void Client::tickVideoScale() {
+    const auto now=monotonicMs();
+    if(now<nextVideoScaleCheck_)return;
+    nextVideoScaleCheck_=now+250;
+    const auto state=snapshot();
+    if(!state.streaming || pendingQuality_)return;
+    const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+    if(channel==channels_.end() || !channel->second->isOpen())return;
+    if(activeScreenId_<0)return;
+
+    if(pendingVideoScale_){
+        const auto &request=*pendingVideoScale_;
+        const auto media=media_->stats();
+        if(request.acknowledged && media.epoch==request.mediaEpoch &&
+           media.publishedTotal>request.publishedBefore && media.width>0 && media.height>0 &&
+           media.width<=request.targetWidth && media.height<=request.targetHeight){
+            videoScaleVerified_=true;pendingVideoScale_.reset();
+            setVideoScaleNotice("实际视频尺寸已缩放到上限");
+            diagnostic(("video-scale-verified-"+std::to_string(media.width)+"x"+
+                        std::to_string(media.height)).c_str());
+        }else if(now>=request.deadline){
+            const bool acknowledged=request.acknowledged;
+            pendingVideoScale_.reset();
+            setVideoScaleNotice(acknowledged?"电脑已应答但视频尺寸未变化":"电脑未确认视频缩放，未自动重试");
+            if(acknowledged)
+                diagnostic(("video-scale-size-unconfirmed-actual-"+std::to_string(media.width)+"x"+
+                            std::to_string(media.height)).c_str());
+            else
+                diagnostic("video-scale-ack-timeout");
+        }
+        return;
+    }
+    if(videoScaleAttempted_){
+        if(videoScaleVerified_){
+            const auto media=media_->stats();
+            if(media.width>0 && media.height>0 &&
+               (media.width>streamWidth_ || media.height>streamHeight_)){
+                videoScaleVerified_=false;
+                videoScaleAttempted_=false;
+                nextVideoScaleCheck_=0;
+                setVideoScaleNotice("实际视频已超出所选尺寸；正在重新请求缩放");
+                diagnostic(("video-scale-output-exceeded-"+std::to_string(media.width)+"x"+
+                            std::to_string(media.height)).c_str());
+            }
+        }
+        return;
+    }
+    const auto media=media_->stats();
+    if(media.width<=0 || media.height<=0 || media.width>16384 || media.height>16384)return;
+    if(media.width<=streamWidth_ && media.height<=streamHeight_){
+        videoScaleAttempted_=true;videoScaleVerified_=true;
+        setVideoScaleNotice("视频尺寸已在目标范围内");
+        diagnostic(("video-scale-already-within-"+std::to_string(media.width)+"x"+
+                    std::to_string(media.height)).c_str());
+        return;
+    }
+    if(channel->second->bufferedAmount()>65536)return;
+    videoScaleAttempted_=true;videoScaleVerified_=false;
+    const auto id=nextQualityRpc_++;
+    try {
+        const auto bytes=videoScaleRpc(id,media.width,media.height,streamWidth_,streamHeight_,
+                                       streamFps_,streamQuality_,activeScreenId_,
+                                       streamQuality_==6?maxBitrateMbps_:0);
+        pendingVideoScale_=PendingVideoScale{id,now+8000,media.width,media.height,
+                                             streamWidth_,streamHeight_};
+        setVideoScaleNotice("正在请求把视频缩放到 "+std::to_string(streamWidth_)+"×"+
+                            std::to_string(streamHeight_)+"，保留电脑桌面");
+        const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+        diagnostic(((sent?"video-scale-request-sent-src-":"video-scale-request-queued-src-")+
+                   std::to_string(media.width)+"x"+std::to_string(media.height)+
+                   "-dst-"+std::to_string(streamWidth_)+"x"+std::to_string(streamHeight_)).c_str());
+    }catch(...){
+        pendingVideoScale_.reset();
+        setVideoScaleNotice("视频缩放请求未发送，未自动重试");
+        diagnostic("video-scale-send-failed");
     }
 }
 void Client::applyBitrateCap() {

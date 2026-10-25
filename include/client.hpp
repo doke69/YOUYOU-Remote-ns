@@ -30,7 +30,21 @@ struct Snapshot {
     int quality = 3, maxBitrateMbps = 0;
     bool vsync = true, hevc = false, qualityPending=false;
     std::string qualityNotice;
+    std::string videoScaleNotice;
     int playoutDelayMs = 35;
+    // Actual host capture state, when CaptureSettingSync is available.
+    int appliedFps = 0, appliedQuality = 0, appliedWidth = 0, appliedHeight = 0;
+    int appliedBitrateMbps = 0;
+    bool appliedValid = false;
+    // Unified setting result: ACK is accepted; only CaptureSettingSync/media
+    // can promote a setting to applied.
+    bool settingAccepted=false, settingApplied=false, settingRejected=false;
+    int settingErrorCode=0;
+    std::string settingSource;
+    // Parsed forward_setting capability summary (safe, bounded strings only).
+    bool serverCapabilityValid=false;
+    std::string serverDisplayInfo,serverCodecInfo,serverCaptureImpl,serverEncoderImpl;
+    int serverVideoTrack=-1;
     std::string loginMode = "qr";
     int64_t smsRetryAt = 0;
 };
@@ -93,8 +107,10 @@ class Client {
     int64_t lastBitrateAttempt_ = 0;
     void applyBitrateCap();
     struct QualityValues {int width,height,fps,quality,cap,delay;bool vsync,hevc;};
-    struct PendingQuality {QualityValues target;uint64_t id;int64_t deadline;bool acknowledged=false;bool headerOnly=false;int screenId=-1;};
+    enum class QualityRpcKind {QualityOnly,Capture,Fps,VideoQuality};
+    struct PendingQuality {QualityValues target;uint64_t id;int64_t deadline;bool acknowledged=false;bool headerOnly=false;int screenId=-1;QualityRpcKind kind=QualityRpcKind::QualityOnly;bool retried=false;};
     std::optional<PendingQuality> pendingQuality_;
+    bool fpsSettingSupported_=true,qualitySettingSupported_=true;
     uint64_t nextQualityRpc_=1,qualitySent_=0,qualityAcked_=0,qualityFailed_=0;
     int activeScreenId_=-1,lastQualityCode_=0;unsigned lastQualityErrors_=0;
     int64_t qualityNoticeUntil_=0;
@@ -103,6 +119,12 @@ class Client {
     void finishQuality();
     void fallbackQuality(const char *notice);
     void tickQuality();
+    struct PendingVideoScale {uint64_t id;int64_t deadline;int sourceWidth,sourceHeight,targetWidth,targetHeight;bool acknowledged=false;uint64_t mediaEpoch=0,publishedBefore=0;};
+    std::optional<PendingVideoScale> pendingVideoScale_;
+    bool videoScaleAttempted_=false,videoScaleVerified_=false;
+    int64_t nextVideoScaleCheck_=0;
+    void tickVideoScale();
+    void setVideoScaleNotice(const std::string &);
     std::string connectedDeviceId_;
     bool autoReconnect_=true,reconnectArmed_=false;
     int reconnectAttempts_=0,reconnectLimit_=5;

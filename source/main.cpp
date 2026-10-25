@@ -688,10 +688,19 @@ int main(int, char **) {
                     nativeNv12=probe!=nullptr;
                     if(probe) uu::display::destroyTexture(probe);
                 }
-                media->setYuvOutput(nativeNv12);
-                media->setNativeOutput(uu::display::active());
-                uu::diagnostic(nativeNv12?"display-native-nv12-enabled":"display-native-nv12-unavailable-rgba");
-                uu::diagnostic(uu::display::active()?"display-native-output=1":"display-native-output=0");
+                // SDL's renderer may not enumerate NV12 even when deko3d can
+                // import hardware frames directly. Do not force CPU decoding in
+                // that case; deko import is bounded by native_nv12.cpp (1080p).
+                const bool dekoOutput=uu::display::active();
+                const bool yuvOutput=nativeNv12||dekoOutput;
+                media->setYuvOutput(yuvOutput);
+                media->setNativeOutput(dekoOutput);
+                char pathLine[128];
+                std::snprintf(pathLine,sizeof pathLine,
+                    "display-native-nv12-sdl=%d-deko=%d-yuv-output=%d",
+                    nativeNv12?1:0,dekoOutput?1:0,yuvOutput?1:0);
+                uu::diagnostic(pathLine);
+                uu::diagnostic(dekoOutput?"display-native-output=1":"display-native-output=0");
                 uu::LiveTelemetry telemetry;
                 Uint32 lastCpuLedgerSample=0;
                 Uint32 texFormat=0;
@@ -702,15 +711,18 @@ int main(int, char **) {
 #ifdef __SWITCH__
                 FocusHook focusHook(client);
 #endif
-                bool running = true, overlay = false, wasStreaming = false, touchHeld = false,
+                bool running = true, overlay = false, wasStreaming = false,
                      statsVisible = false, persistentNetwork = false;
                 int selected = 0, texW = 0, texH = 0;
+                unsigned lastVideoFormat = 0;
+                bool lastVideoHardware = false;
                 uint64_t serial = 0, lastHeld = 0;
                 // One transient NV12 import failure must not permanently switch
                 // the session to the CPU conversion path. Retry a few frames,
                 // then latch the existing fallback for this session.
                 unsigned nativeImportFailures = 0;
                 bool nativeFallback = false;
+                uint64_t nativeOutputEpoch = media->generation();
                 unsigned lastArrowMask=0;
                 bool nativePadRequested=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
                 Uint32 nativePadSentAt=0,plusAt=0,minusAt=0;std::string lastNativePad;
@@ -759,6 +771,21 @@ int main(int, char **) {
                     float dt = std::min((now - previous) / 1000.f, .05f);
                     previous = now;
                     auto state = client.snapshot();
+                    const auto mediaEpoch=media->generation();
+                    if(mediaEpoch!=nativeOutputEpoch) {
+                        // The media reset is the authoritative session boundary;
+                        // a fast reconnect can skip an observed streaming=false.
+                        nativeOutputEpoch=mediaEpoch;
+                        media->setNativeOutput(uu::display::active());
+                        nativeImportFailures=0;nativeFallback=false;
+                        lastVideoFormat=0;lastVideoHardware=false;
+                        serial=0;texW=texH=0;
+                        uu::display::resetVideo();
+                        if(video) {uu::display::destroyTexture(video);video=nullptr;}
+                        lastDecoded=lastPublished=lastSelected=lastEmpty=lastNoReady=lastFuture=0;
+                        uu::diagnostic(uu::display::active()?"display-native-policy-session-restored-on":
+                                                            "display-native-policy-session-restored-off");
+                    }
                     liveUi.sync(state);
                     if(!state.qualityPending && actualVsync!=state.vsync && uu::display::vsync(renderer,state.vsync?1:0)==0)
                         actualVsync=state.vsync;
@@ -773,7 +800,6 @@ int main(int, char **) {
                             event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                             client.command("release");
                             streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;homePlusPending=false;
-                            touchHeld = false;
                         }
                         if (event.type == SDL_KEYDOWN && !event.key.repeat) {
                             auto k = event.key.keysym.sym;
@@ -894,6 +920,8 @@ int main(int, char **) {
                     if (state.streaming) {
                         const bool captureNetworkInput=captureMenuInput;
                         if (c.disconnect) {
+                            liveUi.restoreRemoteSoundOnDisconnect(state);
+                            SDL_Delay(180);
                             client.command("disconnect");
                             continue;
                         }
@@ -993,8 +1021,10 @@ int main(int, char **) {
                             texW = texH = 0;
                             nativeImportFailures = 0;
                             nativeFallback = false;
+                            media->setNativeOutput(uu::display::active());
+                            lastVideoFormat = 0;
+                            lastVideoHardware = false;
                             overlay = false;
-                            touchHeld = false;
                         }
                         if (state.authenticated) { /* live frontend owns authenticated navigation */ }
                         else if (!state.authenticated && c.logout && (!busy || state.stage == "login")) {
@@ -1075,6 +1105,12 @@ int main(int, char **) {
                         }
                         leadSumMs+=leadMs;++leadSamples;
                         auto p = media->picture(serial,leadMs);
+                        if(p.serial) {
+                            // An empty poll must not erase the last real frame's
+                            // display format or turn it into a false CPU report.
+                            lastVideoFormat=unsigned(p.pixelFormat);
+                            lastVideoHardware=p.hardwareFrame!=nullptr;
+                        }
                         if(p.serial && uu::display::active()) {
                             const auto started=SDL_GetPerformanceCounter();
                             const bool accepted=uu::display::acceptVideo(p);
@@ -1090,7 +1126,11 @@ int main(int, char **) {
                                 } else if(++nativeImportFailures>=6) {
                                     nativeFallback=true;
                                     media->setNativeOutput(false);
-                                    uu::diagnostic("display-deko-import-failed-cpu-fallback");
+                                    char fallback[160];
+                                    std::snprintf(fallback,sizeof fallback,
+                                        "display-deko-import-failed-cpu-fallback-%dx%d-fmt-%u",
+                                        p.width,p.height,unsigned(p.pixelFormat));
+                                    uu::diagnostic(fallback);
                                 } else {
                                     // Retry the same newest frame next vsync instead
                                     // of discarding it on a transient import error.
@@ -1354,6 +1394,17 @@ int main(int, char **) {
                             (unsigned long long)rate.nackSent,(unsigned long long)rate.rtxRecovered,
                             rate.bitrateFeedbackSent?1:0);
                         uu::diagnostic(rateLine);
+                        const auto effective=media->stats();
+                        char effectiveLine[512];
+                        std::snprintf(effectiveLine,sizeof effectiveLine,
+                            "effective-state target-fps=%d applied-fps-%d actual-fps-%.1f target-quality-%d applied-quality-%d target-media-%dx%d actual-media-%dx%d decode-ms-%.2f hw-%d fallback-%d applied-valid-%d setting-accepted-%d setting-applied-%d setting-rejected-%d setting-error-%d setting-source-%s",
+                            state.fps,state.appliedFps,effective.fps,state.quality,state.appliedQuality,
+                            state.width,state.height,effective.width,effective.height,
+                            effective.decodeMs,effective.hardwareFrame?1:0,nativeFallback?1:0,
+                            state.appliedValid?1:0,state.settingAccepted?1:0,state.settingApplied?1:0,
+                            state.settingRejected?1:0,state.settingErrorCode,
+                            state.settingSource.empty()?"none":state.settingSource.c_str());
+                        uu::diagnostic(effectiveLine);
                         lastRateLogSample=presentedAt;
                     }
                     const double telemetryWorkUs=(presentStarted-loopStarted)*counterToUs;
@@ -1383,7 +1434,7 @@ int main(int, char **) {
                         const auto elapsed=Uint32(presentedAt-presentWindow);
                         if(elapsed>=2000) {
                             presentFps=double(presentedFrames)*1000/elapsed;
-                            char timing[256];
+                            char timing[384];
                             std::snprintf(timing,sizeof timing,
                                 "render-window-loops-%llu-uploads-%llu-panel-%d-cpu-avg-us-%.0f-cpu-max-us-%.0f-upload-avg-us-%.0f-present-avg-us-%.0f-over25ms-%llu",
                                 static_cast<unsigned long long>(renderLoops),static_cast<unsigned long long>(uploadCount),int(statsVisible),
@@ -1407,12 +1458,22 @@ int main(int, char **) {
                             lastSelected=mediaStats.pictureSelected;lastEmpty=mediaStats.pictureEmpty;
                             lastNoReady=mediaStats.pictureEmptyNoReady;lastFuture=mediaStats.pictureEmptyFuture;
                             std::snprintf(timing,sizeof timing,
-                                "video-frame decoded=%llu published=%llu selected=%llu empty=%llu no-ready=%llu future=%llu gap-max=%d loops=%llu uploads=%llu",
+                                "video-frame decoded=%llu published=%llu selected=%llu empty=%llu no-ready=%llu future=%llu gap-max=%d loops=%llu uploads=%llu media=%dx%d hw=%d fmt=%u native=%d fallback=%d import-fails=%u nv12-enum=%d yuv=%d",
                                 (unsigned long long)decoded,(unsigned long long)published,
                                 (unsigned long long)selected,(unsigned long long)empty,
                                 (unsigned long long)noReady,(unsigned long long)future,
                                 mediaStats.pictureFutureGapMaxMs,
-                                (unsigned long long)renderLoops,(unsigned long long)uploadCount);
+                                (unsigned long long)renderLoops,(unsigned long long)uploadCount,
+                                mediaStats.width,mediaStats.height,lastVideoHardware?1:0,
+                                lastVideoFormat,uu::display::active()?1:0,
+                                nativeFallback?1:0,nativeImportFailures,nativeNv12?1:0,
+                                yuvOutput?1:0);
+                            uu::diagnostic(timing);
+                            std::snprintf(timing,sizeof timing,
+                                "video-path epoch=%llu decoder-hw-frame=%d native-published=%llu cpu-transfers=%llu",
+                                (unsigned long long)mediaStats.epoch,mediaStats.hardwareFrame?1:0,
+                                (unsigned long long)mediaStats.nativePublished,
+                                (unsigned long long)mediaStats.cpuTransfers);
                             uu::diagnostic(timing);
                             leadSumMs=0;leadSamples=0;
                             cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;

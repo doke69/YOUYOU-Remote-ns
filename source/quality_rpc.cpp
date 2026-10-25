@@ -103,12 +103,30 @@ std::optional<TextRpcAck> parseTextRpcAck(const uint8_t *data,size_t size)noexce
     if(!outer.good() || !response || !header || !id || !body)return {};
     return out;
 }
+Bytes fpsSettingRpc(uint64_t id,int fps){
+    if(!id || (fps!=30&&fps!=60))throw std::invalid_argument("Invalid fps setting");
+    Bytes body,header,rpc,out;
+    integer(body,1,fps==30?1:2); // gv_pb.FPS: FPS_30=1, FPS_60=2
+    integer(header,1,id);message(rpc,1,header);message(rpc,3,body);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
+Bytes videoQualitySettingRpc(uint64_t id,int quality){
+    if(!id || quality<1 || quality>6)throw std::invalid_argument("Invalid quality setting");
+    Bytes body,header,rpc,out;
+    integer(body,1,quality); // gv_pb.VideoQuality
+    integer(header,1,id);message(rpc,1,header);message(rpc,4,body);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
 Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenId,int customMbps){
     if(!id || screenId<0 || !((w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080)) ||
        (fps!=30&&fps!=60) || quality<1 || quality>6 || customMbps<0 || customMbps>100 ||
        (quality==6 && customMbps==0) || (quality!=6 && customMbps!=0))throw std::invalid_argument("Invalid capture settings");
     Bytes capture,header,rpc,out;
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
+    // Preserve the 0.3.25 capture pacing fields; these keep the host frame
+    // cadence regular and avoid batching in the decoder queue.
+    integer(capture,12,0);
+    integer(capture,18,uint64_t(fps));
     // Connect auto-selection (-1) is not a valid online target. Use the
     // current ID advertised in Main.screens and validated against its list.
     integer(capture,4,unsigned(screenId));integer(capture,5,w);integer(capture,6,h);
@@ -120,8 +138,72 @@ Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenI
     integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
 }
 
-std::optional<ScreenSourceInfo> parseScreenSources(const uint8_t *data,size_t size)noexcept{
-    if(!data || !size || size>65536)return {};
+Bytes qualityUpdateRpc(uint64_t id,int fps,int quality,int screenId,int customMbps){
+    if(!id || screenId<0 || (fps!=30&&fps!=60) || quality<1 || quality>6 ||
+       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0) ||
+       (quality!=6&&customMbps!=0))throw std::invalid_argument("Invalid quality update");
+    Bytes capture,header,rpc,out;
+    integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
+    integer(capture,12,0);
+    integer(capture,18,uint64_t(fps));
+    integer(capture,4,unsigned(screenId));
+    // No resolution/max-scale/pixel fields: this request must only update the
+    // encoder controls and leave the host capture resolution unchanged.
+    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
+    integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
+
+Bytes videoScaleRpc(uint64_t id,int sourceWidth,int sourceHeight,
+                    int outputWidth,int outputHeight,int fps,int quality,
+                    int screenId,int customMbps){
+    const bool outputSupported=(outputWidth==960&&outputHeight==540) ||
+        (outputWidth==1280&&outputHeight==720) || (outputWidth==1920&&outputHeight==1080);
+    if(!id || sourceWidth<1 || sourceHeight<1 || sourceWidth>16384 || sourceHeight>16384 ||
+       !outputSupported || screenId<0 || (fps!=30&&fps!=60) || quality<1 || quality>6 ||
+       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0) ||
+       (quality!=6&&customMbps!=0))
+        throw std::invalid_argument("Invalid video scale request");
+    Bytes capture,header,rpc,out;
+    integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
+    integer(capture,12,0);
+    integer(capture,18,uint64_t(fps));
+    integer(capture,4,unsigned(screenId));
+    // Source/desktop dimensions are intentionally the observed media size, not
+    // the selected stream size. The pixel pair is the mobile-style encoded
+    // output bound; max_scale is kept as the same bound for hosts that use it.
+    integer(capture,5,unsigned(sourceWidth));integer(capture,6,unsigned(sourceHeight));
+    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
+    integer(capture,10,3);
+    integer(capture,14,unsigned(outputWidth));integer(capture,15,unsigned(outputHeight));
+    integer(capture,16,unsigned(outputWidth));integer(capture,17,unsigned(outputHeight));
+    integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
+
+namespace {
+std::string wireSummary(const uint8_t *data,size_t size,unsigned depth) {
+    Reader reader(data,size);Field field;std::string out;unsigned seen=0;
+    while(reader.next(field) && ++seen<=128 && out.size()<600) {
+        out+=std::to_string(field.key);
+        if(field.wire==0) out+="="+std::to_string(field.value);
+        else if(field.wire==2) {
+            out+="["+std::to_string(field.size)+"]";
+            if(depth && field.size && field.size<=8192) {
+                const auto nested=wireSummary(field.data,field.size,depth-1);
+                if(!nested.empty()) out+="{"+nested+"}";
+            }
+        } else out+="?";
+        out+=",";
+    }
+    return out;
+}
+}
+std::string screenSourceWireSummary(const uint8_t *data,size_t size) noexcept {
+    if(!data || !size || size>65536) return {};
+    try { return wireSummary(data,size,2); } catch(...) { return {}; }
+}
+std::optional<ScreenSourceInfo> parseScreenSources(const uint8_t *data,size_t size)noexcept{    if(!data || !size || size>65536)return {};
     bool found=false;ScreenSourceInfo result;
     Reader outer(data,size);Field f;
     while(outer.next(f))if(f.key==7){
@@ -153,6 +235,37 @@ std::optional<ScreenSourceInfo> parseScreenSources(const uint8_t *data,size_t si
         for(unsigned i=0;i<count;++i)if(current>=0 && ids[i]==current)result.screenId=current;
     }
     if(!outer.good() || !found)return {};
+    return result;
+}
+
+std::optional<CaptureSettingSyncInfo> parseCaptureSettingSync(const uint8_t *data,size_t size)noexcept{
+    if(!data || !size || size>65536)return {};
+    bool found=false;CaptureSettingSyncInfo result;
+    Reader outer(data,size);Field f;
+    while(outer.next(f))if(f.key==25){
+        if(found || f.wire!=2)return {};found=true;
+        Reader body(f.data,f.size);Field v;
+        while(body.next(v)){
+            if(v.wire!=0)continue;
+            switch(v.key){
+                case 1: if(v.value>2)return {}; result.fps=int(v.value);break;
+                case 2: if(v.value>6)return {}; result.quality=int(v.value);break;
+                case 3: if(v.value>4)return {}; result.chroma=int(v.value);break;
+                case 4: result.maxCustomBitrate=int64_t(v.value);break;
+                case 5: result.width=int(v.value);break;
+                case 6: result.height=int(v.value);break;
+                case 7: if(v.value>4)return {}; result.resolutionType=int(v.value);break;
+                case 8: result.dpiScale=int(v.value);break;
+                case 9: result.pixelWidth=int(v.value);break;
+                case 10: result.pixelHeight=int(v.value);break;
+                case 11: result.orientation=int(v.value);break;
+                default: break;
+            }
+        }
+        if(!body.good())return {};
+    }
+    if(!outer.good() || !found)return {};
+    if(!result.fps && !result.quality && !result.width && !result.height)return {};
     return result;
 }
 

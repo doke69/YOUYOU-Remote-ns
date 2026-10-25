@@ -455,6 +455,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             {const char *keys[]={"回车","Tab","Esc","退格","全选","粘贴"};for(int i=0;i<6;++i)add(90+i*186,458,170,58,keys[i],2310+i);}
             aligned(r,f.hint,"离线预览仅编辑草稿，不发送文字或按键",{90,552,1100,36},label);break;
         case Page::Disconnect:title="退出远控？";aligned(r,f.small,"退出后返回电脑首页",{848,180,376,72},label);row(2,"继续远控",80);row(3,"返回首页",81);break;
+        default: break;
         }
         if(!title.empty()) {
 

@@ -133,6 +133,7 @@ bool LiveTelemetry::observe(uint32_t ticks,bool streaming,bool submitted,double 
 }
 void LiveTelemetry::publish(const StreamStatsSnapshot &s,bool vsync,bool nv12,double refreshMs,unsigned stableSwaps,
                             bool nativeDisplay,uint64_t directFrames,uint64_t mapHits,uint64_t mapImports,uint64_t mapCached) noexcept {
+    (void)nv12;
     if(!impl_ || impl_->fd<0) return;
     auto &p=*impl_;
     try {

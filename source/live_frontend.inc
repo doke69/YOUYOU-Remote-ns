@@ -146,6 +146,11 @@ class LiveFrontend {
         for(auto action:uu::remoteSoundActions(remoteMute,restoreSound))
             safetyAction(action,s,std::nullopt,quiet);
     }
+    void restoreRemoteSound(const uu::Snapshot &s){
+        if(!remoteMute || !restoreSound || !s.streaming || !s.controlChannelReady ||
+           s.activeDeviceId.empty())return;
+        safetyAction(16,s,std::nullopt,true);
+    }
     void push(Page p){touchTarget=-1;touchDown=false;hit=-1;stack.push_back({p,0});notice.clear();}
     void back(){
         if(!stack.empty() && stack.back().page==Page::Keyboard){
@@ -244,7 +249,7 @@ class LiveFrontend {
             if(!dispatchWindowsShortcut(s,pendingShortcut)){notice="请先连接电脑";break;}
             stack.clear();draining=true;notice="已提交操作请求，等待电脑端结果";break;
         case 770:client.command("logout");client.command("login");stack.clear();draining=true;break;
-        case 81:client.command("disconnect");stack.clear();draining=true;break;
+        case 81:restoreRemoteSound(s);SDL_Delay(180);client.command("disconnect");stack.clear();draining=true;break;
         case 90:client.command("refresh");break;
         case 2300:if(!sendingText && !keyboardText.empty()){auto n=keyboardText.size()-1;while(n && (static_cast<unsigned char>(keyboardText[n])&0xc0)==0x80)--n;keyboardText.resize(n);}break;
         case 2301:if(!sendingText && keyboardText.size()<2048)keyboardText+=' ';break;case 2302:if(!sendingText)keyboardText.clear();break;
@@ -262,6 +267,7 @@ class LiveFrontend {
     }
 public:
     bool networkOverlay=false;
+    void restoreRemoteSoundOnDisconnect(const uu::Snapshot &s){restoreRemoteSound(s);}
     explicit LiveFrontend(uu::Client &c,std::shared_ptr<uu::Media> m,SDL_Renderer *r):client(c),media(std::move(m)),renderer(r){
         uu::Json p;
         if(readPrefs(prefsPath,p) || readPrefs(std::string(prefsPath)+".previous",p)){
@@ -281,7 +287,8 @@ public:
     bool trackpad()const{return touchMode==1;}
     bool multitouch()const{return nativeMultitouch;}
     bool takeKeyboardEdit(std::string &value){
-        if(!keyboardEditRequested)return false;keyboardEditRequested=false;value=keyboardText;return true;
+        if(!keyboardEditRequested)return false;
+        keyboardEditRequested=false;value=keyboardText;return true;
     }
     void finishKeyboardEdit(const std::optional<std::string> &value){
         SDL_StopTextInput();if(value && value->size()<=2048)keyboardText=*value;
@@ -689,6 +696,7 @@ public:
         }
 
         if(!saveError.empty())aligned(r,f.small,saveError,{65,638,710,32},SDL_Color{255,170,140,255});
+        else if(!snapshot.videoScaleNotice.empty())aligned(r,f.small,snapshot.videoScaleNotice,{65,638,710,32},label);
         else if(notice.empty())aligned(r,f.small,snapshot.qualityNotice.empty()?snapshot.detail:snapshot.qualityNotice,{65,638,710,32},label);
         else aligned(r,f.small,notice,{65,638,710,32},SDL_Color{149,191,255,255});
 

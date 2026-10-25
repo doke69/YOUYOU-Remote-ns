@@ -55,7 +55,7 @@ RtpTrackStats::RtpTrackStats(unsigned clockRate, std::string name, bool rtx)
 RtpTrackStats::~RtpTrackStats() {
     flushDiagnostics();
 }
-void RtpTrackStats::incoming(rtc::message_vector &messages, const rtc::message_callback &send) {
+void RtpTrackStats::incoming(rtc::message_vector &messages, const rtc::message_callback &) {
     const auto now = nowMs();
     for (auto &message : messages) {
         if (!message)

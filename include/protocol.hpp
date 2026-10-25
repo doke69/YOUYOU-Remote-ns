@@ -16,7 +16,8 @@ std::string sign(const std::string &key, const std::string &method, const std::s
 Headers requestHeaders(const std::string &key, const std::string &method, const std::string &path,
                        const std::string &body, const std::string &client, const std::string &device,
                        const std::string &user, int64_t timestamp);
-Bytes connectOptions(int width = 1280, int height = 720, int fps = 30, int quality = 3, int customMbps = 0);
+Bytes connectOptions(int width = 1280, int height = 720, int fps = 30, int quality = 3, int customMbps = 0,
+                     bool hevc = false);
 Bytes launchApp(uint64_t seq, const Json &app);
 Json ackValue(const Json &args, const std::string &event);
 Json soac(const Json &client, const std::string &type, const Json &payload, const Json &ice,
