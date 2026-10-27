@@ -29,6 +29,9 @@ struct Picture {
         return 0;
     }
     int64_t mediaTimestamp = INT64_MIN, dueMs = 0, decodedMs = 0, originalDueMs = 0;
+    // Fine-grained timing diagnostics for selected-age breakdown:
+    int64_t queuedMs = 0;   // When pushPlayout() added this to ready queue
+    int64_t selectedMs = 0; // When nextPlayout() selected this for rendering
 };
 struct MediaStats {
     std::string codec = "—";   // H.264 profile/level parsed from the SPS
@@ -52,6 +55,11 @@ struct MediaStats {
     uint64_t pictureEmpty = 0, pictureEmptyNoReady = 0, pictureEmptyFuture = 0;
     uint64_t pictureSelected = 0;
     int pictureFutureGapMaxMs = 0;
+    uint64_t selectedAgeTotalMs = 0, selectedAgeSamples = 0;
+    int selectedAgeMaxMs = 0;
+    // Breakdown of selected-age timing
+    uint64_t decodeToQueueTotalMs = 0, queueWaitTotalMs = 0;
+    uint64_t ageBreakdownSamples = 0;
     // Diagnostic-only access-unit / queue / decode timing. Maxima and >threshold
     // counters are session-cumulative until Media::reset().
     uint64_t auMaxBytes = 0, auBytesTotal = 0, auCount = 0, auOversize = 0;

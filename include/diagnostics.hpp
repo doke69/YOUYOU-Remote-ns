@@ -3,6 +3,7 @@
 #include <string>
 namespace uu {
 void diagnostic(const char *event) noexcept;
+void flushDiagnosticsLog() noexcept;
 std::string exceptionSummary(std::exception_ptr error);
 void diagnosticException(const char *event, std::exception_ptr error) noexcept;
 [[noreturn]] void terminateWithDiagnostics() noexcept;

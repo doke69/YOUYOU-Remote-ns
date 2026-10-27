@@ -248,16 +248,16 @@ std::optional<CaptureSettingSyncInfo> parseCaptureSettingSync(const uint8_t *dat
         while(body.next(v)){
             if(v.wire!=0)continue;
             switch(v.key){
-                case 1: if(v.value>2)return {}; result.fps=int(v.value);break;
-                case 2: if(v.value>6)return {}; result.quality=int(v.value);break;
+                case 1: if(v.value>2)return {}; result.fps=int(v.value);result.fields|=1u;break;
+                case 2: if(v.value>6)return {}; result.quality=int(v.value);result.fields|=2u;break;
                 case 3: if(v.value>4)return {}; result.chroma=int(v.value);break;
-                case 4: result.maxCustomBitrate=int64_t(v.value);break;
-                case 5: result.width=int(v.value);break;
-                case 6: result.height=int(v.value);break;
+                case 4: if(v.value>uint64_t(std::numeric_limits<int64_t>::max()))return {}; result.maxCustomBitrate=int64_t(v.value);result.fields|=16u;break;
+                case 5: if(v.value>16384)return {}; result.width=int(v.value);result.fields|=4u;break;
+                case 6: if(v.value>16384)return {}; result.height=int(v.value);result.fields|=8u;break;
                 case 7: if(v.value>4)return {}; result.resolutionType=int(v.value);break;
                 case 8: result.dpiScale=int(v.value);break;
-                case 9: result.pixelWidth=int(v.value);break;
-                case 10: result.pixelHeight=int(v.value);break;
+                case 9: if(v.value>16384)return {}; result.pixelWidth=int(v.value);break;
+                case 10: if(v.value>16384)return {}; result.pixelHeight=int(v.value);break;
                 case 11: result.orientation=int(v.value);break;
                 default: break;
             }
@@ -265,7 +265,7 @@ std::optional<CaptureSettingSyncInfo> parseCaptureSettingSync(const uint8_t *dat
         if(!body.good())return {};
     }
     if(!outer.good() || !found)return {};
-    if(!result.fps && !result.quality && !result.width && !result.height)return {};
+    if(!result.fields)return {};
     return result;
 }
 

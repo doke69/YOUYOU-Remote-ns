@@ -1,4 +1,5 @@
 #include "background.hpp"
+#include "refresh_pacer.hpp"
 #include "client.hpp"
 #include "config_store.hpp"
 #include "cpu_diagnostics.hpp"
@@ -721,7 +722,7 @@ int main(int, char **) {
                 // the session to the CPU conversion path. Retry a few frames,
                 // then latch the existing fallback for this session.
                 unsigned nativeImportFailures = 0;
-                bool nativeFallback = false;
+                bool nativeFallback = false, nativeOversizeNotice = false;
                 uint64_t nativeOutputEpoch = media->generation();
                 unsigned lastArrowMask=0;
                 bool nativePadRequested=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
@@ -746,9 +747,15 @@ int main(int, char **) {
                 unsigned irregularSwaps=0;
                 unsigned stableSwaps=0;
                 uint64_t leadSamples=0;
+                uu::RefreshPacer refreshPacer;
                 double cpuUs=0,uploadUs=0,presentUs=0,maxCpuUs=0;
+                double syncMaxUs=0,pollMaxUs=0,pictureMaxUs=0,acceptMaxUs=0,presentMaxUs=0,cpuLedgerMaxUs=0,drawMaxUs=0;
                 uint64_t renderLoops=0,uploadCount=0,slowLoops=0;
+                uint64_t lastNewPresentAt=0,presentGapCount=0,presentGapGt17=0,presentGapGt25=0,presentGapGt33=0,presentGapGt50=0;
+                double presentGapSumMs=0,presentGapMaxMs=0;
                 uint64_t lastDecoded=0,lastPublished=0,lastSelected=0,lastEmpty=0,lastNoReady=0,lastFuture=0;
+                uint64_t lastSelectedAgeTotal=0,lastSelectedAgeSamples=0;
+                uint64_t lastBreakdownSamples=0,lastDecodeToQueueTotal=0,lastQueueWaitTotal=0,lastStatsEpoch=0;
                 uu::StreamStatsSnapshot panelStats; Uint32 panelStatsAt=0;
                 SDL_Texture *video = nullptr;
                 std::string qrUrl;
@@ -777,21 +784,29 @@ int main(int, char **) {
                         // a fast reconnect can skip an observed streaming=false.
                         nativeOutputEpoch=mediaEpoch;
                         media->setNativeOutput(uu::display::active());
-                        nativeImportFailures=0;nativeFallback=false;
+                        nativeImportFailures=0;nativeFallback=false;nativeOversizeNotice=false;
                         lastVideoFormat=0;lastVideoHardware=false;
                         serial=0;texW=texH=0;
+                        previousSwap=0;refreshPeriodMs=0;leadSumMs=0;
+                        irregularSwaps=0;stableSwaps=0;leadSamples=0;refreshPacer.reset();
+                        lastNewPresentAt=0;presentGapCount=0;presentGapGt17=0;presentGapGt25=0;
+                        presentGapGt33=0;presentGapGt50=0;presentGapSumMs=0;presentGapMaxMs=0;
                         uu::display::resetVideo();
                         if(video) {uu::display::destroyTexture(video);video=nullptr;}
                         lastDecoded=lastPublished=lastSelected=lastEmpty=lastNoReady=lastFuture=0;
+                        lastSelectedAgeTotal=lastSelectedAgeSamples=0;
+                        lastBreakdownSamples=lastDecodeToQueueTotal=lastQueueWaitTotal=0;lastStatsEpoch=0;
                         uu::diagnostic(uu::display::active()?"display-native-policy-session-restored-on":
                                                             "display-native-policy-session-restored-off");
                     }
                     liveUi.sync(state);
+                    syncMaxUs=std::max(syncMaxUs,(SDL_GetPerformanceCounter()-loopStarted)*counterToUs);
                     if(!state.qualityPending && actualVsync!=state.vsync && uu::display::vsync(renderer,state.vsync?1:0)==0)
                         actualVsync=state.vsync;
                     selected = std::clamp(selected, 0, std::max(0, int(state.devices.size()) - 1));
                     Controls c;
                     SDL_Event event;
+                    const auto pollStarted=SDL_GetPerformanceCounter();
                     while (SDL_PollEvent(&event)) {
                         if (event.type == SDL_QUIT)
                             running = false;
@@ -921,8 +936,7 @@ int main(int, char **) {
                         const bool captureNetworkInput=captureMenuInput;
                         if (c.disconnect) {
                             liveUi.restoreRemoteSoundOnDisconnect(state);
-                            SDL_Delay(180);
-                            client.command("disconnect");
+                            client.command("disconnect",{{"graceMs",220}});
                             continue;
                         }
                         if(liveUi.gamepadMode()) {
@@ -1089,6 +1103,7 @@ int main(int, char **) {
                             }
                         }
                     }
+                    pollMaxUs=std::max(pollMaxUs,(SDL_GetPerformanceCounter()-pollStarted)*counterToUs);
                     lastHeld = c.held;
                     if(state.streaming && !wasStreaming) streamingSince=SDL_GetTicks();
                     if(!state.streaming) streamingSince=0;
@@ -1098,31 +1113,43 @@ int main(int, char **) {
                     bool submittedNewFrame=false;
                     double frameUploadUs=0;
                     if (state.streaming) {
-                        int leadMs=0;
-                        if(actualVsync && stableSwaps>=6 && previousSwap && refreshPeriodMs>0) {
-                            const auto ageMs=(SDL_GetPerformanceCounter()-previousSwap)*counterToUs/1000.0;
-                            leadMs=int(std::ceil(std::clamp(refreshPeriodMs-ageMs,0.0,20.0)));
-                        }
+                        // Frame eligibility is independent of speculative
+                        // refresh lookahead. Keep one presentation policy.
+                        const int leadMs=0;
                         leadSumMs+=leadMs;++leadSamples;
-                        auto p = media->picture(serial,leadMs);
+                        const auto pictureStarted=SDL_GetPerformanceCounter();
+                        auto p = media->picture(serial);
+                        pictureMaxUs=std::max(pictureMaxUs,(SDL_GetPerformanceCounter()-pictureStarted)*counterToUs);
                         if(p.serial) {
                             // An empty poll must not erase the last real frame's
                             // display format or turn it into a false CPU report.
                             lastVideoFormat=unsigned(p.pixelFormat);
                             lastVideoHardware=p.hardwareFrame!=nullptr;
                         }
-                        if(p.serial && uu::display::active()) {
+                        if(p.serial>serial && uu::display::active()) {
                             const auto started=SDL_GetPerformanceCounter();
                             const bool accepted=uu::display::acceptVideo(p);
+                            acceptMaxUs=std::max(acceptMaxUs,(SDL_GetPerformanceCounter()-started)*counterToUs);
                             bool consume=true;
                             if(accepted) {
-                                nativeImportFailures=0;
+                                nativeImportFailures=0;nativeOversizeNotice=false;
                                 submittedNewFrame=true;++uploadCount;
                             } else if(p.hardwareFrame) {
+                                const bool oversized=p.width>1920 || p.height>1080;
                                 if(nativeFallback) {
                                     // Already latched for this session: consume the
                                     // hardware frame and let the decoder produce
                                     // CPU-readable frames from now on.
+                                } else if(oversized) {
+                                    // A desktop-mode switch can briefly produce a
+                                    // frame larger than the native import limit.
+                                    // Do not latch CPU fallback for that transient;
+                                    // wait for the host to scale to the stream size.
+                                    if(!nativeOversizeNotice) {
+                                        nativeOversizeNotice=true;
+                                        uu::diagnostic("display-native-oversize-wait");
+                                    }
+                                    nativeImportFailures=0;
                                 } else if(++nativeImportFailures>=6) {
                                     nativeFallback=true;
                                     media->setNativeOutput(false);
@@ -1145,7 +1172,7 @@ int main(int, char **) {
                                           int(p.width*scale),int(p.height*scale)};
                             }
                         }
-                        if (p.serial && !uu::display::active()) {
+                        if (p.serial>serial && !uu::display::active()) {
                             if (!video || p.width != texW || p.height != texH || p.pixelFormat!=texFormat) {
                                 if (video)
                                     uu::display::destroyTexture(video);
@@ -1181,6 +1208,7 @@ int main(int, char **) {
                             viewport = {int((1280 - p.width * scale) / 2), int((720 - p.height * scale) / 2),
                                         int(p.width * scale), int(p.height * scale)};
                         }
+                        const auto drawStarted=SDL_GetPerformanceCounter();
                         const auto touchView=streamTouch.view(viewport);
                         if(uu::display::active()) uu::display::drawVideo(touchView);
                         else if (video)
@@ -1218,6 +1246,7 @@ int main(int, char **) {
                         }
                         if(!liveUi.multitouch() && !liveUi.captures())phoneMouse.draw(renderer,fonts);
                         liveUi.draw(renderer,fonts,state,panelStats);
+                        drawMaxUs=std::max(drawMaxUs,(SDL_GetPerformanceCounter()-drawStarted)*counterToUs);
                     } else {
                         if(state.authenticated)liveUi.draw(renderer,fonts,state,panelStats);
                         else {
@@ -1335,38 +1364,28 @@ int main(int, char **) {
                     const auto presentStarted=SDL_GetPerformanceCounter();
                     uu::display::present(renderer);
                     const auto presentFinished=SDL_GetPerformanceCounter();
-                    // Some handheld/native-window combinations accept swap interval
-                    // 1 but do not block presentImage at 60 Hz (observed as a 120 Hz
-                    // UI loop with pacing-refresh=0). Cap the loop at 60 Hz only when
-                    // vsync is requested and the measured loop is clearly faster;
-                    // a working 60 Hz present path is left untouched.
-                    const double loopElapsedUs=(presentFinished-loopStarted)*counterToUs;
-                    static double nextFrameDeadlineUs=0.0;
-                    if(state.vsync && loopElapsedUs < 14000.0) {
-                        static bool frameLimitLogged=false;
-                        if(!frameLimitLogged){uu::diagnostic("display-vsync-framelimit-engaged");uu::diagnostic("display-vsync-precise-pacing");frameLimitLogged=true;}
-                        constexpr double targetFrameUs=16666.6666667;
-                        const double nowUs=presentFinished*counterToUs;
-                        if(nextFrameDeadlineUs<=0.0 || nowUs>nextFrameDeadlineUs+targetFrameUs*3.0)
-                            nextFrameDeadlineUs=nowUs+targetFrameUs;
-                        const double remainingUs=nextFrameDeadlineUs-nowUs;
+                    // One absolute 60 Hz application clock. Hardware vsync
+                    // can consume the budget itself; only sleep the remainder.
+                    // Never restart this clock based on one short/long frame,
+                    // and never masquerade software pacing as hardware vsync.
+                    static const bool softwarePacingEnabled=
+                        uu::ConfigStore::instance().integer("software_pacing",1,0,1)!=0;
+                    const bool softwarePacing=softwarePacingEnabled && state.streaming && !state.vsync;
+                    if(state.vsync || softwarePacing) {
+                        const double remainingUs=refreshPacer.remaining(loopStarted*counterToUs,
+                            presentFinished*counterToUs);
                         if(remainingUs>0.0) {
 #ifdef __SWITCH__
-                            // SDL_Delay rounds to whole milliseconds; on Switch that
-                            // turns a 16.666 ms target into ~17 ms (57-58 Hz). Sleep
-                            // with nanosecond precision and keep an absolute deadline
-                            // so scheduler overshoot is corrected next frame.
-                            svcSleepThread(int64_t(remainingUs*1000.0));
+                            svcSleepThread(int64_t(std::ceil(remainingUs*1000.0)));
 #else
                             SDL_Delay(Uint32(std::ceil(remainingUs/1000.0)));
 #endif
                         }
-                        nextFrameDeadlineUs+=targetFrameUs;
-                        // The software cap makes the observed cadence 60 Hz; let
-                        // the existing refresh/lead estimator use it as well.
-                        actualVsync=true;
+                        // A long missed frame is not repaid by back-to-back
+                        // renders; resume from the current clock instead.
+                        refreshPacer.advance(SDL_GetPerformanceCounter()*counterToUs);
                     } else {
-                        nextFrameDeadlineUs=0.0;
+                        refreshPacer.reset();
                     }
                     if(actualVsync && previousSwap) {
                         const auto intervalMs=(presentFinished-previousSwap)*counterToUs/1000.0;
@@ -1405,6 +1424,13 @@ int main(int, char **) {
                             state.settingRejected?1:0,state.settingErrorCode,
                             state.settingSource.empty()?"none":state.settingSource.c_str());
                         uu::diagnostic(effectiveLine);
+                        std::snprintf(effectiveLine,sizeof effectiveLine,
+                            "encoder-bitrate-status target-bps=%llu host-known=%d host-mbps=%d actual-mbps=%.3f ack=%d applied=%d source=%s",
+                            (unsigned long long)(state.quality==6?uint64_t(state.maxBitrateMbps)*1000000u:0),
+                            state.appliedBitrateKnown?1:0,state.appliedBitrateMbps,
+                            rate.video.bitrateMbps,state.settingAccepted?1:0,state.settingApplied?1:0,
+                            state.settingSource.empty()?"none":state.settingSource.c_str());
+                        uu::diagnostic(effectiveLine);
                         lastRateLogSample=presentedAt;
                     }
                     const double telemetryWorkUs=(presentStarted-loopStarted)*counterToUs;
@@ -1421,16 +1447,31 @@ int main(int, char **) {
                     // here and emit a local ledger every 5 s; when telemetry is
                     // enabled, publish() already drives the same collector.
                     if(!telemetry.enabled() && (!lastCpuLedgerSample || presentedAt-lastCpuLedgerSample>=5000)){
+                        const auto ledgerStarted=SDL_GetPerformanceCounter();
                         uu_cpu_mark(2);
                         (void)uu::cpuDiagnosticsSnapshot();
+                        cpuLedgerMaxUs=std::max(cpuLedgerMaxUs,(SDL_GetPerformanceCounter()-ledgerStarted)*counterToUs);
                         lastCpuLedgerSample=presentedAt;
                     }
                     if (state.streaming) {
                         const auto workUs=(presentStarted-loopStarted)*counterToUs;
                         cpuUs+=workUs;presentUs+=(presentFinished-presentStarted)*counterToUs;
+                        presentMaxUs=std::max(presentMaxUs,(presentFinished-presentStarted)*counterToUs);
                         maxCpuUs=std::max(maxCpuUs,workUs);++renderLoops;
                         if((presentFinished-loopStarted)*counterToUs>25000) ++slowLoops;
                         if (submittedNewFrame) ++presentedFrames;
+                        if(submittedNewFrame) {
+                            if(lastNewPresentAt) {
+                                const double gapMs=(presentFinished-lastNewPresentAt)*counterToUs/1000.0;
+                                ++presentGapCount;presentGapSumMs+=gapMs;
+                                presentGapMaxMs=std::max(presentGapMaxMs,gapMs);
+                                if(gapMs>17)++presentGapGt17;
+                                if(gapMs>25)++presentGapGt25;
+                                if(gapMs>33)++presentGapGt33;
+                                if(gapMs>50)++presentGapGt50;
+                            }
+                            lastNewPresentAt=presentFinished;
+                        }
                         const auto elapsed=Uint32(presentedAt-presentWindow);
                         if(elapsed>=2000) {
                             presentFps=double(presentedFrames)*1000/elapsed;
@@ -1441,10 +1482,20 @@ int main(int, char **) {
                                 renderLoops?cpuUs/renderLoops:0,maxCpuUs,uploadCount?uploadUs/uploadCount:0,
                                 renderLoops?presentUs/renderLoops:0,static_cast<unsigned long long>(slowLoops));
                             uu::diagnostic(timing);
+                            std::snprintf(timing,sizeof timing,
+                                "render-stage-max-us-sync-%.0f-poll-%.0f-picture-%.0f-accept-%.0f-draw-%.0f-present-%.0f-cpu-ledger-%.0f",
+                                syncMaxUs,pollMaxUs,pictureMaxUs,acceptMaxUs,drawMaxUs,presentMaxUs,cpuLedgerMaxUs);
+                            uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,"pacing-window-refresh-us-%.0f-lead-avg-us-%.0f-stable-%u",
                                 refreshPeriodMs*1000,leadSamples?leadSumMs*1000/leadSamples:0,stableSwaps);
                             uu::diagnostic(timing);
                             const auto mediaStats=media->stats();
+                            if(lastStatsEpoch!=mediaStats.epoch) {
+                                lastDecoded=lastPublished=lastSelected=lastEmpty=lastNoReady=lastFuture=0;
+                                lastSelectedAgeTotal=lastSelectedAgeSamples=0;
+                                lastBreakdownSamples=lastDecodeToQueueTotal=lastQueueWaitTotal=0;
+                                lastStatsEpoch=mediaStats.epoch;
+                            }
                             auto delta=[](uint64_t current,uint64_t previous){
                                 return current>=previous?current-previous:current;
                             };
@@ -1454,9 +1505,22 @@ int main(int, char **) {
                             const auto empty=delta(mediaStats.pictureEmpty,lastEmpty);
                             const auto noReady=delta(mediaStats.pictureEmptyNoReady,lastNoReady);
                             const auto future=delta(mediaStats.pictureEmptyFuture,lastFuture);
+                            const auto ageSamples=delta(mediaStats.selectedAgeSamples,lastSelectedAgeSamples);
+                            const auto ageTotal=delta(mediaStats.selectedAgeTotalMs,lastSelectedAgeTotal);
                             lastDecoded=mediaStats.decodedTotal;lastPublished=mediaStats.publishedTotal;
                             lastSelected=mediaStats.pictureSelected;lastEmpty=mediaStats.pictureEmpty;
                             lastNoReady=mediaStats.pictureEmptyNoReady;lastFuture=mediaStats.pictureEmptyFuture;
+                            lastSelectedAgeTotal=mediaStats.selectedAgeTotalMs;lastSelectedAgeSamples=mediaStats.selectedAgeSamples;
+                            std::snprintf(timing,sizeof timing,
+                                "present-window-gaps=%llu-avg-ms-%.2f-max-ms-%.2f-gt17=%llu-gt25=%llu-gt33=%llu-gt50=%llu selected-age-avg-ms=%.2f-max-ms=%d selected-late-ms=%d playout-ms=%d pacing=%d",
+                                (unsigned long long)presentGapCount,
+                                presentGapCount?presentGapSumMs/presentGapCount:0.0,presentGapMaxMs,
+                                (unsigned long long)presentGapGt17,(unsigned long long)presentGapGt25,
+                                (unsigned long long)presentGapGt33,(unsigned long long)presentGapGt50,
+                                ageSamples?double(ageTotal)/ageSamples:0.0,
+                                mediaStats.selectedAgeMaxMs,mediaStats.selectedLateMs,
+                                mediaStats.playoutDelayMs,mediaStats.pacing?1:0);
+                            uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,
                                 "video-frame decoded=%llu published=%llu selected=%llu empty=%llu no-ready=%llu future=%llu gap-max=%d loops=%llu uploads=%llu media=%dx%d hw=%d fmt=%u native=%d fallback=%d import-fails=%u nv12-enum=%d yuv=%d",
                                 (unsigned long long)decoded,(unsigned long long)published,
@@ -1475,19 +1539,44 @@ int main(int, char **) {
                                 (unsigned long long)mediaStats.nativePublished,
                                 (unsigned long long)mediaStats.cpuTransfers);
                             uu::diagnostic(timing);
+                            // Per-window deltas, not lifetime/cross-session averages.
+                            const auto breakdownSamples=delta(mediaStats.ageBreakdownSamples,lastBreakdownSamples);
+                            const auto decodeToQueue=delta(mediaStats.decodeToQueueTotalMs,lastDecodeToQueueTotal);
+                            const auto queueWait=delta(mediaStats.queueWaitTotalMs,lastQueueWaitTotal);
+                            lastBreakdownSamples=mediaStats.ageBreakdownSamples;
+                            lastDecodeToQueueTotal=mediaStats.decodeToQueueTotalMs;
+                            lastQueueWaitTotal=mediaStats.queueWaitTotalMs;
+                            std::snprintf(timing,sizeof timing,
+                                "selected-age-detail-samples=%llu-decode-to-queue-avg-ms=%.2f-queue-wait-avg-ms=%.2f",
+                                (unsigned long long)breakdownSamples,
+                                breakdownSamples?double(decodeToQueue)/breakdownSamples:0.0,
+                                breakdownSamples?double(queueWait)/breakdownSamples:0.0);
+                            uu::diagnostic(timing);
+                            std::snprintf(timing,sizeof timing,
+                                "present-content-new=%llu-no-new=%llu-window-ms=%u-scanout-known=0",
+                                (unsigned long long)presentedFrames,
+                                (unsigned long long)(renderLoops-presentedFrames),unsigned(elapsed));
+                            uu::diagnostic(timing);
                             leadSumMs=0;leadSamples=0;
                             cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;
                             presentedFrames=0;presentWindow=presentedAt;
+                            lastNewPresentAt=0;presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;
+                            presentGapSumMs=presentGapMaxMs=0;
+                            syncMaxUs=pollMaxUs=pictureMaxUs=acceptMaxUs=drawMaxUs=presentMaxUs=cpuLedgerMaxUs=0;
                         }
                     } else {
                         presentWindow=presentedAt;presentedFrames=0;presentFps=-1;
                         leadSumMs=0;leadSamples=0;
                         cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;
+                        lastNewPresentAt=0;presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;
+                        presentGapSumMs=presentGapMaxMs=0;
+                        syncMaxUs=pollMaxUs=pictureMaxUs=acceptMaxUs=drawMaxUs=presentMaxUs=cpuLedgerMaxUs=0;
                     }
                 }
                 if (video)
                     uu::display::destroyTexture(video);
             }
+            const auto shutdownStarted=SDL_GetTicks();
             rtc::Cleanup().wait();
             uu::waitBackgroundTasks();
             media.reset();
@@ -1495,8 +1584,10 @@ int main(int, char **) {
             SDL_DestroyRenderer(renderer);
             uu::display::shutdown();
             SDL_DestroyWindow(window);
+            uu::diagnostic(("shutdown-cleanup-ms-"+std::to_string(SDL_GetTicks()-shutdownStarted)).c_str());
         }
         curl_global_cleanup();
+        uu::flushDiagnosticsLog();
         TTF_Quit();
         SDL_Quit();
     } catch (const std::exception &e) {

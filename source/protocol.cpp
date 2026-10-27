@@ -138,6 +138,9 @@ static void text(Bytes &b, int field, const std::string &s) {
     message(b, field, Bytes(s.begin(), s.end()));
 }
 Bytes connectOptions(int w, int h, int fps, int quality, int customMbps, bool hevc) {
+    const bool supportedResolution=(w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080);
+    if (!supportedResolution)
+        throw std::invalid_argument("Unsupported capture resolution");
     if (quality < 1 || quality > 6 || customMbps < 0 || customMbps > 100 ||
         (quality == 6 && customMbps == 0) || (quality != 6 && customMbps != 0))
         throw std::invalid_argument("Invalid custom capture bitrate");

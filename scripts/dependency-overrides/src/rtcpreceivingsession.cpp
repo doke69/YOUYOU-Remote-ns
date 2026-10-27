@@ -69,6 +69,19 @@ void RtcpReceivingSession::incoming(message_vector &messages, const message_call
 		}
 
 		case Message::Control: {
+			if (message->size() < sizeof(RtcpHeader))
+				break;
+			auto *controlHeader = reinterpret_cast<const RtcpHeader *>(message->data());
+			const size_t controlSize = controlHeader->lengthInBytes();
+			if (controlHeader->version() != 2 || controlSize < sizeof(RtcpHeader) ||
+			    (controlSize & 3) || controlSize > message->size())
+				break;
+			if (controlHeader->payloadType() == 201 &&
+			    controlSize < RtcpRr::SizeWithReportBlocks(controlHeader->reportCount()))
+				break;
+			if (controlHeader->payloadType() == 200 &&
+			    controlSize < RtcpSr::Size(controlHeader->reportCount()))
+				break;
 			auto rr = reinterpret_cast<const RtcpRr *>(message->data());
 			if (rr->header.payloadType() == 201) { // RR
 				mSsrc = rr->senderSSRC();

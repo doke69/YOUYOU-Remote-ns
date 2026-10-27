@@ -7,6 +7,7 @@ inline constexpr const char *systemActionChannel="CONTROL_DATA_CHANNEL";
 struct CaptureRpcAck {uint64_t requestId=0;unsigned errors=0,entries=0;int errorCode=0;bool capture=false;unsigned otherFields=0;};
 struct ScreenSourceInfo {int screenId=-1;unsigned count=0;};
 struct CaptureSettingSyncInfo {
+    unsigned fields=0; // bit0 fps, bit1 quality, bit2 width, bit3 height, bit4 bitrate
     int fps=0,quality=0,chroma=0,resolutionType=0,dpiScale=0,orientation=0;
     int64_t maxCustomBitrate=0;
     int width=0,height=0,pixelWidth=0,pixelHeight=0;

@@ -1,4 +1,5 @@
 #include "strict_video_receiver.hpp"
+#include "diagnostics.hpp"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -177,6 +178,13 @@ void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::mes
     ++inputBatches_;
     inputMessages_ += messages.size();
     maxBatch_ = std::max<uint64_t>(maxBatch_, messages.size());
+
+    // Diagnostic: warn about abnormally large RTP batches. Normal batches are <50 packets;
+    // >200 may indicate severe network jitter or buffering issues requiring investigation.
+    if (messages.size() > 200 && messages.size() == maxBatch_) {
+        diagnostic(("receiver-large-batch-" + std::to_string(messages.size())).c_str());
+    }
+
     rtc::message_vector packets;
     packets.swap(messages);
     if (stopped_) {
@@ -245,10 +253,18 @@ void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::mes
         if (position != f.packets.end() && position->first == ext) { ++duplicates_; continue; }
         // Charge the retained allocation and conservative object/node overhead,
         // not only payload bytes (RTP extensions/padding may otherwise evade bounds).
-        const size_t retainedCost=packet->capacity()+sizeof(rtc::Message)+sizeof(Packet)+64;
-        if (f.bytes + end - header > 2 * 1024 * 1024 || f.packets.size() >= 4096 ||
-            buffered_ + end - header > 8 * 1024 * 1024 ||
-            retainedCost>8*1024*1024 || retained_>8*1024*1024-retainedCost || frames_.size() > 90) {
+        const size_t retainedCost=packet->size()+sizeof(rtc::Message)+sizeof(Packet)+64;
+
+        // Adaptive memory limits based on observed frame sizes. Start conservatively
+        // with 3MB/frame (accommodates both 720p and most 1080p frames), then upgrade
+        // to 4MB if larger frames are observed. Using packet->size() rather than
+        // capacity() prevents over-conservative retirement.
+        const size_t maxFrameBytes = maxFrameBytes_ < 3 * 1024 * 1024 ? 3 * 1024 * 1024 : 4 * 1024 * 1024;
+        const size_t maxBuffered = maxFrameBytes_ < 3 * 1024 * 1024 ? 12 * 1024 * 1024 : 16 * 1024 * 1024;
+
+        if (f.bytes + end - header > maxFrameBytes || f.packets.size() >= 4096 ||
+            buffered_ + end - header > maxBuffered ||
+            retainedCost > maxBuffered || retained_ > maxBuffered - retainedCost || frames_.size() > 90) {
             ++memoryBoundRetires_;
             maxFrameBytes_ = std::max<uint64_t>(maxFrameBytes_, f.bytes + end - header);
             retire(it, "memory_bound");
@@ -291,7 +307,9 @@ void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::mes
 bool StrictVideoReceiver::assemble(const Frame &f, int64_t first, std::vector<uint8_t> &out,
                                    bool &idr, std::vector<uint8_t> &sps, std::vector<uint8_t> &pps, std::vector<uint8_t> &vps) const {
     if(hevc_) return assembleHevc(f,first,out,idr,sps,pps,vps);
-    out.reserve(std::min<size_t>(2*1024*1024,f.bytes+4*f.packets.size()));
+    // Match receiver's adaptive 4MB frame limit for 1080p high bitrate support
+    constexpr size_t maxFrameSize = 4 * 1024 * 1024;
+    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size()));
     std::vector<uint8_t> fragment;
     bool fragmentOpen = false;
     uint8_t fragmentHeader = 0;
@@ -299,6 +317,7 @@ bool StrictVideoReceiver::assemble(const Frame &f, int64_t first, std::vector<ui
         if (n.empty() || (n[0] & 128)) return false;
         const auto type = n[0] & 31;
         if (!type || type >= 24) return false;
+        if (out.size() + 4 + n.size() > maxFrameSize) return false;
         if (type == 5) idr = true;
         if (type == 7) sps.assign(n.begin(),n.end());
         if (type == 8) pps.assign(n.begin(),n.end());
@@ -346,14 +365,16 @@ bool StrictVideoReceiver::assemble(const Frame &f, int64_t first, std::vector<ui
 bool StrictVideoReceiver::assembleHevc(const Frame &f, int64_t first, std::vector<uint8_t> &out,
                                       bool &idr, std::vector<uint8_t> &sps,
                                       std::vector<uint8_t> &pps, std::vector<uint8_t> &vps) const {
-    out.reserve(std::min<size_t>(2*1024*1024,f.bytes+4*f.packets.size()));
+    // Match receiver's adaptive 4MB frame limit for 1080p high bitrate support
+    constexpr size_t maxFrameSize = 4 * 1024 * 1024;
+    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size()));
     // RFC7798 section4.4: SRST, no decoding-order-number field, layer0.
     // Bound output as well as input: aggregation adds Annex-B start codes.
     auto validHeader=[](RtpPayloadView n) {
         return n.size()>=3 && !(n[0]&128) && !(n[0]&1) && !(n[1]&0xf8) && (n[1]&7);
     };
     auto append=[&](RtpPayloadView n) {
-        if(!validHeader(n) || out.size()+4+n.size()>2*1024*1024) return false;
+        if(!validHeader(n) || out.size()+4+n.size()>maxFrameSize) return false;
         const int type=(n[0]>>1)&63;
         if(type>=48) return false;
         // CRA/RASL open-GOP recovery is intentionally not accepted as IDR.
@@ -384,7 +405,7 @@ bool StrictVideoReceiver::assembleHevc(const Frame &f, int64_t first, std::vecto
                 if(open) return false;
                 fragment={h0,h1};header0=h0;header1=h1;open=true;
             } else if(!open || h0!=header0 || h1!=header1) return false;
-            if(fragment.size()+p.size()-3>2*1024*1024) return false;
+            if(fragment.size()+p.size()-3>maxFrameSize) return false;
             fragment.insert(fragment.end(),p.begin()+3,p.end());
             if(end) {
                 if(!append(fragment)) return false;

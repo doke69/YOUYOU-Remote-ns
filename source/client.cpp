@@ -19,6 +19,8 @@
 #include <cerrno>
 #include <rtc/rtp.hpp>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -37,6 +39,10 @@ bool verboseDiagnostics() {
 }
 // Diagnostic-only, bounded JSON shape summary. String values are never
 // printed; only keys, numeric/boolean values, string lengths and array sizes.
+// Diagnostic-only bounded JSON shape representation. Recursively traverses
+// JSON structure, showing object/array shapes and safe string values.
+// Related: jsonFlatten() below provides an alternative flat representation.
+// TODO: Consider extracting shared traversal logic into a visitor pattern.
 std::string jsonShape(const Json &value,unsigned depth=0) {
     if(depth>5)return "...";
     if(value.is_object()) {
@@ -95,6 +101,8 @@ std::string streamerDataShape(const uint8_t *data,size_t size) {
 }
 // Diagnostic-only flattened path/value dump for forward_setting. Known safe
 // strings may be shown; all other strings are reduced to their length.
+// Related: jsonShape() above provides hierarchical shape representation.
+// Both functions traverse JSON but produce different output formats.
 void jsonFlatten(const Json &value,const std::string &path,std::string &out,unsigned depth=0) {
     if(out.size()>2800 || depth>8)return;
     if(value.is_object()) {
@@ -226,11 +234,21 @@ class PrimaryVideoRtcpSession final : public rtc::RtcpReceivingSession {
     double jitter_ = 0;
     uint32_t reportExpected_ = 0, reportReceived_ = 0, reportBase_ = 0;
     bool haveReport_ = false;
+    std::mutex sessionMutex_;
     static uint32_t read32(const uint8_t *p) {
         return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3];
     }
   public:
+    bool requestKeyframe(const rtc::message_callback &send) override {
+        std::lock_guard lock(sessionMutex_);
+        return rtc::RtcpReceivingSession::requestKeyframe(send);
+    }
+    bool requestBitrate(unsigned int bitrate,const rtc::message_callback &send) override {
+        std::lock_guard lock(sessionMutex_);
+        return rtc::RtcpReceivingSession::requestBitrate(bitrate,send);
+    }
     void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override {
+        std::lock_guard lock(sessionMutex_);
         // A single known-valid primary RTP packet needs no filtered copy.
         // RTX/control/invalid cases retain the original separate accounting path.
         const bool direct=messages.size()==1 && messages[0] &&
@@ -396,17 +414,22 @@ void saveQuality(int width, int height, int fps, int quality, bool vsync, int pl
     const std::string path = "config.ini";
 #endif
     std::ifstream input(path);
-    std::string line, retained;
+    std::string line, retained, framePacing = "1";
     while (std::getline(input, line)) {
         const auto key = trim(line.substr(0, line.find('=')));
+        if (key == "frame_pacing") {
+            const auto value = trim(line.substr(line.find('=') + 1));
+            framePacing = value == "0" ? "0" : "1";
+            continue;
+        }
         if (key != "width" && key != "height" && key != "fps" && key != "quality" && key != "vsync" &&
-            key != "playout_delay_ms" && key != "frame_pacing" && key != "max_bitrate_mbps" && key != "video_codec") retained += line + '\n';
+            key != "playout_delay_ms" && key != "max_bitrate_mbps" && key != "video_codec") retained += line + '\n';
     }
     input.close();
     std::ofstream output(path + ".quality-tmp", std::ios::trunc);
     output << retained << "width=" << width << "\nheight=" << height << "\nfps=" << fps << "\nquality=" << quality << '\n';
     output << "vsync=" << (vsync ? 1 : 0) << '\n';
-    output << "frame_pacing=1\nplayout_delay_ms=" << playoutDelay << '\n';
+    output << "frame_pacing=" << framePacing << "\nplayout_delay_ms=" << playoutDelay << '\n';
     output << "max_bitrate_mbps=" << maxBitrateMbps << '\n';
     output << "video_codec=" << (hevc?"hevc":"h264") << '\n';
     output.close();
@@ -496,6 +519,15 @@ void Client::recordIceCandidate(const char *direction, const char *stage, rtc::C
 Client::Client(std::string key, std::string client, std::shared_ptr<Media> media) : media_(std::move(media)) {
     streamWidth_ = configInt("width", 1280, 320, 1920);
     streamHeight_ = configInt("height", 720, 180, 1080);
+    const bool supportedResolution=
+        (streamWidth_==960 && streamHeight_==540) ||
+        (streamWidth_==1280 && streamHeight_==720) ||
+        (streamWidth_==1920 && streamHeight_==1080);
+    if(!supportedResolution){
+        diagnostic(("config-resolution-normalized-"+std::to_string(streamWidth_)+"x"+
+                    std::to_string(streamHeight_)).c_str());
+        streamWidth_=1280;streamHeight_=720;
+    }
     streamFps_ = configInt("fps", 60, 30, 60);
     streamQuality_ = configInt("quality", 3, 1, 6);
     maxBitrateMbps_=configInt("max_bitrate_mbps",0,0,100);
@@ -655,6 +687,7 @@ void Client::run() {
             disconnect();
             if (cancel_) {
                 cancel_ = false;
+                reconnectArmed_ = false; // User cancelled, disable auto-reconnect
                 setState("idle", "已取消");
             } else {
                 const bool transient=reason=="failure-connect-timeout" || reason=="failure-signal-heartbeat" ||
@@ -668,7 +701,7 @@ void Client::run() {
                     diagnostic(("auto-reconnect-scheduled-"+std::to_string(reconnectAttempts_)).c_str());
                     setState("reconnecting",std::to_string(delay/1000)+" 秒后重新连接（"+
                         std::to_string(reconnectAttempts_)+"/"+std::to_string(reconnectLimit_)+"），B 取消");
-                } else {reconnectAt_=0;setState("error",failure);}
+                } else {reconnectAt_=0;reconnectArmed_=false;setState("error",failure);} // Fatal or non-transient error, disable auto-reconnect
             }
         } catch (...) {
             diagnostic("client-unknown-exception");
@@ -698,45 +731,55 @@ void Client::handle(const Event &event) {
                 fallbackQuality("电脑屏幕已变化，正在重新连接…");
         }
     } else if(e=="capture-setting-sync") {
+        const unsigned syncFields=data.value("fields",0u);
+        const bool hasFps=bool(syncFields&1u),hasQuality=bool(syncFields&2u);
+        const bool hasWidth=bool(syncFields&4u),hasHeight=bool(syncFields&8u);
+        const bool hasBitrate=bool(syncFields&16u);
         const int syncFps=data.value("fps",0)==1?30:(data.value("fps",0)==2?60:0);
         const int syncQuality=data.value("quality",0);
         const int syncWidth=data.value("width",0),syncHeight=data.value("height",0);
         const int64_t syncBitrate=data.value("bitrate",int64_t(0));
         const int syncMbps=int(syncBitrate>0?(syncBitrate+500000)/1000000:0);
+        const int targetFps=pendingQuality_?pendingQuality_->target.fps:streamFps_;
+        const int targetQuality=pendingQuality_?pendingQuality_->target.quality:streamQuality_;
+        const int targetWidth=pendingQuality_?pendingQuality_->target.width:streamWidth_;
+        const int targetHeight=pendingQuality_?pendingQuality_->target.height:streamHeight_;
+        const int targetCap=pendingQuality_?pendingQuality_->target.cap:maxBitrateMbps_;
+        const bool complete=hasFps && hasQuality && hasWidth && hasHeight;
+        const bool matches=complete &&
+            syncFps==targetFps && syncQuality==targetQuality &&
+            syncWidth==targetWidth && syncHeight==targetHeight &&
+            (!hasBitrate || !targetCap || syncMbps==targetCap);
         {
             std::lock_guard lock(stateMutex_);
-            state_.appliedFps=syncFps;state_.appliedQuality=syncQuality;
-            state_.appliedWidth=syncWidth;state_.appliedHeight=syncHeight;
-            state_.appliedBitrateMbps=syncMbps;
-            state_.appliedValid=syncFps||syncQuality||syncWidth||syncHeight;
+            if(hasFps)state_.appliedFps=syncFps;
+            if(hasQuality)state_.appliedQuality=syncQuality;
+            if(hasWidth)state_.appliedWidth=syncWidth;
+            if(hasHeight)state_.appliedHeight=syncHeight;
+            if(hasBitrate){state_.appliedBitrateMbps=syncMbps;state_.appliedBitrateKnown=true;}
+            state_.appliedValid=syncFields!=0;
             if(state_.appliedValid){
                 state_.settingAccepted=true;
-                state_.settingApplied=((!syncFps||syncFps==streamFps_) &&
-                    (!syncQuality||syncQuality==streamQuality_) &&
-                    (!syncWidth||syncWidth==streamWidth_) &&
-                    (!syncHeight||syncHeight==streamHeight_) &&
-                    (!syncMbps||!maxBitrateMbps_||syncMbps==maxBitrateMbps_));
+                // Partial sync is evidence for the fields it carries, not proof
+                // that the whole request was applied.
+                state_.settingApplied=matches;
                 state_.settingRejected=false;
                 state_.settingErrorCode=0;
                 state_.settingSource="sync";
             }
         }
-        const bool matches=((!syncFps||syncFps==streamFps_) &&
-                            (!syncQuality||syncQuality==streamQuality_) &&
-                            (!syncWidth||syncWidth==streamWidth_) &&
-                            (!syncHeight||syncHeight==streamHeight_) &&
-                            (!syncMbps||!maxBitrateMbps_||syncMbps==maxBitrateMbps_));
         diagnostic(("capture-setting-sync-fps-"+std::to_string(syncFps)+
                     "-quality-"+std::to_string(syncQuality)+
                     "-chroma-"+std::to_string(data.value("chroma",0))+
                     "-bitrate-"+std::to_string(syncBitrate)+
-                    "-resolution-"+std::to_string(syncWidth)+"x"+std::to_string(syncHeight)+
+                    "-resolution-"+std::to_string(syncWidth)+"x-"+std::to_string(syncHeight)+
                     "-type-"+std::to_string(data.value("resolution_type",0))+
-                    "-pixel-"+std::to_string(data.value("pixel_width",0))+"x"+std::to_string(data.value("pixel_height",0))+
+                    "-pixel-"+std::to_string(data.value("pixel_width",0))+"x-"+std::to_string(data.value("pixel_height",0))+
                     "-orientation-"+std::to_string(data.value("orientation",0))+
-                    "-target-fps-"+std::to_string(streamFps_)+
-                    "-quality-"+std::to_string(streamQuality_)+
-                    "-resolution-"+std::to_string(streamWidth_)+"x"+std::to_string(streamHeight_)+
+                    "-fields-"+std::to_string(syncFields)+
+                    "-target-fps-"+std::to_string(targetFps)+
+                    "-quality-"+std::to_string(targetQuality)+
+                    "-resolution-"+std::to_string(targetWidth)+"x-"+std::to_string(targetHeight)+
                     "-matches-"+std::to_string(matches?1:0)).c_str());
     } else if(e=="screen-wire") {
         if(verboseDiagnostics())diagnostic(("screen-wire-"+data.get<std::string>()).c_str());
@@ -818,10 +861,13 @@ void Client::handle(const Event &event) {
             bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
             rpcMode="capture";rpcKind=QualityRpcKind::Capture;
         }
+        diagnostic(("encoder-bitrate-request-online-id-"+std::to_string(id)+
+                    "-bps-"+std::to_string(quality==6?uint64_t(maxBitrate)*1000000u:0)+
+                    "-quality-"+std::to_string(quality)).c_str());
         pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_,rpcKind,false};
         {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";
-         state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
-         state_.settingErrorCode=0;state_.settingSource="pending";}
+         state_.settingAccepted=false;state_.settingApplied=false;state_.appliedValid=false;state_.settingRejected=false;
+         state_.settingErrorCode=0;state_.settingSource="pending";state_.appliedBitrateKnown=false;}
         try{
             if(!it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
                 fallbackQuality("设置发送受阻，正在重连应用…");return;
@@ -890,7 +936,7 @@ void Client::handle(const Event &event) {
                     }catch(...){reconnectQuality(target,"兼容设置构造失败，正在重连应用…");return;}
                     pendingQuality_=PendingQuality{target,retryId,monotonicMs()+5000,false,false,activeScreenId_,
                         QualityRpcKind::QualityOnly,true};
-                    {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在重试兼容设置…";}
+                    {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在重试兼容设置…";state_.appliedValid=false;}
                     auto channel=channels_.find("TEXT_DATA_CHANNEL");
                     if(channel==channels_.end() || !channel->second->isOpen() ||
                        !channel->second->send(reinterpret_cast<const std::byte *>(retry.data()),retry.size())){
@@ -911,7 +957,8 @@ void Client::handle(const Event &event) {
         ++qualityAcked_;pendingQuality_->acknowledged=true;pendingQuality_->deadline=monotonicMs()+5000;
         {
             std::lock_guard lock(stateMutex_);
-            state_.settingAccepted=true;state_.settingApplied=false;
+            state_.settingAccepted=true;
+            if(!state_.appliedValid)state_.settingApplied=false;
             state_.settingRejected=false;state_.settingErrorCode=0;
             state_.settingSource="ack";
         }
@@ -975,6 +1022,11 @@ void Client::handle(const Event &event) {
             completeLogin(sms_.login(request, data));
         }
     } else if (e == "cancel" || e == "disconnect") {
+        if(e=="disconnect"){
+            const int graceMs=std::clamp(data.value("graceMs",0),0,1000);
+            if(graceMs>0)std::this_thread::sleep_for(std::chrono::milliseconds(graceMs));
+        }
+        reconnectArmed_ = false; // User-initiated disconnect, disable auto-reconnect
         disconnect();
         cancel_ = false;
         {
@@ -1281,6 +1333,9 @@ void Client::dispatch(const SioPacket &p) {
                 throw std::runtime_error("房间内没有在线电脑");
             control_ = uuid();
             auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_,streamQuality_==6?maxBitrateMbps_:0,hevc_);
+            diagnostic(("encoder-bitrate-request-connect-bps-"+
+                        std::to_string(streamQuality_==6?uint64_t(maxBitrateMbps_)*1000000u:0)+
+                        "-quality-"+std::to_string(streamQuality_)).c_str());
             options.insert(options.begin(), 4);
             diagnostic(("stream-options-" + std::to_string(streamWidth_) + "x" +
                         std::to_string(streamHeight_) + "-" + std::to_string(streamFps_) + "fps-q" +
@@ -1560,7 +1615,8 @@ void Client::beginPeer(const Json &result) {
                     if(queue->events.size()>124)return;
                     if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
                     if(settingSync)queue->events.push_back({"capture-setting-sync",
-                        {{"fps",settingSync->fps},{"quality",settingSync->quality},
+                        {{"fields",settingSync->fields},
+                         {"fps",settingSync->fps},{"quality",settingSync->quality},
                          {"chroma",settingSync->chroma},{"bitrate",settingSync->maxCustomBitrate},
                          {"width",settingSync->width},{"height",settingSync->height},
                          {"resolution_type",settingSync->resolutionType},
@@ -1851,7 +1907,15 @@ void Client::refreshFeedbackObservation() {
 }
 #endif
 void Client::disconnect() {
+    const auto disconnectStarted=monotonicMs();
     diagnostic("disconnect");
+
+    // Only clear the scheduled reconnect time, not the armed flag.
+    // reconnectArmed_ is set when user initiates connection and should persist
+    // through disconnect to allow automatic reconnection on transient failures.
+    // User-initiated cancel or fatal errors clear reconnectArmed_ separately.
+    reconnectAt_ = 0;
+
     if(pendingText_)finishTextInput(3,"连接已断开，已取消等待中的粘贴");
 #ifdef UU_TWCC_OBSERVE_CLIENT
     stopFeedbackObservation();
@@ -1865,6 +1929,7 @@ void Client::disconnect() {
     if (strictVideo_)
         strictVideo_->shutdown();
     release();
+    diagnostic(("disconnect-stage-release-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
     if(gamepadConnected_)input({{"action","gpd_disconnect"},{"index",0}});
     gamepadConnected_=false;nativeTouchActive_=false;touchPoints_=0;
     ++generation_;
@@ -1886,6 +1951,7 @@ void Client::disconnect() {
         peer_->close();
         peer_.reset();
     }
+    diagnostic(("disconnect-stage-peer-close-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
     video_.reset();
     rembAvailable_=false;bitrateFeedbackSent_=false;lastBitrateAttempt_=0;
     turnBridges_.clear();
@@ -1904,6 +1970,7 @@ void Client::disconnect() {
     }
     socket_.reset();
     media_->reset();
+    diagnostic(("disconnect-stage-media-reset-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
     {
         std::lock_guard lock(stateMutex_);
         state_.qrUrl.clear();
@@ -1914,11 +1981,12 @@ void Client::disconnect() {
         state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
         state_.settingErrorCode=0;state_.settingSource="none";
         state_.appliedFps=0;state_.appliedQuality=0;state_.appliedWidth=0;state_.appliedHeight=0;
-        state_.appliedBitrateMbps=0;state_.appliedValid=false;
+        state_.appliedBitrateMbps=0;state_.appliedValid=false;state_.appliedBitrateKnown=false;
         state_.serverCapabilityValid=false;
         state_.serverDisplayInfo.clear();state_.serverCodecInfo.clear();
         state_.serverCaptureImpl.clear();state_.serverEncoderImpl.clear();state_.serverVideoTrack=-1;
     }
+    diagnostic(("disconnect-total-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
 }
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
     if(hotCap && q.quality!=6 && (!video_ || !rembAvailable_ || q.cap<=0 || !video_->requestBitrate(unsigned(q.cap)*1000000u)))
@@ -1956,7 +2024,7 @@ void Client::finishQuality() {
     try {
         const char *notice=pendingQuality_->headerOnly
             ? "电脑已接收，等待实际状态"
-            : "电脑已确认画质设置";
+            : "电脑已接受设置，等待实际参数确认";
         commitQuality(q,q.quality!=6 && q.cap!=maxBitrateMbps_,notice);
         diagnostic(pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
         pendingQuality_.reset();

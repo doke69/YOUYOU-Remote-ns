@@ -31,6 +31,7 @@ constexpr const char *kFallbackTemplate =
     "quality=6\n"
     "vsync=1\n"
     "frame_pacing=1\n"
+    "software_pacing=1\n"
     "playout_delay_ms=8\n"
     "max_bitrate_mbps=20\n"
     "video_codec=hevc\n"
@@ -147,6 +148,13 @@ void ensureDefaultConfig() noexcept {
     mkdir(kDirectory, 0777);
     pruneLegacyBackups();
     std::string existing = readFile(kPath);
+    if (trim(existing).empty()) {
+        const std::string backup = readFile(kBackup);
+        if (!trim(backup).empty() && writeAtomic(backup)) {
+            existing = backup;
+            log("config-restored-from-backup");
+        }
+    }
     if (trim(existing).empty()) {
         const std::string templateText = readFile(kTemplatePath);
         const std::string content = trim(templateText).empty() ? kFallbackTemplate : templateText;

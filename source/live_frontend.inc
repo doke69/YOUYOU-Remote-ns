@@ -249,7 +249,7 @@ class LiveFrontend {
             if(!dispatchWindowsShortcut(s,pendingShortcut)){notice="请先连接电脑";break;}
             stack.clear();draining=true;notice="已提交操作请求，等待电脑端结果";break;
         case 770:client.command("logout");client.command("login");stack.clear();draining=true;break;
-        case 81:restoreRemoteSound(s);SDL_Delay(180);client.command("disconnect");stack.clear();draining=true;break;
+        case 81:restoreRemoteSound(s);client.command("disconnect",{{"graceMs",220}});stack.clear();draining=true;break;
         case 90:client.command("refresh");break;
         case 2300:if(!sendingText && !keyboardText.empty()){auto n=keyboardText.size()-1;while(n && (static_cast<unsigned char>(keyboardText[n])&0xc0)==0x80)--n;keyboardText.resize(n);}break;
         case 2301:if(!sendingText && keyboardText.size()<2048)keyboardText+=' ';break;case 2302:if(!sendingText)keyboardText.clear();break;

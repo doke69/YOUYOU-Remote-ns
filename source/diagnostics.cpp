@@ -2,10 +2,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #ifdef __SWITCH__
 #include <switch.h>
 #include <unwind.h>
@@ -20,24 +23,103 @@ const char *diagnosticPath() noexcept {
     return "connection.log";
 #endif
 }
-void diagnostic(const char *event) noexcept {
-    // Fixed names, numeric error codes and code offsets only; never log protocol data.
-    try {
-        static std::mutex mutex;
-        std::lock_guard lock(mutex);
+namespace {
+class AsyncLog {
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::string> queue_;
+    bool stopping_ = false;
+    bool writerFailed_ = false;
+    std::thread worker_;
+    static constexpr size_t kMaxQueued = 512;
+
+    void writeBatch(std::deque<std::string> &batch) noexcept {
         auto *file = std::fopen(diagnosticPath(), "a");
-        if (!file)
-            return;
+        if (!file) return;
         std::fseek(file, 0, SEEK_END);
         if (std::ftell(file) > 128 * 1024) {
             std::fclose(file);
             file = std::fopen(diagnosticPath(), "w");
-            if (!file)
-                return;
+            if (!file) return;
         }
-        std::fprintf(file, "%lld %s\n", static_cast<long long>(std::time(nullptr)), event);
+        for (const auto &line : batch)
+            std::fprintf(file, "%s\n", line.c_str());
         std::fflush(file);
         std::fclose(file);
+    }
+    void run() noexcept {
+        std::deque<std::string> batch;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty() && stopping_) return;
+                batch.swap(queue_);
+            }
+            writeBatch(batch);
+            batch.clear();
+            cv_.notify_all();
+        }
+    }
+  public:
+    AsyncLog() {
+        try {
+            worker_ = std::thread([this] { run(); });
+        } catch (...) {
+            writerFailed_ = true;
+        }
+    }
+    ~AsyncLog() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+    void push(std::string line) noexcept {
+        try {
+            if (writerFailed_) {
+                std::deque<std::string> one;
+                one.push_back(std::move(line));
+                writeBatch(one);
+                return;
+            }
+            std::lock_guard lock(mutex_);
+            if (queue_.size() >= kMaxQueued) queue_.pop_front();
+            queue_.push_back(std::move(line));
+            cv_.notify_one();
+        } catch (...) {
+        }
+    }
+    void flush() noexcept {
+        try {
+            if (writerFailed_) return;
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return queue_.empty(); });
+        } catch (...) {
+        }
+    }
+};
+AsyncLog &asyncLog() {
+    static AsyncLog instance;
+    return instance;
+}
+} // namespace
+void diagnostic(const char *event) noexcept {
+    // Fixed names, numeric error codes and code offsets only; never log protocol data.
+    try {
+        if (!event) return;
+        std::string line = std::to_string(static_cast<long long>(std::time(nullptr)));
+        line += ' ';
+        line += event;
+        asyncLog().push(std::move(line));
+    } catch (...) {
+    }
+}
+void flushDiagnosticsLog() noexcept {
+    try {
+        asyncLog().flush();
     } catch (...) {
     }
 }
@@ -85,6 +167,7 @@ void diagnosticException(const char *event, std::exception_ptr error) noexcept {
             return ++depth < 16 ? _URC_NO_REASON : _URC_END_OF_STACK;
         },
         &depth);
+    flushDiagnosticsLog();
     // libc abort/exit can tear down the shared window while the UI thread is presenting.
     // Exit the process directly after saving evidence, without running global destructors.
     svcExitProcess();

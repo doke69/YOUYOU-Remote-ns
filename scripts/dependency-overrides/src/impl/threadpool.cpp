@@ -72,7 +72,7 @@ bool ThreadPool::runOne() {
 	return false;
 }
 
-void ThreadPool::enqueueDetached(std::function<void()> task) noexcept {
+void ThreadPool::enqueueDetached(std::function<void()> task) {
 	const auto time = clock::now();
 	std::unique_lock lock(mMutex);
 	mTasks.push({time, [task = std::move(task)]() noexcept {

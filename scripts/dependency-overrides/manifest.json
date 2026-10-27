@@ -57,7 +57,7 @@
     "dependency": "libdatachannel",
     "path": "src/impl/peerconnection.cpp",
     "upstream_sha256": "3dcbb89a28f950ab2babd17f9d20cc5e8d422985943786ef508dfeafdbae5bb2",
-    "sha256": "72f05e456c3108cabcbb3000ce7599eb04c3a4d9801c50b71b60537299acdc07"
+    "sha256": "80449060754fae37d21b4d061f78219c7aaadea206c58d323ba73659507231e8"
   },
   {
     "dependency": "libdatachannel",
@@ -81,13 +81,13 @@
     "dependency": "libdatachannel",
     "path": "src/impl/threadpool.cpp",
     "upstream_sha256": "e8b5dd8ac13f89dfc1e92e23230d0fa44bfad262c9ce06fc1a5847977f3be9a9",
-    "sha256": "37e7dcafdfa9e6643efb1f7df3a38a6954178a9bc36b44c71f960b517a7a861e"
+    "sha256": "81e4ef67122687c5b9088895337d2efc1c70e6736deef7940df5dc779e940240"
   },
   {
     "dependency": "libdatachannel",
     "path": "src/impl/threadpool.hpp",
     "upstream_sha256": "674ca23a8f662534fe14c9e9cc278c297d5f65464831e4c1f36bc7b6e001f1a6",
-    "sha256": "fa77c0e062d7c71e87dd397f5f85dbde790b9265089da39d3778bbffd400fc10"
+    "sha256": "c2af0bbbc8f5df0f721af15275e74e86fd0125b7f009a1297ba35947b5d42a70"
   },
   {
     "dependency": "libdatachannel",
@@ -117,7 +117,7 @@
     "dependency": "libdatachannel",
     "path": "src/rtcpreceivingsession.cpp",
     "upstream_sha256": "561deaf604f468b20538a36c5d994fc5f2f63c0d1d63481578d2d9caf956a780",
-    "sha256": "da2ba9d466c46c3d8e5138ad4e3f60ba1772de56c09225d942e9226714f840b9"
+    "sha256": "55541e89c2b9b7275f58484af4be132e24154f8dd3705702439ca38b5ba62956"
   },
   {
     "dependency": "libjuice",

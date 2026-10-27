@@ -48,7 +48,7 @@ public:
 	void run();
 	bool runOne();
 	// Fire-and-forget only: task exceptions are contained, as with discarded futures.
-	void enqueueDetached(std::function<void()> task) noexcept;
+	void enqueueDetached(std::function<void()> task);
 
 	template <class F, class... Args>
 	auto enqueue(F &&f, Args &&...args) noexcept -> invoke_future_t<F, Args...>;

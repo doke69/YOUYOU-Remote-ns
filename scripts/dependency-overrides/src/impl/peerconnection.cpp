@@ -594,30 +594,52 @@ void PeerConnection::dispatchMedia([[maybe_unused]] message_ptr message) {
 		size_t offset = 0;
 		while ((sizeof(RtcpHeader) + offset) <= message->size()) {
 			auto header = reinterpret_cast<RtcpHeader *>(message->data() + offset);
-			if (header->lengthInBytes() > message->size() - offset) {
+			const size_t remaining = message->size() - offset;
+			const size_t blockSize = header->lengthInBytes();
+			// Validate the compound-packet block before any type-specific
+			// reinterpretation. A valid RTCP length is at least one 32-bit word,
+			// 32-bit aligned, and fully contained in the remaining message.
+			if (blockSize < sizeof(RtcpHeader) || (blockSize & 3) || blockSize > remaining ||
+			    header->version() != 2) {
 				COUNTER_MEDIA_TRUNCATED++;
 				break;
 			}
-			offset += header->lengthInBytes();
 			if (header->payloadType() == 205 || header->payloadType() == 206) {
+				if (blockSize < sizeof(RtcpFbHeader)) {
+					COUNTER_MEDIA_TRUNCATED++;
+					break;
+				}
 				auto rtcpfb = reinterpret_cast<RtcpFbHeader *>(header);
 				ssrcs.insert(rtcpfb->packetSenderSSRC());
 				ssrcs.insert(rtcpfb->mediaSourceSSRC());
 
 			} else if (header->payloadType() == 200) {
+				if (blockSize < RtcpSr::Size(header->reportCount())) {
+					COUNTER_MEDIA_TRUNCATED++;
+					break;
+				}
 				auto rtcpsr = reinterpret_cast<RtcpSr *>(header);
 				ssrcs.insert(rtcpsr->senderSSRC());
-				for (int i = 0; i < rtcpsr->header.reportCount(); ++i)
+				for (int i = 0; i < header->reportCount(); ++i)
 					ssrcs.insert(rtcpsr->getReportBlock(i)->getSSRC());
 			} else if (header->payloadType() == 201) {
+				if (blockSize < RtcpRr::SizeWithReportBlocks(header->reportCount())) {
+					COUNTER_MEDIA_TRUNCATED++;
+					break;
+				}
 				auto rtcprr = reinterpret_cast<RtcpRr *>(header);
 				ssrcs.insert(rtcprr->senderSSRC());
-				for (int i = 0; i < rtcprr->header.reportCount(); ++i)
+				for (int i = 0; i < header->reportCount(); ++i)
 					ssrcs.insert(rtcprr->getReportBlock(i)->getSSRC());
 			} else if (header->payloadType() == 202) {
+				if (blockSize < sizeof(RtcpSdes)) {
+					COUNTER_MEDIA_TRUNCATED++;
+					break;
+				}
 				auto sdes = reinterpret_cast<RtcpSdes *>(header);
 				if (!sdes->isValid()) {
 					PLOG_WARNING << "RTCP SDES packet is invalid";
+					offset += blockSize;
 					continue;
 				}
 				for (unsigned int i = 0; i < sdes->chunksCount(); i++) {
@@ -633,6 +655,7 @@ void PeerConnection::dispatchMedia([[maybe_unused]] message_ptr message) {
 					COUNTER_UNKNOWN_PACKET_TYPE++;
 				}
 			}
+			offset += blockSize;
 		}
 
 		if (!ssrcs.empty()) {

@@ -4,6 +4,7 @@
 #include "diagnostics.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -56,6 +57,10 @@ struct Renderer {
     int width=1280,height=720,imageSlot=-1;unsigned current=0;
     uint64_t hardwareFrames=0;
     bool recording=false;
+    bool skippingFrame=false;
+    uint64_t skippedFrames=0;
+    uint64_t swapchainSaturatedSkips=0;
+    uint64_t acquireTimeoutSkips=0; // Track if acquireImage returns invalid slot
     Renderer(int w,int h):width(w),height(h) {
         auto *nativeWindow=nwindowGetDefault();
         // Catch ownership conflicts before deko3d's nonrecoverable error path.
@@ -86,6 +91,9 @@ struct Renderer {
         if(!swapchain) throw std::runtime_error("GPU 显示缓冲创建失败");
         code=memory(device,1<<18,sharedFlags|DkMemBlockFlags_Code);
         uint32_t offset=0;const char *names[]={"nv12.vert","nv12.frag","ui.vert","ui.frag"};
+        // Shader path is hardcoded to romfs:/shaders/ for production builds.
+        // For shader development/testing, consider adding a config override:
+        // const std::string shaderDir = ConfigStore::instance().value("shader_dir", "romfs:/shaders/");
         for(unsigned i=0;i<4;++i) {
             std::ifstream file(std::string("romfs:/shaders/")+names[i]+".dksh",std::ios::binary|std::ios::ate);
             if(!file) throw std::runtime_error("缺少 GPU 显示着色器");
@@ -130,16 +138,76 @@ struct Renderer {
         return texture;
     }
     Slot &slot() {return frames[current];}
-    void begin() {
-        if(recording) return;
-        current=(current+1)%slots;auto &f=slot();
-        if(f.pending && f.fence.wait(1000000000LL)!=DkResult_Success) {
-            // Never release surfaces or reuse command memory before completion.
-            queue.waitIdle();
+    bool begin() {
+        if(recording) return true;
+        if(skippingFrame) return false;
+        // Never block the UI thread on a previously submitted frame. Scan for
+        // a slot whose fence is already complete; if all slots are in flight,
+        // skip this frame and keep the last presented image.
+        skippingFrame=false;
+        bool acquired=false;
+        for(uint32_t i=1;i<=slots;++i) {
+            const uint32_t candidate=(current+i)%slots;
+            auto &candidateFrame=frames[candidate];
+            if(candidateFrame.pending &&
+               candidateFrame.fence.wait(0)!=DkResult_Success) continue;
+            current=candidate;
+            acquired=true;
+            break;
         }
+        if(!acquired) {
+            skippingFrame=true;
+            ++skippedFrames;
+            return false;
+        }
+        // Additional safeguard: verify that at least one swapchain image is
+        // available before calling acquireImage. The fence check above only
+        // confirms our command buffer completed; the display controller may
+        // still hold images for presentation. If all swapchain images are in
+        // the display pipeline, skip this frame rather than blocking the UI
+        // thread for up to 50ms (3 slots × 16.67ms).
+        uint32_t availableCount=0;
+        for(uint32_t i=0;i<slots;++i) {
+            if(!frames[i].pending || frames[i].fence.wait(0)==DkResult_Success)
+                ++availableCount;
+        }
+        // Conservative threshold: require at least one fully idle slot.
+        // This prevents acquireImage from blocking when the display pipeline
+        // is saturated, which was causing the 30-55ms draw spikes.
+        if(availableCount==0) {
+            skippingFrame=true;
+            ++skippedFrames;
+            ++swapchainSaturatedSkips;
+            if(swapchainSaturatedSkips==1 || swapchainSaturatedSkips%100==0) {
+                diagnostic(("display-swapchain-saturated-"+std::to_string(swapchainSaturatedSkips)).c_str());
+            }
+            return false;
+        }
+        auto &f=slot();
         f.pending=false;f.textures.clear();f.video.reset();f.used=f.imageCount=0;
+
+        // Acquire swapchain image. Even with fence pre-check, this may still block
+        // if display controller holds all images. Track acquisition failures separately
+        // from saturation detection to identify if pre-check is insufficient.
+        const auto acquireStarted = std::chrono::steady_clock::now();
         imageSlot=queue.acquireImage(swapchain);
-        if(imageSlot<0 || imageSlot>=int(slots)) throw std::runtime_error("GPU 显示缓冲获取失败");
+        const auto acquireDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - acquireStarted).count();
+
+        // Diagnostic: warn if acquire took >5ms despite passing pre-check
+        if (acquireDuration > 5000) {
+            diagnostic(("display-acquire-slow-" + std::to_string(acquireDuration) + "us").c_str());
+        }
+
+        if(imageSlot<0 || imageSlot>=int(slots)) {
+            skippingFrame=true;
+            ++skippedFrames;
+            ++acquireTimeoutSkips;
+            if(acquireTimeoutSkips==1 || acquireTimeoutSkips%100==0) {
+                diagnostic(("display-acquire-failed-"+std::to_string(acquireTimeoutSkips)).c_str());
+            }
+            return false;
+        }
         f.command.clear();f.command.addMemory(f.commands,0,commandBytes);
         dk::ImageView target{frameImages[imageSlot]};f.command.bindRenderTargets({&target});
         // Screen-space UI/video triangles have no back face. Upper-left,
@@ -154,6 +222,7 @@ struct Renderer {
         DkScissor clip{0,0,uint32_t(width),uint32_t(height)};f.command.setScissors(0,{clip});
         f.command.clearColor(0,DkColorMask_RGBA,color.r/255.f,color.g/255.f,color.b/255.f,color.a/255.f);
         recording=true;
+        return true;
     }
     DkGpuAddr uniform(DkStage stage,const void *data,size_t bytes) {
         auto &f=slot();const auto offset=aligned(f.used,DK_UNIFORM_BUF_ALIGNMENT);
@@ -177,7 +246,8 @@ struct Renderer {
     }
     void textured(const std::shared_ptr<Texture> &texture,const SDL_Rect &source,const SDL_Rect &dest,SDL_Color tint) {
         if(!texture || source.w<=0 || source.h<=0 || dest.w<=0 || dest.h<=0) return;
-        begin();auto &f=slot();viewport(dest);
+        if(!begin()) return;
+        auto &f=slot();viewport(dest);
         DkShader const *programs[]={&shaders[2],&shaders[3]};dkCmdBufBindShaders(f.command,DkStageFlag_GraphicsMask,programs,2);
         const float rect[]={source.x/float(texture->width),source.y/float(texture->height),
                             source.w/float(texture->width),source.h/float(texture->height)};
@@ -193,7 +263,13 @@ struct Renderer {
     }
     void drawVideo(const SDL_Rect &dest) {
         if(!nativeVideo) {if(cpuVideo) textured(cpuVideo,{0,0,cpuVideo->width,cpuVideo->height},dest,{255,255,255,255});return;}
-        begin();auto &f=slot();viewport(dest);
+
+        const auto drawStarted = std::chrono::steady_clock::now();
+        if(!begin()) return;
+        const auto beginUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - drawStarted).count();
+
+        auto &f=slot();viewport(dest);
         DkShader const *programs[]={&shaders[0],&shaders[1]};dkCmdBufBindShaders(f.command,DkStageFlag_GraphicsMask,programs,2);
         uniform(DkStage_Fragment,nativeVideo->colorRows.data(),sizeof(nativeVideo->colorRows));
         DkColorState state;dkColorStateDefaults(&state);f.command.bindColorState(state);
@@ -201,9 +277,19 @@ struct Renderer {
         dkCmdBufBindTextures(f.command,DkStage_Fragment,0,handles,2);
         f.command.barrier(DkBarrier_None,DkInvalidateFlags_Image|DkInvalidateFlags_Descriptors);
         f.command.draw(DkPrimitive_Triangles,3,1,0,0);f.video=nativeVideo;
+
+        const auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - drawStarted).count();
+
+        // Diagnostic: warn if video draw takes >10ms
+        if (totalUs > 10000 || beginUs > 5000) {
+            diagnostic(("draw-video-slow-total-" + std::to_string(totalUs) + "us-begin-" + std::to_string(beginUs) + "us").c_str());
+        }
     }
     void present() {
-        begin();auto &f=slot();f.command.signalFence(f.fence,true);
+        if(skippingFrame) {skippingFrame=false;recording=false;return;}
+        if(!begin()) {skippingFrame=false;recording=false;return;}
+        auto &f=slot();f.command.signalFence(f.fence,true);
         queue.submitCommands(f.command.finishList());queue.presentImage(swapchain,imageSlot);
         f.pending=true;recording=false;
     }
@@ -249,7 +335,7 @@ int fillRect(SDL_Renderer *r,const SDL_Rect *rect) {
     if(!renderer) return SDL_RenderFillRect(r,rect);
     const SDL_Rect all{0,0,1280,720};renderer->textured(renderer->white,{0,0,1,1},rect?*rect:all,renderer->color);return 0;
 }
-int clear(SDL_Renderer *r) {if(!renderer) return SDL_RenderClear(r);renderer->begin();return 0;}
+int clear(SDL_Renderer *r) {if(!renderer) return SDL_RenderClear(r);return renderer->begin()?0:-1;}
 void present(SDL_Renderer *r) {if(renderer) renderer->present();else SDL_RenderPresent(r);}
 SDL_Texture *textureFromSurface(SDL_Renderer *r,SDL_Surface *surface) {
     auto *texture=SDL_CreateTextureFromSurface(r,surface);

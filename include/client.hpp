@@ -35,7 +35,7 @@ struct Snapshot {
     // Actual host capture state, when CaptureSettingSync is available.
     int appliedFps = 0, appliedQuality = 0, appliedWidth = 0, appliedHeight = 0;
     int appliedBitrateMbps = 0;
-    bool appliedValid = false;
+    bool appliedValid = false, appliedBitrateKnown = false;
     // Unified setting result: ACK is accepted; only CaptureSettingSync/media
     // can promote a setting to applied.
     bool settingAccepted=false, settingApplied=false, settingRejected=false;
