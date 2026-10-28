@@ -2,8 +2,9 @@
 
 namespace uu {
 
-// The four production presets. legacyMbps is only the old Custom-cap value
-// used to recognize pre-F02 configs; it is not a promised output rate.
+// The four production presets. legacyMbps is the pre-0.3.73 custom-cap label
+// for that menu row. It is not a host output rate and must not be used to
+// rewrite a saved custom cap into a preset.
 struct QualityPreset {
     const char *name;
     int quality;

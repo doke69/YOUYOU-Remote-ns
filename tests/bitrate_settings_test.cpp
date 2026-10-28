@@ -124,8 +124,25 @@ int main() {
             const auto explicitChoice=uu::qualityPresetRequest(2,0);
             require(explicitChoice.quality==3 && explicitChoice.maxBitrateMbps==0);
         }
-        // v2->v3 migration: exact old UI caps become native presets; arbitrary
-        // Custom values are preserved and reported for explicit compatibility.
+        require(uu::captureSyncFps(1)==30 && uu::captureSyncFps(2)==60);
+        require(uu::captureSyncFps(30)==30 && uu::captureSyncFps(60)==60);
+        require(uu::captureSyncFps(0)==0 && uu::captureSyncFps(90)==0);
+        // A host that echoes raw fps=60 plus field 4 must not be dropped.
+        // Previously fps>2 rejected the whole sync, so the bitrate echo vanished.
+        {
+            auto appendVarint=[](uu::Bytes &b,uint64_t n){while(n>127){b.push_back(uint8_t(n)|128);n>>=7;}b.push_back(uint8_t(n));};
+            auto appendInt=[&](uu::Bytes &b,unsigned key,uint64_t n){appendVarint(b,uint64_t(key)*8);appendVarint(b,n);};
+            uu::Bytes body; appendInt(body,1,60); appendInt(body,4,50000000);
+            uu::Bytes raw; appendVarint(raw,(25u<<3)|2); appendVarint(raw,body.size());
+            raw.insert(raw.end(),body.begin(),body.end());
+            auto echoed=uu::parseCaptureSettingSync(raw.data(),raw.size());
+            require(echoed && (echoed->fields&1u) && (echoed->fields&16u));
+            require(echoed->fps==60 && echoed->maxCustomBitrate==50000000);
+            require(uu::captureSyncFps(echoed->fps)==60);
+        }
+        // v2->v3 keeps saved Custom ceilings, including the old 5/12/20/30 labels.
+        // Rewriting 20 into preset quality 3 drops field 8 and the host encodes
+        // that preset far below 20 Mbps.
         using Lines=std::vector<std::string>;
         auto lineValue=[](const Lines &lines,const std::string &key)->std::string{
             for(const auto &line:lines){
@@ -135,15 +152,20 @@ int main() {
             return {};
         };
         for(int i=0;i<uu::qualityPresetCount;++i){
-            Lines lines={"width=1280","quality=6","max_bitrate_mbps="+std::to_string(uu::qualityPresets[i].legacyMbps),"video_codec=hevc"};
+            const auto mbps=std::to_string(uu::qualityPresets[i].legacyMbps);
+            Lines lines={"width=1280","quality=6","max_bitrate_mbps="+mbps,"video_codec=hevc"};
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed && migration.toQuality==i+1);
-            require(lineValue(lines,"quality")==std::to_string(i+1));
-            require(lineValue(lines,"max_bitrate_mbps")=="0");
+            require(!migration.changed && migration.legacyCustom && !migration.invalidCustom);
+            require(migration.fromQuality==6 && migration.fromMbps==uu::qualityPresets[i].legacyMbps);
+            require(lineValue(lines,"quality")=="6");
+            require(lineValue(lines,"max_bitrate_mbps")==mbps);
             require(lineValue(lines,"video_codec")=="hevc");
             auto again=uu::migrateQualityConfigLines(lines);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom && !again.invalidCustom);
         }
+        // 20 still names the old 高清 row, but that index must not rewrite the cap.
+        require(uu::qualityPresetIndexForLegacyMbps(20)==2);
+        require(uu::qualityPresetIndexForLegacyMbps(25)<0);
         {
             Lines lines={"quality=6","max_bitrate_mbps=25","width=1280"};
             auto migration=uu::migrateQualityConfigLines(lines);
@@ -157,12 +179,12 @@ int main() {
         {
             Lines lines={"quality=6 # old UI","max_bitrate_mbps=20 # cap","video_codec=hevc # keep","width=1280"};
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed && migration.toQuality==3);
-            require(lineValue(lines,"quality")=="3 # old UI");
-            require(lineValue(lines,"max_bitrate_mbps")=="0 # cap");
+            require(!migration.changed && migration.legacyCustom && migration.fromMbps==20);
+            require(lineValue(lines,"quality")=="6 # old UI");
+            require(lineValue(lines,"max_bitrate_mbps")=="20 # cap");
             require(lineValue(lines,"video_codec")=="hevc # keep");
             auto again=uu::migrateQualityConfigLines(lines);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom);
         }
         {
             Lines lines={"quality=6","quality=3","max_bitrate_mbps=20"};
@@ -193,17 +215,17 @@ int main() {
             };
             auto lines=readLines();
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed);
+            require(!migration.changed && migration.legacyCustom && migration.fromMbps==20);
             {
                 std::ofstream out(path,std::ios::trunc);
                 for(const auto &line:lines)out<<line<<'\n';
             }
             auto reloaded=readLines();
-            require(lineValue(reloaded,"quality")=="3 # old UI");
-            require(lineValue(reloaded,"max_bitrate_mbps")=="0 # cap");
+            require(lineValue(reloaded,"quality")=="6 # old UI");
+            require(lineValue(reloaded,"max_bitrate_mbps")=="20 # cap");
             require(lineValue(reloaded,"width")=="1280");
             auto again=uu::migrateQualityConfigLines(reloaded);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom);
             std::remove(path.c_str());
         }
         // The same production tracker used by Client: ACK must not erase
@@ -257,6 +279,6 @@ int main() {
         tracker.evidence.observeQuality(3);
         tracker.evidence.observeSize(1280,720);
         require(tracker.evaluate(preset));
-        std::cout<<"PASS: native preset wire/cap-preserve; legacy migration/comments/duplicates/fixture; Custom wire; sync; tracker\n";
+        std::cout<<"PASS: native preset wire/cap-preserve; custom caps kept; comments/duplicates/fixture; Custom wire; raw-fps sync; tracker\n";
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

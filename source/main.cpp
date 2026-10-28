@@ -210,8 +210,8 @@ void statsPanel(SDL_Renderer *renderer, TTF_Font *font, const uu::StreamStatsSna
     line("音频", audio);
 }
 // Compact bottom-left overlay with a subdued backdrop:
-// session time, transport, fps, realtime video Mbps, RTT, frame time, loss,
-// configured video bitrate.
+// session time, transport, fps, received Mbps, RTT, frame time, loss,
+// requested cap and the host's echoed cap (机-- means no echo yet).
 void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamStatsSnapshot &s,
                         Uint32 elapsedSeconds) {
     const SDL_Color normal{235,235,235,240},warning{253,138,0,235},bad{250,75,90,235};
@@ -222,17 +222,21 @@ void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamSt
     if(s.transport.find("私网地址直连")!=std::string::npos || s.transport.find("局域网直连")!=std::string::npos)path="UDP LAN";
     else if(s.transport.find("TURN")!=std::string::npos || s.transport.find("远端中继")!=std::string::npos)path="TURN";
     else if(s.transport.find("P2P")!=std::string::npos || s.transport.find("公网")!=std::string::npos)path="UDP WAN";
+    const bool customCap=s.requestedQuality==6 && s.maxBitrateMbps>0;
+    std::string capText=customCap?"设"+std::to_string(s.maxBitrateMbps):"预设";
+    capText+=s.hostBitrateKnown?" 机"+std::to_string(s.hostBitrateMbps):" 机--";
+    const bool hostDiffers=customCap && s.hostBitrateKnown && s.hostBitrateMbps!=s.maxBitrateMbps;
     struct Row{std::string text;SDL_Color color;};
     const Row rows[8]={
         {duration(elapsedSeconds),normal},
         {path,normal},
         {number(s.presentFps)+" fps",normal},
-        {formatMbps(s.video.bitrateMbps),normal},
+        {"实 "+formatMbps(s.video.bitrateMbps),normal},
         {s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("-- ms"),normal},
         {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm",normal},
         {formatPercent(s.video.lossPercent)+" loss",
             s.video.lossPercent>=10?bad:s.video.lossPercent>=5?warning:normal},
-        {s.maxBitrateMbps>0?std::to_string(s.maxBitrateMbps)+" Mbps":std::string("-- Mbps"),normal},
+        {capText,hostDiffers?warning:normal},
     };
     std::string display[8];int maxWidth=0;
     for(int i=0;i<8;++i){

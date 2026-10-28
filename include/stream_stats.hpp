@@ -31,7 +31,9 @@ struct StreamStatsSnapshot {
     std::string transport = "—";
     std::string localEndpoint = "—", remoteEndpoint = "—";
     double presentFps = -1;
-    int requestedFps = 0, maxBitrateMbps = 0;
+    int requestedFps = 0, requestedQuality = 0, maxBitrateMbps = 0;
+    int hostBitrateMbps = 0;
+    bool hostBitrateKnown = false;
     bool bitrateFeedbackSent = false;
     uint64_t qualitySent=0,qualityAcked=0,qualityFailed=0;
     uint64_t touchPackets=0,touchFailures=0;unsigned touchPoints=0;

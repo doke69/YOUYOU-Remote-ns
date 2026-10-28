@@ -556,8 +556,12 @@ public:
             aligned(r,f.normal,"网络延迟  "+(stats.rttMs>=0?std::to_string(stats.rttMs)+" ms":"--"),{90,130,700,60},ink);
             aligned(r,f.hint,"连接信息",{90,194,510,25},label);aligned(r,f.hint,"播放性能",{660,194,510,25},label);
             const char *names[]={"连接通道","被控端地址","控制端地址","客户端版本","客户端系统","解码耗时","显示帧率","视频码率","初传缺口","连接时间"};
+            const bool customCap=stats.requestedQuality==6 && stats.maxBitrateMbps>0;
+            std::string videoRate=number(stats.video.bitrateMbps);
+            videoRate+=customCap?" 设"+std::to_string(stats.maxBitrateMbps):" 预设";
+            videoRate+=stats.hostBitrateKnown?" 机"+std::to_string(stats.hostBitrateMbps):" 机--";
             const std::string values[]={stats.transport,stats.remoteEndpoint,stats.localEndpoint,UU_VERSION,"Nintendo Switch",
-                formatMillis(stats.decodeMs),number(stats.presentFps)+" FPS",formatMbps(stats.video.bitrateMbps),formatPercent(stats.video.lossPercent),
+                formatMillis(stats.decodeMs),number(stats.presentFps)+" FPS",videoRate,formatPercent(stats.video.lossPercent),
                 snapshot.streaming?std::to_string((SDL_GetTicks()-connectedAt)/1000)+" 秒":"--"};
             for(int i=0;i<10;++i){
                 const int col=i/5,line=i%5,x=90+col*570,y=220+line*53;

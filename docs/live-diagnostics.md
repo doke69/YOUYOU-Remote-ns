@@ -87,10 +87,11 @@ python scripts/telemetry_receiver.py --config private.json --out diagnostics-out
 
 ### 4.1 core
 
-`version,width,height,requested_fps,codecflag,actualmbps,targetcap,feedback,vsync,buffer,pacing,snapshot_age_ms,session_age_ms,sent,dropdiag,path,local,remote,send_us,recv_us,publish_us`
+`version,width,height,requested_fps,codecflag,actualmbps,targetcap,hostknown,hostmbps,feedback,vsync,buffer,pacing,snapshot_age_ms,session_age_ms,sent,dropdiag,path,local,remote,send_us,recv_us,publish_us`
 
 - `codecflag`：1 = HEVC，0 = H.264。
-- `actualmbps`：视频实际 Mbps；`targetcap`：设置上限，0 表示自动。
+- `actualmbps`：视频实际 Mbps；`targetcap`：客户端设定上限，0 表示主机预设、未发送自定义字段。
+- `hostknown`：1 表示已解析到主机 CaptureSettingSync 的码率回显；`hostmbps` 是该回显换算后的 Mbps，未知为 -1。主机回显低于 `targetcap` 时，客户端没有采用该上限。
 - `buffer`：当前播放缓冲 ms；`pacing`：播放调度是否开启。
 - `sent/dropdiag`：发送端累计成功/失败 datagram 计数（不是视频丢包）。
 - `send_us/recv_us/publish_us`：解码阶段 EMA，单位 µs；不要当作 GPU 计算时间。

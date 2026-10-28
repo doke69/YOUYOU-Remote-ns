@@ -13,6 +13,14 @@ struct CaptureSettingSyncInfo {
     int width=0,height=0,pixelWidth=0,pixelHeight=0;
 };
 std::optional<CaptureSettingSyncInfo> parseCaptureSettingSync(const uint8_t *data,size_t size) noexcept;
+// CaptureSettingSync field 1 is either the fps option (1=30, 2=60) or the raw
+// frame rate. A raw 30/60 must not be treated as an unknown option: rejecting
+// it used to drop the rest of the sync, including the host bitrate echo.
+inline int captureSyncFps(int wire) noexcept {
+    if(wire==1 || wire==30) return 30;
+    if(wire==2 || wire==60) return 60;
+    return 0;
+}
 struct TextRpcAck {uint64_t requestId=0;unsigned status=0;};
 Bytes clipboardTextRpc(uint64_t requestId,const std::string &text);
 std::optional<TextRpcAck> parseTextRpcAck(const uint8_t *data,size_t size) noexcept;

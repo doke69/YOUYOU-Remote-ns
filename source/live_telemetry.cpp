@@ -197,7 +197,9 @@ void LiveTelemetry::publish(const StreamStatsSnapshot &s,bool vsync,bool nv12,do
         groups[0].update(Json{
             {"version",UU_VERSION},{"width",s.width},{"height",s.height},{"requested_fps",s.requestedFps},
             {"codecflag",s.codec.rfind("H.265",0)==0?1:0},{"actualmbps",r(s.video.bitrateMbps)},
-            {"targetcap",s.maxBitrateMbps},{"feedback",s.bitrateFeedbackSent?1:0},{"vsync",vsync?1:0},
+            {"targetcap",s.maxBitrateMbps},{"hostknown",s.hostBitrateKnown?1:0},
+            {"hostmbps",s.hostBitrateKnown?s.hostBitrateMbps:-1},
+            {"feedback",s.bitrateFeedbackSent?1:0},{"vsync",vsync?1:0},
             {"buffer",s.playoutDelayMs},{"pacing",s.pacing?1:0},
             {"snapshot_age_ms",s.sampledMs?std::max<int64_t>(0,nowMs-s.sampledMs):-1},
             {"session_age_ms",p.now-p.sessionStart},{"sent",p.sent},{"dropdiag",p.failed},

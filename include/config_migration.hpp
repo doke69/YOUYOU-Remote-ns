@@ -1,6 +1,5 @@
 #pragma once
 #include "config_value.hpp"
-#include "quality_presets.hpp"
 #include <string>
 #include <vector>
 
@@ -17,12 +16,14 @@ struct QualityConfigMigration {
     int toQuality=0;
 };
 
-// v2 -> v3: exact old UI Custom caps become native presets. Inline comments
-// are ignored for parsing and preserved on rewritten values. Reload and this
-// migration both use the first occurrence of a key. Duplicate quality/cap
-// entries remain unresolved and preserved (no key is rewritten), so the
-// effective first value is not silently changed; this is the F02 compatibility
-// contract for duplicate keys.
+// v2 -> v3 keeps a saved Custom ceiling. The old menu stored its four rows as
+// quality=6 plus 5/12/20/30 Mbps. Rewriting those into presets 1..4 and
+// clearing max_bitrate_mbps drops field 8; the host then applies its own
+// preset ceilings (about 1/2/8/20 Mbps), so a saved 20 Mbps request becomes
+// roughly 8 Mbps. Positive custom caps stay quality=6 with the original Mbps.
+// Native presets (quality 1..4) are unchanged. Inline comments are ignored
+// for parsing. Duplicate quality/cap entries stay unresolved and are not
+// rewritten, so the effective first value is not silently changed.
 inline QualityConfigMigration migrateQualityConfigLines(std::vector<std::string> &lines) {
     QualityConfigMigration result;
     int qualityLine=-1,bitrateLine=-1,qualityCount=0,bitrateCount=0;
@@ -60,17 +61,8 @@ inline QualityConfigMigration migrateQualityConfigLines(std::vector<std::string>
         result.unresolved=true;
         return result;
     }
-    const int preset=qualityPresetIndexForLegacyMbps(mbps);
-    if(preset<0) {
-        result.legacyCustom=true;
-        result.invalidCustom=(mbps<=0);
-        return result;
-    }
-    config::setValue(lines[std::size_t(qualityLine)],
-        std::to_string(qualityPresets[preset].quality));
-    config::setValue(lines[std::size_t(bitrateLine)],"0");
-    result.changed=true;
-    result.toQuality=qualityPresets[preset].quality;
+    result.legacyCustom=true;
+    result.invalidCustom=(mbps<=0);
     return result;
 }
 

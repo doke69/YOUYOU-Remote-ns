@@ -248,7 +248,7 @@ std::optional<CaptureSettingSyncInfo> parseCaptureSettingSync(const uint8_t *dat
         while(body.next(v)){
             if(v.wire!=0)continue;
             switch(v.key){
-                case 1: if(v.value>2)return {}; result.fps=int(v.value);result.fields|=1u;break;
+                case 1: if(v.value>240)return {}; result.fps=int(v.value);result.fields|=1u;break;
                 case 2: if(v.value>6)return {}; result.quality=int(v.value);result.fields|=2u;break;
                 case 3: if(v.value>4)return {}; result.chroma=int(v.value);break;
                 case 4: if(v.value>uint64_t(std::numeric_limits<int64_t>::max()))return {}; result.maxCustomBitrate=int64_t(v.value);result.fields|=16u;break;

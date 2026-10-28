@@ -37,6 +37,13 @@ bool verboseDiagnostics() {
     static const bool enabled=ConfigStore::instance().integer("diag_verbose",0,0,1)!=0;
     return enabled;
 }
+std::string hostBitrateGapNotice(int quality,int capMbps,bool known,int hostMbps) {
+    if(quality!=6 || capMbps<=0) return {};
+    if(!known) return "电脑未回传最高码率，设定 "+std::to_string(capMbps)+" Mbps";
+    if(hostMbps!=capMbps)
+        return "设定 "+std::to_string(capMbps)+" Mbps，主机确认 "+std::to_string(hostMbps)+" Mbps";
+    return {};
+}
 // Diagnostic-only, bounded JSON shape summary. String values are never
 // printed; only keys, numeric/boolean values, string lengths and array sizes.
 // Diagnostic-only bounded JSON shape representation. Recursively traverses
@@ -684,7 +691,7 @@ void Client::handle(const Event &event) {
         const bool hasFps=bool(syncFields&1u),hasQuality=bool(syncFields&2u);
         const bool hasWidth=bool(syncFields&4u),hasHeight=bool(syncFields&8u);
         const bool hasBitrate=bool(syncFields&16u);
-        const int syncFps=data.value("fps",0)==1?30:(data.value("fps",0)==2?60:0);
+        const int syncFps=hasFps?captureSyncFps(data.value("fps",0)):0;
         const int syncQuality=data.value("quality",0);
         const int syncWidth=data.value("width",0),syncHeight=data.value("height",0);
         const int64_t syncBitrate=data.value("bitrate",int64_t(0));
@@ -699,7 +706,7 @@ void Client::handle(const Event &event) {
         const QualityApplicationTarget target{targetWidth,targetHeight,targetFps,targetQuality,targetCap};
         // Evidence is accumulated for the lifetime of the current request.
         // Split sync messages can therefore jointly prove a complete match.
-        if(hasFps)qualityApply_.evidence.observeFps(syncFps);
+        if(hasFps && syncFps>0)qualityApply_.evidence.observeFps(syncFps);
         if(hasQuality)qualityApply_.evidence.observeQuality(syncQuality);
         if(hasWidth)qualityApply_.evidence.observeWidth(syncWidth);
         if(hasHeight)qualityApply_.evidence.observeHeight(syncHeight);
@@ -736,6 +743,14 @@ void Client::handle(const Event &event) {
             }
             qualityNoticeUntil_=monotonicMs()+6000;
             diagnostic(("quality-apply-confirmed-"+std::to_string(applyConfirmedId)).c_str());
+        } else if(const auto gap=hostBitrateGapNotice(targetQuality,targetCap,hasBitrate,syncMbps); !gap.empty() && hasBitrate){
+            {
+                std::lock_guard lock(stateMutex_);
+                state_.qualityNotice=gap;
+            }
+            qualityNoticeUntil_=monotonicMs()+8000;
+            diagnostic(("encoder-bitrate-host-mismatch-target-mbps-"+std::to_string(targetCap)+
+                        "-host-mbps-"+std::to_string(syncMbps)).c_str());
         }
         diagnostic(("capture-setting-sync-fps-"+std::to_string(syncFps)+
                     "-quality-"+std::to_string(syncQuality)+
@@ -748,6 +763,7 @@ void Client::handle(const Event &event) {
                     "-fields-"+std::to_string(syncFields)+
                     "-target-fps-"+std::to_string(targetFps)+
                     "-quality-"+std::to_string(targetQuality)+
+                    "-cap-"+std::to_string(targetCap)+
                     "-resolution-"+std::to_string(targetWidth)+"x-"+std::to_string(targetHeight)+
                     "-matches-"+std::to_string(matches?1:0)).c_str());
     } else if(e=="screen-wire") {
@@ -2077,14 +2093,19 @@ void Client::tickQuality() {
     }
     if(pendingQualityApply_ && now>=pendingQualityApply_->deadline){
         const auto requestId=pendingQualityApply_->id;
+        const auto target=pendingQualityApply_->target;
+        const bool bitrateKnown=qualityApply_.evidence.bitrateKnown;
+        const int hostMbps=qualityApply_.evidence.bitrateMbps;
         pendingQualityApply_.reset();
         qualityApply_.timeout();
+        auto notice=hostBitrateGapNotice(target.quality,target.cap,bitrateKnown,hostMbps);
+        if(notice.empty()) notice="电脑已应答，但未确认实际参数";
         {
             std::lock_guard lock(stateMutex_);
             state_.settingApplied=false;
             state_.settingApplyPending=false;
             state_.settingSource="ack";
-            state_.qualityNotice="电脑已应答，但未确认实际参数";
+            state_.qualityNotice=notice;
         }
         qualityNoticeUntil_=now+8000;
         diagnostic(("quality-apply-confirmation-timeout-"+std::to_string(requestId)).c_str());
@@ -2263,6 +2284,12 @@ void Client::refreshStats(int64_t now) {
     stats.height = media.height;
     stats.decodeFps = media.fps;
     stats.requestedFps = streamFps_;
+    {
+        std::lock_guard lock(stateMutex_);
+        stats.requestedQuality=state_.quality;
+        stats.hostBitrateMbps=state_.appliedBitrateMbps;
+        stats.hostBitrateKnown=state_.appliedBitrateKnown;
+    }
     stats.maxBitrateMbps=maxBitrateMbps_;stats.bitrateFeedbackSent=bitrateFeedbackSent_;
     stats.touchPackets=touchPackets_;stats.touchFailures=touchFailures_;stats.touchPoints=touchPoints_;
     stats.qualitySent=qualitySent_;stats.qualityAcked=qualityAcked_;stats.qualityFailed=qualityFailed_;
