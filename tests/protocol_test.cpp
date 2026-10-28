@@ -32,8 +32,10 @@ int main() {
         check(headers.at("X-Param-SIGN") ==
                   "bde127df49e8d93a661a4b2e524aee17475dca99bd3de74c3341bf7755c930b7",
               "HMAC differs from Web client");
-        check(hex(connectOptions()) == "080110ffffffffffffffffff011a1808011003180120022a0608800a10d0053206088"
-                                       "00a10d005220a081e100118800a20d0054002",
+        // Current contract: capture field4=4 (ChooseType_RESOLUTION), field10=0
+        // (no automatic frame-quality mode), field11=30 (default fixed fps).
+        // Decoder remains 30fps/H264/1280x720; top-level fields 1/2/8 unchanged.
+        check(hex(connectOptions()) == "080110ffffffffffffffffff011a1c08011003180120042a0608800a10d005320608800a10d0055000581e220a081e100118800a20d0054002",
               "ConnectOptions differs from Web client");
         auto message = soac("pc", "candidate", {{"candidate", "candidate:1"}, {"sdpMid", "0"}}, 7, "control");
         check(message["data"]["candidate"]["candidate"] == "candidate:1" && message["data"]["ice_id"] == 7,

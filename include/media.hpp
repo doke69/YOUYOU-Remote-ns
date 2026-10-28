@@ -79,7 +79,8 @@ class Media {
     void video(const uint8_t *data, size_t size, uint64_t generation,
                std::optional<uint32_t> timestamp = std::nullopt, bool hevc = false,
                std::optional<bool> validatedKeyframe = std::nullopt);
-    void audio(const uint8_t *data, size_t size, uint64_t generation);
+    void audio(const uint8_t *data, size_t size, uint64_t generation,
+               std::optional<uint32_t> timestamp = std::nullopt);
     uint64_t generation() const;
     Picture picture(uint64_t after, int presentationLeadMs = 0);
     void setPlayoutDelay(int milliseconds);

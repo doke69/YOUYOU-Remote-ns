@@ -9,15 +9,13 @@ class LiveFrontend {
     uu::DeviceSelection deviceSelection;
     bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true;
     bool nativeMultitouch=true;Uint32 modeNoticeUntil=0;
-    bool keyboardEditRequested=false,sendingText=false,legacyQuality=false;
+    bool keyboardEditRequested=false,sendingText=false,legacyQuality=false,customQuality=false;
     uu::Json safetyProfiles=uu::Json::object();std::string safetyDevice;bool safetyApplied=false;
     uint64_t textRevisionAtSend=0;
     uu::RuntimeProfile runtimeProfile;
     bool resetTouchZoom=false,touchDown=false,wasStreaming=false,wasAuthenticated=false,draining=false;
-    Uint32 settingsSentAt=0,connectedAt=0;int requestedCap=0,sourceQuality=3;
+    Uint32 settingsSentAt=0,connectedAt=0;int requestedCap=0,sourceQuality=3,customMbps=30;
     std::string device,keyboardText,draftDevice,pendingShortcut,notice,saveError;
-    const char *qualityNames[4]={"省流","清晰","高清","原画"};
-    static constexpr int qualityMbps[4]={5,12,20,30};
     static constexpr const char *prefsPath=
 #ifdef __SWITCH__
         "sdmc:/switch/UURemote-ns/ui-state.json";
@@ -160,14 +158,38 @@ class LiveFrontend {
     }
     void loadSettings(const uu::Snapshot &s){
         fps=s.fps;resolution=s.height;codec=s.hevc;vsync=s.vsync;bufferMs=s.playoutDelayMs;requestedCap=s.maxBitrateMbps;sourceQuality=s.quality;
-        quality=std::clamp(s.quality-1,0,3);legacyQuality=true;
-        if(s.quality==6)for(int i=0;i<4;++i)if(s.maxBitrateMbps==qualityMbps[i]){quality=i;legacyQuality=false;}
+        const int direct=uu::qualityPresetIndexForQuality(s.quality);
+        if(s.quality==6 && s.maxBitrateMbps>0 && s.maxBitrateMbps<=100){
+            customQuality=true;legacyQuality=false;customMbps=s.maxBitrateMbps;
+        }else if(direct>=0){
+            quality=direct;customQuality=false;legacyQuality=false;
+        }else{
+            // Do not silently map an unrecognized value onto a preset.
+            // Keep the original quality/cap until the user selects a preset.
+            quality=0;customQuality=false;legacyQuality=true;
+        }
+    }
+    std::string qualitySummary() const {
+        if(customQuality)return "最高 "+std::to_string(customMbps)+" Mbps";
+        if(legacyQuality)return "自定义（待确认）";
+        return std::string(uu::qualityPresets[quality].name)+" · 主机预设";
     }
     void applyQuality(const uu::Snapshot &s){
         if(s.qualityPending){notice="正在应用上一次设置，请稍候";loadSettings(s);return;}
         if(uu::display::vsync(renderer,vsync?1:0)!=0){notice="当前显示后端不支持该垂直同步设置";loadSettings(s);return;}
+        // Native presets carry quality 1..4 and no Custom field 8. An explicit
+        // custom ceiling sends quality 6 plus that ceiling. An unrecognized
+        // loaded value is preserved only until the user picks a preset or ceiling.
+        int requestedQuality=sourceQuality;
+        int requestedBitrate=requestedCap;
+        if(customQuality){
+            requestedQuality=6;requestedBitrate=customMbps;
+        }else if(!legacyQuality){
+            const auto presetRequest=uu::qualityPresetRequest(quality,requestedCap);
+            requestedQuality=presetRequest.quality;requestedBitrate=presetRequest.maxBitrateMbps;
+        }
         client.command("quality-settings",{{"width",resolution==540?960:resolution==1080?1920:1280},{"height",resolution},{"fps",fps},
-            {"quality",legacyQuality?sourceQuality:6},{"vsync",vsync},{"hevc",bool(codec)},{"playout_delay_ms",bufferMs},{"max_bitrate_mbps",legacyQuality?requestedCap:qualityMbps[quality]}});
+            {"quality",requestedQuality},{"vsync",vsync},{"hevc",bool(codec)},{"playout_delay_ms",bufferMs},{"max_bitrate_mbps",requestedBitrate}});
         settingsSentAt=SDL_GetTicks();notice="正在应用设置；部分设置需要重新连接";
     }
     void chord(std::initializer_list<int> keys){for(int key:keys)client.command("input",{{"action","kbd_press"},{"key",key}});for(auto it=keys.end();it!=keys.begin();){--it;client.command("input",{{"action","kbd_release"},{"key",*it}});}}
@@ -191,7 +213,12 @@ class LiveFrontend {
         const auto page=stack.back().page;
         if(page==Page::Resolution && a!=99){resolution=a-400;applyQuality(s);back();return;}
         if(page==Page::Codec && a!=99){codec=a-500;applyQuality(s);back();return;}
-        if((page==Page::QualityPreset || page==Page::Bitrate) && a>=510 && a<=513){quality=a-510;legacyQuality=false;requestedCap=qualityMbps[quality];applyQuality(s);back();return;}
+        if(page==Page::QualityPreset && a>=510 && a<=513){quality=a-510;customQuality=false;legacyQuality=false;requestedCap=0;applyQuality(s);back();return;}
+        if(page==Page::Bitrate && a>=820 && a<=825){
+            static constexpr int choices[]={8,15,20,30,40,50};
+            customMbps=choices[a-820];customQuality=true;legacyQuality=false;requestedCap=customMbps;
+            applyQuality(s);back();return;
+        }
         if(page==Page::Playout && a!=99){bufferMs=a-550;applyQuality(s);back();return;}
         if(page==Page::Touch && (a==610 || a==611)){touchMode=1;nativeMultitouch=false;client.command("release");resetTouchZoom=true;draining=true;save();return;}
         if(page==Page::Mouse && a!=99){mouseSpeed=a-620;save();back();return;}
@@ -209,7 +236,7 @@ class LiveFrontend {
         case 23:push(Page::Peripherals);break;case 24:case 70:push(Page::More);break;case 25:push(Page::Windows);break;
         case 30:loadSettings(s);push(Page::Quality);break;case 31:loadSettings(s);push(Page::Picture);break;
         case 40:fps=60;applyQuality(s);break;case 41:fps=30;applyQuality(s);break;
-        case 43:push(Page::QualityPreset);break;case 44:push(Page::Resolution);break;case 45:push(Page::Codec);break;
+        case 43:push(Page::QualityPreset);break;case 514:push(Page::Bitrate);break;case 44:push(Page::Resolution);break;case 45:push(Page::Codec);break;
         case 46:vsync=!vsync;applyQuality(s);break;case 47:push(Page::Playout);break;case 48:push(Page::Audio);break;
         case 50:draft=scheme;push(Page::Schemes);stack.back().focus=draft-1;break;
         case 51:push(Page::Guide);break;case 52:case 58:push(Page::Logout);break;case 53:push(Page::InputMode);break;
@@ -455,16 +482,20 @@ public:
         case Page::Display:title="显示";row(0,"画质与帧率",30,true,false,std::to_string(fps)+" FPS");row(1,"画面设置",31,true,false,std::to_string(resolution)+"p");break;
         case Page::Quality:title="画质与帧率";
             row(0,"60 帧",40,true,fps==60);row(1,"30 帧",41,true,fps==30);
-            row(2,"画质档位",43,true,false,legacyQuality?"选择画质":std::string(qualityNames[quality])+" · "+std::to_string(qualityMbps[quality])+" Mbps");
+            row(2,"画质档位",43,true,false,qualitySummary());
             row(3,"播放缓冲",47,true,false,std::to_string(bufferMs)+" ms");break;
         case Page::Picture:title="画面设置";row(0,"分辨率",44,true,false,std::to_string(resolution)+"p");row(1,"视频编码",45,true,false,codec?"H.265":"H.264");row(2,"垂直同步",46,true,false,vsync?"开启":"关闭");break;
         case Page::Resolution:title="分辨率";row(0,"960 × 540",400+540,true,resolution==540);row(1,"1280 × 720",400+720,true,resolution==720);row(2,"1920 × 1080",400+1080,true,resolution==1080);break;
         case Page::Codec:title="视频编码";row(0,"H.264",500,true,codec==0);row(1,"H.265",501,true,codec==1);break;
-        case Page::Bitrate:
         case Page::QualityPreset:title="画质";{
-            for(int i=0;i<4;++i)row(i,qualityNames[i],510+i,true,!legacyQuality && quality==i,std::to_string(qualityMbps[i])+" Mbps");
-            aligned(r,f.small,"高清及以上建议 CPU 超频",{848,514,376,36},label);
-            aligned(r,f.small,"提升流畅度",{848,551,376,30},label);
+            for(int i=0;i<4;++i)row(i,uu::qualityPresets[i].name,510+i,true,!customQuality && !legacyQuality && quality==i,"主机预设");
+            row(4,"自定义",514,true,false,customQuality?qualitySummary():"");
+            aligned(r,f.small,"高清及以上建议 CPU 超频",{848,560,376,28},label);
+            aligned(r,f.small,"提升流畅度",{848,588,376,28},label);
+            }break;
+        case Page::Bitrate:title="自定义上限";{
+            static constexpr int choices[]={8,15,20,30,40,50};
+            for(int i=0;i<6;++i)row(i,"最高 "+std::to_string(choices[i])+" Mbps",820+i,true,customQuality && customMbps==choices[i]);
             }break;
         case Page::Playout:title="播放缓冲";{int values[]={0,8,16,24,35};for(int i=0;i<5;++i)row(i,std::to_string(values[i])+" ms",550+values[i],true,bufferMs==values[i]);}
             aligned(r,f.small,"缓冲越低越跟手；网络不稳时更易卡顿",{848,556,376,60},label);break;
@@ -685,7 +716,7 @@ public:
             }else {
                 const bool arrow=opensPage(b.action);const int left=asset?64:20;
                 const bool radio=page==Page::Quality?(b.action==40 || b.action==41):
-                    page==Page::Bitrate || page==Page::Resolution || page==Page::Codec || page==Page::QualityPreset || page==Page::Playout || page==Page::InputMode || page==Page::XboxLayout || (page==Page::Touch && b.action!=612) || page==Page::Mouse || (page==Page::Audio && b.action!=630);
+                    page==Page::Bitrate || page==Page::Resolution || page==Page::Codec || (page==Page::QualityPreset && b.action!=514) || page==Page::Playout || page==Page::InputMode || page==Page::XboxLayout || (page==Page::Touch && b.action!=612) || page==Page::Mouse || (page==Page::Audio && b.action!=630);
                 int right=(arrow||radio)?48:20,vw=0,vh=0;TTF_SizeUTF8(f.small,b.value.c_str(),&vw,&vh);vw=std::min(vw,140);
                 if(asset)image(r,asset,{b.box.x+20,b.box.y+(b.box.h-26)/2,26,26});
                 if(vw)aligned(r,f.small,b.value,{b.box.x+b.box.w-right-vw,b.box.y,vw,b.box.h},tint);

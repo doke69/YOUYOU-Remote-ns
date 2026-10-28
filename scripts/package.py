@@ -1,6 +1,7 @@
 """Create SD-card-ready packages (Switch and Switch Lite) from a built NRO."""
 import hashlib
 import argparse
+import json
 import pathlib
 import re
 import shutil
@@ -15,12 +16,20 @@ if not args.allow_private_signing_material:
 version = re.search(r'project\(UURemote-ns VERSION ([\d.]+)',
                     (ROOT/'CMakeLists.txt').read_text(encoding='utf-8')).group(1)
 source = ROOT/'build-nx/UURemote-ns.nro'
+manifest_source = ROOT/'build-nx/UURemote-ns.manifest.json'
+if not manifest_source.is_file():
+    raise ValueError('Missing UURemote-ns.manifest.json; build with F10 resource mode first')
+manifest = json.loads(manifest_source.read_text(encoding='utf-8'))
 data = source.read_bytes()
 if data[16:20] != b'NRO0':
     raise ValueError('Not a valid NRO executable')
+if hashlib.sha256(data).hexdigest() != manifest.get('nro',{}).get('sha256'):
+    raise ValueError('NRO does not match its build manifest')
 destination = ROOT/'dist/switch/UURemote-ns/UURemote-ns.nro'
 destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(source, destination)
+manifest_destination = ROOT/'dist/UURemote-ns.manifest.json'
+shutil.copy2(manifest_source, manifest_destination)
 shutil.copy2(ROOT/'README.md', ROOT/'dist/README.md')
 shutil.copy2(ROOT/'THIRD_PARTY.md', ROOT/'dist/THIRD_PARTY.md')
 shutil.copy2(ROOT/'LICENSE', ROOT/'dist/LICENSE')
@@ -76,14 +85,16 @@ Switch Lite（HDH-001）
     LITE_NOTES.format(version=version), encoding='utf-8')
 
 digest = hashlib.sha256(data).hexdigest()
-(ROOT/'dist/SHA256SUMS').write_text(f'{digest}  switch/UURemote-ns/UURemote-ns.nro\n')
+(ROOT/'dist/SHA256SUMS').write_text(
+    f'{digest}  switch/UURemote-ns/UURemote-ns.nro\n'
+    f'{hashlib.sha256(manifest_source.read_bytes()).hexdigest()}  UURemote-ns.manifest.json\n')
 archives = []
 for target, name, note in (
         ('switch', f'UURemote-ns-{version}-switch.zip', '安装说明-Switch.txt'),
         ('switch-lite', f'UURemote-ns-{version}-switch-lite.zip', '安装说明-SwitchLite.txt')):
     archive = ROOT/'dist'/name
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        paths = [destination, ROOT/'dist/README.md', ROOT/'dist/THIRD_PARTY.md',
+        paths = [destination, manifest_destination, ROOT/'dist/README.md', ROOT/'dist/THIRD_PARTY.md',
                  ROOT/'dist/LICENSE', ROOT/'dist/SHA256SUMS']
         paths += list((ROOT/'dist/docs').rglob('*')) + list(notice_dir.glob('*'))
         paths.append(ROOT/'dist'/note)

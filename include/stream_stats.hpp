@@ -1,4 +1,5 @@
 #pragma once
+#include "rtp_jitter.hpp"
 #include <cstdint>
 #include <mutex>
 #include <set>
@@ -91,7 +92,6 @@ class RtpTrackStats : public rtc::MediaHandler {
   private:
     void packet(const uint8_t *data, size_t size);
     void info(const uint8_t *data, size_t size);
-    void sendNack(const std::vector<uint16_t> &sequences, const rtc::message_callback &send);
     void flushDiagnostics();
 
     mutable std::mutex mutex_;
@@ -101,9 +101,7 @@ class RtpTrackStats : public rtc::MediaHandler {
     bool started_ = false;
     uint32_t expected_ = 0; // extended sequence number of the next packet
     uint64_t received_ = 0, lost_ = 0;
-    double jitter_ = 0;
-    bool haveTransit_ = false;
-    int64_t lastTransit_ = 0;
+    RtpJitterTracker jitterTracker_;
     int64_t windowStart_ = 0;
     uint64_t windowReceived_ = 0, windowLost_ = 0, windowBytes_ = 0;
     double windowLoss_ = -1, windowJitter_ = -1, windowBitrate_ = -1;

@@ -9,6 +9,8 @@
 #include "live_telemetry.hpp"
 #include "native_display.hpp"
 #include "qrcodegen.hpp"
+#include "present_identity.hpp"
+#include "quality_presets.hpp"
 #include "rtc_diagnostics.hpp"
 #include "runtime_profile.hpp"
 #include <SDL_ttf.h>
@@ -227,7 +229,7 @@ void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamSt
         {number(s.presentFps)+" fps",normal},
         {formatMbps(s.video.bitrateMbps),normal},
         {s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("-- ms"),normal},
-        {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm.",normal},
+        {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm",normal},
         {formatPercent(s.video.lossPercent)+" loss",
             s.video.lossPercent>=10?bad:s.video.lossPercent>=5?warning:normal},
         {s.maxBitrateMbps>0?std::to_string(s.maxBitrateMbps)+" Mbps":std::string("-- Mbps"),normal},
@@ -366,103 +368,6 @@ std::string read(const std::string &path) {
 #include "phone_mouse.inc"
 #include "native_touch.inc"
 
-std::optional<uu::Json> qualityMenu(SDL_Renderer *renderer, Fonts &fonts, const uu::Snapshot &state) {
-    const char *resolutionNames[] = {"960 × 540", "1280 × 720", "1920 × 1080"};
-    const int widths[] = {960,1280,1920}, heights[] = {540,720,1080};
-    const char *qualityNames[] = {"流畅", "普通", "高清", "蓝光", "自动"};
-    int resolution = state.width == 960 ? 0 : state.width == 1920 ? 2 : 1;
-    int fps = state.fps == 30 ? 0 : 1, quality = std::clamp(state.quality-1,0,4), selected=0;
-    bool vsync=state.vsync;
-    int playoutDelay=state.playoutDelayMs;
-    int maxBitrate=state.maxBitrateMbps;
-    bool hevc=state.hevc;
-    const int delayOptions[]={0,16,35,50,100};
-    std::string displayError;
-#ifdef __SWITCH__
-    PadState menuPad;
-    padInitializeDefault(&menuPad);
-#endif
-    bool touched = false;
-    while (true) {
-        bool up=false,down=false,left=false,right=false,apply=false,back=false,reset=false;
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) return std::nullopt;
-            if (event.type == SDL_KEYDOWN) {
-                const auto key = event.key.keysym.sym;
-                up |= key == SDLK_UP; down |= key == SDLK_DOWN;
-                left |= key == SDLK_LEFT; right |= key == SDLK_RIGHT;
-                apply |= key == SDLK_RETURN; back |= key == SDLK_ESCAPE; reset |= key == SDLK_x;
-            }
-            if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-                const int y=event.button.y;
-                if (y>=200 && y<515) {selected=(y-200)/45;right=true;}
-                if (y>=590 && y<655) apply=true;
-            }
-        }
-#ifdef __SWITCH__
-        if (!appletMainLoop()) return std::nullopt;
-        padUpdate(&menuPad);
-        const auto pressed = padGetButtonsDown(&menuPad);
-        up |= pressed & HidNpadButton_Up; down |= pressed & HidNpadButton_Down;
-        left |= pressed & HidNpadButton_Left; right |= pressed & HidNpadButton_Right;
-        apply |= pressed & HidNpadButton_A; back |= pressed & HidNpadButton_B;
-        reset |= pressed & HidNpadButton_X;
-        HidTouchScreenState touch{};
-        hidGetTouchScreenStates(&touch,1);
-        if (touch.count && !touched) {
-            const int y=touch.touches[0].y;
-            if (y>=200 && y<515) {selected=(y-200)/45;right=true;}
-            if (y>=590 && y<655) apply=true;
-        }
-        touched=touch.count!=0;
-#endif
-        if (back) return std::nullopt;
-        if (up) selected=(selected+6)%7;
-        if (down) selected=(selected+1)%7;
-        const int delta=right ? 1 : left ? -1 : 0;
-        if (delta) {
-            if(selected==0) resolution=(resolution+delta+3)%3;
-            if(selected==1) fps=1-fps;
-            if(selected==2) quality=(quality+delta+5)%5;
-            if(selected==3) vsync=!vsync;
-            if(selected==6) hevc=!hevc;
-            if(selected==5) maxBitrate=std::clamp(maxBitrate+delta,0,50);
-            if(selected==4) {
-                int index=0;
-                while(index<4 && delayOptions[index]<playoutDelay) ++index;
-                playoutDelay=delayOptions[(index+delta+5)%5];
-            }
-        }
-        if (reset) {resolution=1;fps=1;quality=2;vsync=true;playoutDelay=0;maxBitrate=0;hevc=false;}
-        if (apply) {
-            if (vsync!=state.vsync && uu::display::vsync(renderer,vsync?1:0)!=0) {
-                displayError="当前显示后端不支持切换垂直同步，请保留原设置。";
-            } else {
-                return uu::Json{{"width",widths[resolution]},{"height",heights[resolution]},
-                                {"fps",fps?60:30},{"quality",quality+1},{"vsync",vsync},
-                                {"playout_delay_ms",playoutDelay},{"max_bitrate_mbps",maxBitrate},{"hevc",hevc}};
-            }
-        }
-        color(renderer,{13,19,25,255});uu::display::clear(renderer);
-        text(renderer,fonts.large,"画质与显示",80,65);
-        text(renderer,fonts.small,"↑ ↓ 选择   ← → 调整   A 保存   B 返回   X 恢复 720p60 高清",80,150,muted);
-        const char *labels[]={"分辨率","目标帧率","画质","垂直同步","播放缓冲","码率上限","视频编码"};
-        const std::string values[]={resolutionNames[resolution],fps?"60 FPS":"30 FPS",qualityNames[quality],vsync?"开启":"关闭",
-            playoutDelay==0?"低延迟（0 ms）":std::to_string(playoutDelay)+" ms",maxBitrate?std::to_string(maxBitrate)+" Mbps":"自动",hevc?"H.265（实验）":"H.264"};
-        for(int row=0;row<7;++row) {
-            rect(renderer,80,200+row*45,1120,40,row==selected?SDL_Color{32,60,57,255}:SDL_Color{28,40,49,255});
-            text(renderer,fonts.normal,labels[row],104,205+row*45,muted);
-            text(renderer,fonts.normal,"〈  "+values[row]+"  〉",650,205+row*45,white);
-        }
-        text(renderer,fonts.small,"码率上限范围 1–50 Mbps；自动由电脑调配，实际码率随画面和网络变化。",80,520,muted);
-        text(renderer,fonts.small,displayError.empty()?"画质优先在线更新；编码切换、关闭上限或不兼容时会重连。":displayError,80,553,
-             displayError.empty()?muted:SDL_Color{255,157,141,255});
-        rect(renderer,80,590,1120,65,accent);
-        text(renderer,fonts.normal,"A  保存设置",110,608,{13,19,25,255});
-        uu::display::present(renderer);SDL_Delay(16);
-    }
-}
 struct Controls {
     bool confirm = false, back = false, refresh = false, logout = false, up = false, down = false,
          help = false, disconnect = false, exit = false, stats = false, quality = false, keyboard=false,left=false,right=false;
@@ -718,6 +623,8 @@ int main(int, char **) {
                 unsigned lastVideoFormat = 0;
                 bool lastVideoHardware = false;
                 uint64_t serial = 0, lastHeld = 0;
+                uu::PresentIdentity presentIdentity;
+                uint64_t uploadedVideoSerial=0;
                 // One transient NV12 import failure must not permanently switch
                 // the session to the CPU conversion path. Retry a few frames,
                 // then latch the existing fallback for this session.
@@ -750,7 +657,10 @@ int main(int, char **) {
                 uu::RefreshPacer refreshPacer;
                 double cpuUs=0,uploadUs=0,presentUs=0,maxCpuUs=0;
                 double syncMaxUs=0,pollMaxUs=0,pictureMaxUs=0,acceptMaxUs=0,presentMaxUs=0,cpuLedgerMaxUs=0,drawMaxUs=0;
+                double slotWaitMaxUs=0,acquireMaxUs=0,submitMaxUs=0,presentImageMaxUs=0;
                 uint64_t renderLoops=0,uploadCount=0,slowLoops=0;
+                uint64_t presentSkippedFrames=0,gpuSubmitCalls=0,sdlPresentCalls=0;
+                uint64_t gpuSubmittedFrames=0,sdlPresentedFrames=0;
                 uint64_t lastNewPresentAt=0,presentGapCount=0,presentGapGt17=0,presentGapGt25=0,presentGapGt33=0,presentGapGt50=0;
                 double presentGapSumMs=0,presentGapMaxMs=0;
                 uint64_t lastDecoded=0,lastPublished=0,lastSelected=0,lastEmpty=0,lastNoReady=0,lastFuture=0;
@@ -786,11 +696,14 @@ int main(int, char **) {
                         media->setNativeOutput(uu::display::active());
                         nativeImportFailures=0;nativeFallback=false;nativeOversizeNotice=false;
                         lastVideoFormat=0;lastVideoHardware=false;
-                        serial=0;texW=texH=0;
+                        serial=0;texW=texH=0;presentIdentity.reset();uploadedVideoSerial=0;
                         previousSwap=0;refreshPeriodMs=0;leadSumMs=0;
                         irregularSwaps=0;stableSwaps=0;leadSamples=0;refreshPacer.reset();
                         lastNewPresentAt=0;presentGapCount=0;presentGapGt17=0;presentGapGt25=0;
                         presentGapGt33=0;presentGapGt50=0;presentGapSumMs=0;presentGapMaxMs=0;
+                        presentSkippedFrames=gpuSubmitCalls=sdlPresentCalls=0;
+                        gpuSubmittedFrames=sdlPresentedFrames=0;
+                        slotWaitMaxUs=acquireMaxUs=submitMaxUs=presentImageMaxUs=0;
                         uu::display::resetVideo();
                         if(video) {uu::display::destroyTexture(video);video=nullptr;}
                         lastDecoded=lastPublished=lastSelected=lastEmpty=lastNoReady=lastFuture=0;
@@ -1032,6 +945,7 @@ int main(int, char **) {
                                 video = nullptr;
                             }
                             serial = 0;
+                            uploadedVideoSerial = 0;
                             texW = texH = 0;
                             nativeImportFailures = 0;
                             nativeFallback = false;
@@ -1111,6 +1025,9 @@ int main(int, char **) {
                     color(renderer, {13, 19, 25, 255});
                     uu::display::clear(renderer);
                     bool submittedNewFrame=false;
+                    bool sdlVideoDrawn=false;
+                    bool gpuSubmittedNewFrame=false;
+                    bool sdlPresentedNewFrame=false;
                     double frameUploadUs=0;
                     if (state.streaming) {
                         // Frame eligibility is independent of speculative
@@ -1133,7 +1050,7 @@ int main(int, char **) {
                             bool consume=true;
                             if(accepted) {
                                 nativeImportFailures=0;nativeOversizeNotice=false;
-                                submittedNewFrame=true;++uploadCount;
+                                ++uploadCount;
                             } else if(p.hardwareFrame) {
                                 const bool oversized=p.width>1920 || p.height>1080;
                                 if(nativeFallback) {
@@ -1176,6 +1093,11 @@ int main(int, char **) {
                             if (!video || p.width != texW || p.height != texH || p.pixelFormat!=texFormat) {
                                 if (video)
                                     uu::display::destroyTexture(video);
+                                // The old texture and its uploaded identity are being
+                                // replaced. If the new texture's first upload fails,
+                                // RenderCopy may still succeed on uninitialized data;
+                                // identity 0 prevents that from counting as an old frame.
+                                uploadedVideoSerial = 0;
                                 video = SDL_CreateTexture(renderer, p.pixelFormat,
                                                           SDL_TEXTUREACCESS_STREAMING, p.width, p.height);
                                 texFormat=p.pixelFormat;
@@ -1196,23 +1118,24 @@ int main(int, char **) {
                                 } else uploadResult=SDL_UpdateTexture(video,nullptr,p.pixels->data(),p.width*4);
                             }
                             if(uploadResult==0) {
-                                submittedNewFrame=true;++uploadCount;
+                                ++uploadCount;
+                                uploadedVideoSerial=p.serial;
+                                serial=p.serial;
+                                float scale = std::min(1280.f / p.width, 720.f / p.height);
+                                viewport = {int((1280 - p.width * scale) / 2), int((720 - p.height * scale) / 2),
+                                            int(p.width * scale), int(p.height * scale)};
                             } else if(p.pixelFormat==SDL_PIXELFORMAT_NV12) {
                                 media->setYuvOutput(false);
                                 uu::diagnostic("display-nv12-update-failed-rgba-fallback");
                             }
                             frameUploadUs=(SDL_GetPerformanceCounter()-uploadStarted)*counterToUs;
                             uploadUs+=frameUploadUs;
-                            serial = p.serial;
-                            float scale = std::min(1280.f / p.width, 720.f / p.height);
-                            viewport = {int((1280 - p.width * scale) / 2), int((720 - p.height * scale) / 2),
-                                        int(p.width * scale), int(p.height * scale)};
                         }
                         const auto drawStarted=SDL_GetPerformanceCounter();
                         const auto touchView=streamTouch.view(viewport);
                         if(uu::display::active()) uu::display::drawVideo(touchView);
                         else if (video)
-                            uu::display::copy(renderer, video, nullptr, &touchView);
+                            sdlVideoDrawn = uu::display::copy(renderer, video, nullptr, &touchView)==0;
                         else
                             text(renderer, fonts.normal, "等待电脑发送画面...", 470, 330, muted);
 
@@ -1235,6 +1158,9 @@ int main(int, char **) {
                         if(!state.qualityNotice.empty()) {
                             rect(renderer,300,72,900,38,{13,19,25,230});
                             text(renderer,fonts.small,state.qualityNotice,314,80,accent,870);
+                        } else if(!state.videoScaleNotice.empty()) {
+                            rect(renderer,300,72,900,38,{13,19,25,230});
+                            text(renderer,fonts.small,state.videoScaleNotice,314,80,accent,870);
                         }
                         if (liveUi.active() || persistentNetwork) {
                             const auto now=SDL_GetTicks();
@@ -1362,7 +1288,26 @@ int main(int, char **) {
                     }
                     }
                     const auto presentStarted=SDL_GetPerformanceCounter();
-                    uu::display::present(renderer);
+                    const auto presentResult=uu::display::present(renderer);
+                    if(state.streaming) {
+                        slotWaitMaxUs=std::max(slotWaitMaxUs,double(presentResult.slotWaitUs));
+                        acquireMaxUs=std::max(acquireMaxUs,double(presentResult.acquireUs));
+                        submitMaxUs=std::max(submitMaxUs,double(presentResult.submitUs));
+                        presentImageMaxUs=std::max(presentImageMaxUs,double(presentResult.presentUs));
+                        if(presentResult.status==uu::display::PresentStatus::Submitted) {
+                            ++gpuSubmitCalls;
+                            if(presentIdentity.gpuSubmitted(presentResult.videoSerial)) {
+                                gpuSubmittedNewFrame=true;submittedNewFrame=true;
+                            }
+                        } else if(presentResult.status==uu::display::PresentStatus::Skipped) {
+                            ++presentSkippedFrames;
+                        } else if(presentResult.status==uu::display::PresentStatus::SdlPresented) {
+                            ++sdlPresentCalls;
+                            if(presentIdentity.sdlPresented(sdlVideoDrawn,uploadedVideoSerial)) {
+                                sdlPresentedNewFrame=true;submittedNewFrame=true;
+                            }
+                        }
+                    }
                     const auto presentFinished=SDL_GetPerformanceCounter();
                     // One absolute 60 Hz application clock. Hardware vsync
                     // can consume the budget itself; only sleep the remainder.
@@ -1370,7 +1315,12 @@ int main(int, char **) {
                     // and never masquerade software pacing as hardware vsync.
                     static const bool softwarePacingEnabled=
                         uu::ConfigStore::instance().integer("software_pacing",1,0,1)!=0;
-                    const bool softwarePacing=softwarePacingEnabled && state.streaming && !state.vsync;
+                    // Streaming keeps its existing software_pacing policy. The
+                    // non-streaming menu gets an independent 60 Hz cap when
+                    // hardware vsync is off, so an idle home screen cannot spin.
+                    const bool streamingSoftwarePacing=softwarePacingEnabled && state.streaming && !state.vsync;
+                    const bool menuPacing=!state.streaming && !state.vsync;
+                    const bool softwarePacing=streamingSoftwarePacing || menuPacing;
                     if(state.vsync || softwarePacing) {
                         const double remainingUs=refreshPacer.remaining(loopStarted*counterToUs,
                             presentFinished*counterToUs);
@@ -1416,27 +1366,29 @@ int main(int, char **) {
                         const auto effective=media->stats();
                         char effectiveLine[512];
                         std::snprintf(effectiveLine,sizeof effectiveLine,
-                            "effective-state target-fps=%d applied-fps-%d actual-fps-%.1f target-quality-%d applied-quality-%d target-media-%dx%d actual-media-%dx%d decode-ms-%.2f hw-%d fallback-%d applied-valid-%d setting-accepted-%d setting-applied-%d setting-rejected-%d setting-error-%d setting-source-%s",
+                            "effective-state target-fps=%d applied-fps-%d actual-fps-%.1f target-quality-%d applied-quality-%d target-media-%dx%d actual-media-%dx%d decode-ms-%.2f hw-%d fallback-%d applied-valid-%d applied-fps-known-%d applied-quality-known-%d applied-size-known-%d setting-apply-pending-%d setting-accepted-%d setting-applied-%d setting-rejected-%d setting-error-%d setting-source-%s",
                             state.fps,state.appliedFps,effective.fps,state.quality,state.appliedQuality,
                             state.width,state.height,effective.width,effective.height,
                             effective.decodeMs,effective.hardwareFrame?1:0,nativeFallback?1:0,
-                            state.appliedValid?1:0,state.settingAccepted?1:0,state.settingApplied?1:0,
+                            state.appliedValid?1:0,state.appliedFpsKnown?1:0,state.appliedQualityKnown?1:0,
+                            (state.appliedWidthKnown&&state.appliedHeightKnown)?1:0,
+                            state.settingApplyPending?1:0,state.settingAccepted?1:0,state.settingApplied?1:0,
                             state.settingRejected?1:0,state.settingErrorCode,
                             state.settingSource.empty()?"none":state.settingSource.c_str());
                         uu::diagnostic(effectiveLine);
                         std::snprintf(effectiveLine,sizeof effectiveLine,
-                            "encoder-bitrate-status target-bps=%llu host-known=%d host-mbps=%d actual-mbps=%.3f ack=%d applied=%d source=%s",
+                            "encoder-bitrate-status target-bps=%llu host-known=%d host-mbps=%d actual-mbps=%.3f ack=%d apply-pending=%d applied=%d source=%s",
                             (unsigned long long)(state.quality==6?uint64_t(state.maxBitrateMbps)*1000000u:0),
                             state.appliedBitrateKnown?1:0,state.appliedBitrateMbps,
-                            rate.video.bitrateMbps,state.settingAccepted?1:0,state.settingApplied?1:0,
-                            state.settingSource.empty()?"none":state.settingSource.c_str());
+                            rate.video.bitrateMbps,state.settingAccepted?1:0,state.settingApplyPending?1:0,
+                            state.settingApplied?1:0,state.settingSource.empty()?"none":state.settingSource.c_str());
                         uu::diagnostic(effectiveLine);
                         lastRateLogSample=presentedAt;
                     }
                     const double telemetryWorkUs=(presentStarted-loopStarted)*counterToUs;
                     const double telemetryPresentUs=(presentFinished-presentStarted)*counterToUs;
                     const double telemetryLoopUs=(presentFinished-loopStarted)*counterToUs;
-                    if(telemetry.observe(presentedAt,state.streaming,submittedNewFrame,frameUploadUs,
+                    if(telemetry.observe(presentedAt,state.streaming,gpuSubmittedNewFrame,frameUploadUs,
                                          telemetryWorkUs,telemetryPresentUs,telemetryLoopUs,
                                          liveUi.active(),statsVisible||persistentNetwork))
                         telemetry.publish(client.streamStats(),actualVsync,texFormat==SDL_PIXELFORMAT_NV12,
@@ -1459,6 +1411,8 @@ int main(int, char **) {
                         presentMaxUs=std::max(presentMaxUs,(presentFinished-presentStarted)*counterToUs);
                         maxCpuUs=std::max(maxCpuUs,workUs);++renderLoops;
                         if((presentFinished-loopStarted)*counterToUs>25000) ++slowLoops;
+                        if(gpuSubmittedNewFrame) ++gpuSubmittedFrames;
+                        if(sdlPresentedNewFrame) ++sdlPresentedFrames;
                         if (submittedNewFrame) ++presentedFrames;
                         if(submittedNewFrame) {
                             if(lastNewPresentAt) {
@@ -1475,7 +1429,7 @@ int main(int, char **) {
                         const auto elapsed=Uint32(presentedAt-presentWindow);
                         if(elapsed>=2000) {
                             presentFps=double(presentedFrames)*1000/elapsed;
-                            char timing[384];
+                            char timing[640];
                             std::snprintf(timing,sizeof timing,
                                 "render-window-loops-%llu-uploads-%llu-panel-%d-cpu-avg-us-%.0f-cpu-max-us-%.0f-upload-avg-us-%.0f-present-avg-us-%.0f-over25ms-%llu",
                                 static_cast<unsigned long long>(renderLoops),static_cast<unsigned long long>(uploadCount),int(statsVisible),
@@ -1483,8 +1437,9 @@ int main(int, char **) {
                                 renderLoops?presentUs/renderLoops:0,static_cast<unsigned long long>(slowLoops));
                             uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,
-                                "render-stage-max-us-sync-%.0f-poll-%.0f-picture-%.0f-accept-%.0f-draw-%.0f-present-%.0f-cpu-ledger-%.0f",
-                                syncMaxUs,pollMaxUs,pictureMaxUs,acceptMaxUs,drawMaxUs,presentMaxUs,cpuLedgerMaxUs);
+                                "render-stage-max-us-sync-%.0f-poll-%.0f-picture-%.0f-import-upload-%.0f-draw-%.0f-present-%.0f-cpu-ledger-%.0f-native-slot-%.0f-acquire-%.0f-submit-%.0f-present-image-%.0f",
+                                syncMaxUs,pollMaxUs,pictureMaxUs,acceptMaxUs,drawMaxUs,presentMaxUs,cpuLedgerMaxUs,
+                                slotWaitMaxUs,acquireMaxUs,submitMaxUs,presentImageMaxUs);
                             uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,"pacing-window-refresh-us-%.0f-lead-avg-us-%.0f-stable-%u",
                                 refreshPeriodMs*1000,leadSamples?leadSumMs*1000/leadSamples:0,stableSwaps);
@@ -1553,12 +1508,20 @@ int main(int, char **) {
                                 breakdownSamples?double(queueWait)/breakdownSamples:0.0);
                             uu::diagnostic(timing);
                             std::snprintf(timing,sizeof timing,
-                                "present-content-new=%llu-no-new=%llu-window-ms=%u-scanout-known=0",
+                                "present-content-new=%llu-no-new=%llu-gpu-submitted=%llu-sdl-presented=%llu-gpu-submit-calls=%llu-sdl-present-calls=%llu-present-skipped=%llu-window-ms=%u-scanout-known=0",
                                 (unsigned long long)presentedFrames,
-                                (unsigned long long)(renderLoops-presentedFrames),unsigned(elapsed));
+                                (unsigned long long)(renderLoops-presentedFrames),
+                                (unsigned long long)gpuSubmittedFrames,
+                                (unsigned long long)sdlPresentedFrames,
+                                (unsigned long long)gpuSubmitCalls,
+                                (unsigned long long)sdlPresentCalls,
+                                (unsigned long long)presentSkippedFrames,unsigned(elapsed));
                             uu::diagnostic(timing);
                             leadSumMs=0;leadSamples=0;
                             cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;
+                            presentSkippedFrames=gpuSubmitCalls=sdlPresentCalls=0;
+                            gpuSubmittedFrames=sdlPresentedFrames=0;
+                            slotWaitMaxUs=acquireMaxUs=submitMaxUs=presentImageMaxUs=0;
                             presentedFrames=0;presentWindow=presentedAt;
                             lastNewPresentAt=0;presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;
                             presentGapSumMs=presentGapMaxMs=0;
@@ -1566,6 +1529,9 @@ int main(int, char **) {
                         }
                     } else {
                         presentWindow=presentedAt;presentedFrames=0;presentFps=-1;
+                        presentSkippedFrames=gpuSubmitCalls=sdlPresentCalls=0;
+                        gpuSubmittedFrames=sdlPresentedFrames=0;
+                        slotWaitMaxUs=acquireMaxUs=submitMaxUs=presentImageMaxUs=0;
                         leadSumMs=0;leadSamples=0;
                         cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;
                         lastNewPresentAt=0;presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;

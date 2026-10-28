@@ -123,6 +123,34 @@ int main() {
     assert(pacer.remaining(following,following+2000)>14000);
     pacer.reset();
     assert(pacer.remaining(0,2000)>14000);
+
+    // Non-streaming menu software cap: 2ms UI work leaves only the remaining
+    // budget; 120 ticks stay on the 60Hz grid.
+    pacer.reset();now=0;
+    for(int i=0;i<120;++i) {
+        const double finish=now+2000;
+        const double wait=pacer.remaining(now,finish);
+        assert(wait>14600 && wait<14700);
+        now=finish+wait;pacer.advance(now);
+    }
+    assert(std::abs(now-2000000.0)<0.01);
+    // A hardware-blocked present consumes the budget; the next menu tick only
+    // waits the remainder rather than a second fixed sleep.
+    pacer.reset();now=0;
+    const double hardwareFinish=1000000.0/60.0;
+    assert(pacer.remaining(now,hardwareFinish)<0.01);
+    now=hardwareFinish;pacer.advance(now);
+    const double menuFinish=now+2000;
+    const double menuWait=pacer.remaining(now,menuFinish);
+    assert(menuWait>14600 && menuWait<14700);
+    pacer.advance(menuFinish+menuWait);
+    // A long elapsed segment is not repaid as a burst.
+    pacer.reset();now=0;
+    const double slowWait=pacer.remaining(now,10000);
+    assert(slowWait>6600 && slowWait<6700);
+    pacer.advance(10000+slowWait);
+    assert(pacer.remaining(10000+slowWait,12000+slowWait)>14600);
+
     std::cout<<"PASS: FIFO burst replay "<<fifo.size()<<"/120 vs newest "<<newest.size()
-             <<"/120; eligibility, stall recovery, 600-tick software/hardware pacing, reset\n";
+             <<"/120; eligibility, stall recovery, 600-tick software/hardware pacing, menu/switch budget, reset\n";
 }

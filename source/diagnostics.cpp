@@ -1,4 +1,5 @@
 #include "diagnostics.hpp"
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -16,6 +17,9 @@ extern "C" char __start__[];
 #endif
 
 namespace uu {
+#ifndef UU_VERSION
+#define UU_VERSION "unknown"
+#endif
 const char *diagnosticPath() noexcept {
 #ifdef __SWITCH__
     return "sdmc:/switch/UURemote-ns/connection.log";
@@ -25,30 +29,66 @@ const char *diagnosticPath() noexcept {
 }
 namespace {
 class AsyncLog {
+    struct Entry {
+        uint64_t sequence = 0;
+        std::string line;
+    };
     std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<std::string> queue_;
+    std::condition_variable cv_, flushCv_;
+    std::deque<Entry> queue_;
     bool stopping_ = false;
-    bool writerFailed_ = false;
+    bool degraded_ = false;
+    bool failed_ = false;
+    bool dropped_ = false;
+    uint64_t accepted_ = 0, completed_ = 0;
+    std::mutex degradedWriteMutex_;
     std::thread worker_;
     static constexpr size_t kMaxQueued = 512;
+    static constexpr size_t kRotateBytes = 128 * 1024;
 
-    void writeBatch(std::deque<std::string> &batch) noexcept {
-        auto *file = std::fopen(diagnosticPath(), "a");
-        if (!file) return;
-        std::fseek(file, 0, SEEK_END);
-        if (std::ftell(file) > 128 * 1024) {
-            std::fclose(file);
-            file = std::fopen(diagnosticPath(), "w");
-            if (!file) return;
+    bool writeBatch(const std::deque<Entry> &batch) noexcept {
+        try {
+            const std::string path = diagnosticPath();
+            size_t size = 0;
+            if (FILE *probe = std::fopen(path.c_str(), "rb")) {
+                if (std::fseek(probe, 0, SEEK_END) == 0) {
+                    const long position = std::ftell(probe);
+                    if (position > 0) size = size_t(position);
+                }
+                std::fclose(probe);
+            }
+            if (size > kRotateBytes) {
+                // Fixed rotation: current -> .1 -> .2. Each new file starts
+                // with the app-start build label so three rotations still
+                // identify the running build.
+                errno = 0;
+                std::remove((path + ".2").c_str());
+                if (errno != 0 && errno != ENOENT) return false;
+                errno = 0;
+                std::rename((path + ".1").c_str(), (path + ".2").c_str());
+                if (errno != 0 && errno != ENOENT) return false;
+                errno = 0;
+                if (std::rename(path.c_str(), (path + ".1").c_str()) != 0)
+                    return false;
+                size = 0;
+            }
+            FILE *file = std::fopen(path.c_str(), "a");
+            if (!file) return false;
+            bool ok = true;
+            auto writeText = [&](const std::string &text) {
+                if (std::fwrite(text.data(), 1, text.size(), file) != text.size()) ok = false;
+            };
+            if (size == 0) writeText(std::string("# build=") + UU_VERSION + "\n");
+            for (const auto &entry : batch) writeText(entry.line + "\n");
+            if (std::fflush(file) != 0) ok = false;
+            if (std::fclose(file) != 0) ok = false;
+            return ok;
+        } catch (...) {
+            return false;
         }
-        for (const auto &line : batch)
-            std::fprintf(file, "%s\n", line.c_str());
-        std::fflush(file);
-        std::fclose(file);
     }
     void run() noexcept {
-        std::deque<std::string> batch;
+        std::deque<Entry> batch;
         for (;;) {
             {
                 std::unique_lock lock(mutex_);
@@ -56,9 +96,17 @@ class AsyncLog {
                 if (queue_.empty() && stopping_) return;
                 batch.swap(queue_);
             }
-            writeBatch(batch);
+            const bool ok = writeBatch(batch);
+            uint64_t last = 0;
+            for (const auto &entry : batch)
+                if (entry.sequence > last) last = entry.sequence;
             batch.clear();
-            cv_.notify_all();
+            {
+                std::lock_guard lock(mutex_);
+                if (last > completed_) completed_ = last;
+                if (!ok) failed_ = true;
+            }
+            flushCv_.notify_all();
         }
     }
   public:
@@ -66,7 +114,9 @@ class AsyncLog {
         try {
             worker_ = std::thread([this] { run(); });
         } catch (...) {
-            writerFailed_ = true;
+            // Honest degraded mode: no waiter can be left forever. Every push
+            // writes synchronously and flush observes completion/failure.
+            degraded_ = true;
         }
     }
     ~AsyncLog() {
@@ -79,28 +129,69 @@ class AsyncLog {
     }
     void push(std::string line) noexcept {
         try {
-            if (writerFailed_) {
-                std::deque<std::string> one;
-                one.push_back(std::move(line));
-                writeBatch(one);
+            // Set only during construction, before the logger is published.
+            const bool direct = degraded_;
+            if (direct) {
+                // Serialize the sequence assignment with the synchronous write:
+                // seq N+1 cannot complete before seq N.
+                std::lock_guard writeLock(degradedWriteMutex_);
+                std::deque<Entry> one;
+                one.push_back({0, std::move(line)}); // allocation can fail before accepted
+                uint64_t sequence = 0;
+                {
+                    std::lock_guard lock(mutex_);
+                    sequence = ++accepted_;
+                }
+                one.front().sequence = sequence;
+                const bool ok = writeBatch(one);
+                {
+                    std::lock_guard lock(mutex_);
+                    if (sequence > completed_) completed_ = sequence;
+                    if (!ok) failed_ = true;
+                }
+                flushCv_.notify_all();
                 return;
             }
-            std::lock_guard lock(mutex_);
-            if (queue_.size() >= kMaxQueued) queue_.pop_front();
-            queue_.push_back(std::move(line));
-            cv_.notify_one();
+            {
+                std::lock_guard lock(mutex_);
+                // Insert first. If allocation fails, accepted_ has not moved, so
+                // there is no sequence gap for flush to wait on forever.
+                queue_.push_back({0, std::move(line)});
+                const uint64_t sequence = ++accepted_;
+                queue_.back().sequence = sequence;
+                if (queue_.size() > kMaxQueued) {
+                    queue_.pop_front();
+                    dropped_ = true;
+                }
+                cv_.notify_one();
+            }
         } catch (...) {
+            // Do not manufacture a completed watermark: other batches may still
+            // be in flight. The failed flag makes the eventual flush false once
+            // the accepted target is actually settled.
+            std::lock_guard lock(mutex_);
+            failed_ = true;
+            flushCv_.notify_all();
         }
     }
-    void flush() noexcept {
+    bool flush() noexcept {
         try {
-            if (writerFailed_) return;
+            uint64_t target = 0;
+            {
+                std::lock_guard lock(mutex_);
+                target = accepted_;
+            }
             std::unique_lock lock(mutex_);
-            cv_.wait(lock, [&] { return queue_.empty(); });
+            // Failure/drop are sticky result bits, not permission to return while
+            // the target's write attempt is still in flight.
+            flushCv_.wait(lock, [&] { return completed_ >= target; });
+            return !failed_ && !dropped_ && completed_ >= target;
         } catch (...) {
+            return false;
         }
     }
 };
+
 AsyncLog &asyncLog() {
     static AsyncLog instance;
     return instance;
@@ -117,10 +208,11 @@ void diagnostic(const char *event) noexcept {
     } catch (...) {
     }
 }
-void flushDiagnosticsLog() noexcept {
+bool flushDiagnosticsLog() noexcept {
     try {
-        asyncLog().flush();
+        return asyncLog().flush();
     } catch (...) {
+        return false;
     }
 }
 std::string exceptionSummary(std::exception_ptr error) {

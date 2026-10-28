@@ -37,6 +37,7 @@ struct Slot {
     dk::Fence fence{};
     bool pending=false;
     uint32_t used=0,imageCount=0;
+    uint64_t videoSerial=0;
     std::vector<std::shared_ptr<Texture>> textures;
     std::shared_ptr<NativeNv12Surface> video;
 };
@@ -55,11 +56,12 @@ struct Renderer {
     SDL_Surface *fontSurface=nullptr;
     SDL_Color color{255,255,255,255};
     int width=1280,height=720,imageSlot=-1;unsigned current=0;
-    uint64_t hardwareFrames=0;
+    uint64_t submittedHardwareFrames=0;
+    uint64_t acceptedVideoSerial=0;
+    uint64_t slotWaitUs=0,acquireUs=0;
     bool recording=false;
     bool skippingFrame=false;
     uint64_t skippedFrames=0;
-    uint64_t swapchainSaturatedSkips=0;
     uint64_t acquireTimeoutSkips=0; // Track if acquireImage returns invalid slot
     Renderer(int w,int h):width(w),height(h) {
         auto *nativeWindow=nwindowGetDefault();
@@ -141,9 +143,12 @@ struct Renderer {
     bool begin() {
         if(recording) return true;
         if(skippingFrame) return false;
-        // Never block the UI thread on a previously submitted frame. Scan for
-        // a slot whose fence is already complete; if all slots are in flight,
-        // skip this frame and keep the last presented image.
+        // The fence scan selects a command slot. A command slot being free
+        // does NOT prove a swapchain image has been returned by the display
+        // controller; acquireImage below can still wait. Keep that wait and
+        // measure it instead of treating command-slot state as image ownership.
+        slotWaitUs=0;acquireUs=0;
+        const auto slotStarted=std::chrono::steady_clock::now();
         skippingFrame=false;
         bool acquired=false;
         for(uint32_t i=1;i<=slots;++i) {
@@ -155,48 +160,27 @@ struct Renderer {
             acquired=true;
             break;
         }
+        slotWaitUs=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-slotStarted).count());
         if(!acquired) {
             skippingFrame=true;
             ++skippedFrames;
             return false;
         }
-        // Additional safeguard: verify that at least one swapchain image is
-        // available before calling acquireImage. The fence check above only
-        // confirms our command buffer completed; the display controller may
-        // still hold images for presentation. If all swapchain images are in
-        // the display pipeline, skip this frame rather than blocking the UI
-        // thread for up to 50ms (3 slots × 16.67ms).
-        uint32_t availableCount=0;
-        for(uint32_t i=0;i<slots;++i) {
-            if(!frames[i].pending || frames[i].fence.wait(0)==DkResult_Success)
-                ++availableCount;
-        }
-        // Conservative threshold: require at least one fully idle slot.
-        // This prevents acquireImage from blocking when the display pipeline
-        // is saturated, which was causing the 30-55ms draw spikes.
-        if(availableCount==0) {
-            skippingFrame=true;
-            ++skippedFrames;
-            ++swapchainSaturatedSkips;
-            if(swapchainSaturatedSkips==1 || swapchainSaturatedSkips%100==0) {
-                diagnostic(("display-swapchain-saturated-"+std::to_string(swapchainSaturatedSkips)).c_str());
-            }
-            return false;
-        }
         auto &f=slot();
-        f.pending=false;f.textures.clear();f.video.reset();f.used=f.imageCount=0;
+        f.pending=false;f.textures.clear();f.video.reset();f.videoSerial=0;
+        f.used=f.imageCount=0;
 
-        // Acquire swapchain image. Even with fence pre-check, this may still block
-        // if display controller holds all images. Track acquisition failures separately
-        // from saturation detection to identify if pre-check is insufficient.
+        // Acquire the display image. This is the real ownership wait and may
+        // block even when a command-slot fence already completed.
         const auto acquireStarted = std::chrono::steady_clock::now();
         imageSlot=queue.acquireImage(swapchain);
-        const auto acquireDuration = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - acquireStarted).count();
+        acquireUs=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-acquireStarted).count());
 
-        // Diagnostic: warn if acquire took >5ms despite passing pre-check
-        if (acquireDuration > 5000) {
-            diagnostic(("display-acquire-slow-" + std::to_string(acquireDuration) + "us").c_str());
+        // Diagnostic: warn if acquire took >5ms despite passing the slot check.
+        if (acquireUs > 5000) {
+            diagnostic(("display-acquire-slow-" + std::to_string(acquireUs) + "us").c_str());
         }
 
         if(imageSlot<0 || imageSlot>=int(slots)) {
@@ -262,7 +246,13 @@ struct Renderer {
         f.command.draw(DkPrimitive_Triangles,3,1,0,0);f.textures.push_back(texture);
     }
     void drawVideo(const SDL_Rect &dest) {
-        if(!nativeVideo) {if(cpuVideo) textured(cpuVideo,{0,0,cpuVideo->width,cpuVideo->height},dest,{255,255,255,255});return;}
+        if(!nativeVideo) {
+            if(cpuVideo) {
+                textured(cpuVideo,{0,0,cpuVideo->width,cpuVideo->height},dest,{255,255,255,255});
+                if(recording) slot().videoSerial=acceptedVideoSerial;
+            }
+            return;
+        }
 
         const auto drawStarted = std::chrono::steady_clock::now();
         if(!begin()) return;
@@ -270,6 +260,7 @@ struct Renderer {
             std::chrono::steady_clock::now() - drawStarted).count();
 
         auto &f=slot();viewport(dest);
+        f.videoSerial=acceptedVideoSerial;
         DkShader const *programs[]={&shaders[0],&shaders[1]};dkCmdBufBindShaders(f.command,DkStageFlag_GraphicsMask,programs,2);
         uniform(DkStage_Fragment,nativeVideo->colorRows.data(),sizeof(nativeVideo->colorRows));
         DkColorState state;dkColorStateDefaults(&state);f.command.bindColorState(state);
@@ -286,12 +277,45 @@ struct Renderer {
             diagnostic(("draw-video-slow-total-" + std::to_string(totalUs) + "us-begin-" + std::to_string(beginUs) + "us").c_str());
         }
     }
-    void present() {
-        if(skippingFrame) {skippingFrame=false;recording=false;return;}
-        if(!begin()) {skippingFrame=false;recording=false;return;}
-        auto &f=slot();f.command.signalFence(f.fence,true);
-        queue.submitCommands(f.command.finishList());queue.presentImage(swapchain,imageSlot);
+    PresentResult present() {
+        PresentResult result;
+        if(skippingFrame) {
+            skippingFrame=false;recording=false;
+            result.slotWaitUs=slotWaitUs;
+            result.acquireUs=acquireUs;
+            result.status=PresentStatus::Skipped;
+            return result;
+        }
+        if(!begin()) {
+            skippingFrame=false;recording=false;
+            result.slotWaitUs=slotWaitUs;
+            result.acquireUs=acquireUs;
+            result.status=PresentStatus::Skipped;
+            return result;
+        }
+        // begin() either retained this frame's clear/draw timing or performed
+        // the timing itself. Never return a previous frame's acquire cost.
+        result.slotWaitUs=slotWaitUs;
+        result.acquireUs=acquireUs;
+        auto &f=slot();
+        result.videoSerial=f.videoSerial;
+        result.directVideo=bool(f.video);
+        const auto submitStarted=std::chrono::steady_clock::now();
+        f.command.signalFence(f.fence,true);
+        queue.submitCommands(f.command.finishList());
+        result.submitUs=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-submitStarted).count());
+        const auto presentStarted=std::chrono::steady_clock::now();
+        queue.presentImage(swapchain,imageSlot);
+        result.presentUs=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-presentStarted).count());
         f.pending=true;recording=false;
+        if(result.directVideo) ++submittedHardwareFrames;
+        // The deko3d wrappers return void: this means the command was submitted
+        // and the present call returned, not that the GPU completed or scanned
+        // out. No synthetic failure status is reported.
+        result.status=PresentStatus::Submitted;
+        return result;
     }
 };
 std::unique_ptr<Renderer> renderer;
@@ -336,7 +360,11 @@ int fillRect(SDL_Renderer *r,const SDL_Rect *rect) {
     const SDL_Rect all{0,0,1280,720};renderer->textured(renderer->white,{0,0,1,1},rect?*rect:all,renderer->color);return 0;
 }
 int clear(SDL_Renderer *r) {if(!renderer) return SDL_RenderClear(r);return renderer->begin()?0:-1;}
-void present(SDL_Renderer *r) {if(renderer) renderer->present();else SDL_RenderPresent(r);}
+PresentResult present(SDL_Renderer *r) {
+    if(renderer) return renderer->present();
+    SDL_RenderPresent(r);
+    return {PresentStatus::SdlPresented};
+}
 SDL_Texture *textureFromSurface(SDL_Renderer *r,SDL_Surface *surface) {
     auto *texture=SDL_CreateTextureFromSurface(r,surface);
     if(renderer && texture) {
@@ -366,7 +394,8 @@ bool acceptVideo(const Picture &picture) {
     if(picture.hardwareFrame) {
         auto frame=NativeNv12Surface::import(renderer->device,picture.hardwareFrame.get(),renderer->nativeCache);
         if(!frame) return false;
-        renderer->nativeVideo=std::move(frame);renderer->cpuVideo.reset();++renderer->hardwareFrames;return true;
+        renderer->nativeVideo=std::move(frame);renderer->cpuVideo.reset();
+        renderer->acceptedVideoSerial=picture.serial;return true;
     }
     if(!picture.pixels) return false;
     std::vector<uint8_t> rgba(size_t(picture.width)*picture.height*4);
@@ -375,11 +404,12 @@ bool acceptVideo(const Picture &picture) {
         rgba.data(),picture.width*4)!=0) return false;
     auto image=renderer->upload(rgba.data(),picture.width,picture.height,picture.width*4);
     if(!image) return false;
-    renderer->cpuVideo=std::move(image);renderer->nativeVideo.reset();return true;
+    renderer->cpuVideo=std::move(image);renderer->nativeVideo.reset();
+    renderer->acceptedVideoSerial=picture.serial;return true;
 }
 void drawVideo(const SDL_Rect &rect) {if(renderer) renderer->drawVideo(rect);}
-void resetVideo() {if(renderer) {renderer->nativeVideo.reset();renderer->cpuVideo.reset();renderer->nativeCache.clear();}}
-uint64_t directFrames() {return renderer?renderer->hardwareFrames:0;}
+void resetVideo() {if(renderer) {renderer->nativeVideo.reset();renderer->cpuVideo.reset();renderer->nativeCache.clear();renderer->acceptedVideoSerial=0;renderer->slotWaitUs=renderer->acquireUs=0;}}
+uint64_t directFrames() {return renderer?renderer->submittedHardwareFrames:0;}
 uint64_t mapHits() {return renderer?renderer->nativeCache.hits():0;}
 uint64_t mapImports() {return renderer?renderer->nativeCache.imports():0;}
 uint64_t mapCached() {return renderer?renderer->nativeCache.size():0;}
@@ -391,7 +421,7 @@ SDL_Renderer *createRenderer(SDL_Window *&w,int,int) {auto *r=SDL_CreateRenderer
 bool active(){return false;} void shutdown(){}
 void setColor(SDL_Renderer *r,Uint8 a,Uint8 b,Uint8 c,Uint8 d){SDL_SetRenderDrawColor(r,a,b,c,d);}
 int fillRect(SDL_Renderer *r,const SDL_Rect *a){return SDL_RenderFillRect(r,a);}
-int clear(SDL_Renderer *r){return SDL_RenderClear(r);} void present(SDL_Renderer *r){SDL_RenderPresent(r);}
+int clear(SDL_Renderer *r){return SDL_RenderClear(r);} PresentResult present(SDL_Renderer *r){SDL_RenderPresent(r);return {PresentStatus::SdlPresented};}
 SDL_Texture *textureFromSurface(SDL_Renderer *r,SDL_Surface *s){return SDL_CreateTextureFromSurface(r,s);}
 void destroyTexture(SDL_Texture *t){SDL_DestroyTexture(t);}
 int copy(SDL_Renderer *r,SDL_Texture *t,const SDL_Rect *a,const SDL_Rect *b){return SDL_RenderCopy(r,t,a,b);}

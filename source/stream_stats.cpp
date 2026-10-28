@@ -46,9 +46,9 @@ void appendU32(std::vector<uint8_t> &buffer, uint32_t value) {
 } // namespace
 
 RtpTrackStats::RtpTrackStats(unsigned clockRate, std::string name, bool rtx)
-    : clockRate_(clockRate), name_(std::move(name)), rtx_(rtx), diag_(diagEnabled()) {
+    : clockRate_(clockRate), name_(std::move(name)), rtx_(rtx), jitterTracker_(clockRate), diag_(diagEnabled()) {
     if (name_ == "video") videoPayloadType_ = 96;
-    windowStart_ = nowMs();
+    windowStart_ = monotonicMs();
     if (diag_)
         dump_.reserve(dumpLimit_);
 }
@@ -56,7 +56,7 @@ RtpTrackStats::~RtpTrackStats() {
     flushDiagnostics();
 }
 void RtpTrackStats::incoming(rtc::message_vector &messages, const rtc::message_callback &) {
-    const auto now = nowMs();
+    const auto now = monotonicMs();
     for (auto &message : messages) {
         if (!message)
             continue;
@@ -126,7 +126,7 @@ void RtpTrackStats::packet(const uint8_t *data, size_t size) {
         return;
     const auto seq = header->seqNumber();
     const auto timestamp = header->timestamp();
-    const auto now = nowMs();
+    const auto now = monotonicMs();
     std::lock_guard lock(mutex_);
     ++received_;
     ++windowReceived_;
@@ -161,54 +161,19 @@ void RtpTrackStats::packet(const uint8_t *data, size_t size) {
     lastPacketMs_ = now;
     ssrcs_.insert(header->ssrc());
     payloadTypes_.insert(int(header->payloadType()));
-    // RFC 3550 interarrival jitter, kept in RTP timestamp units.
-    const int64_t arrival = int64_t(now) * clockRate_ / 1000;
-    const int64_t transit = arrival - int64_t(timestamp);
-    if (haveTransit_) {
-        const auto delta = transit >= lastTransit_ ? transit - lastTransit_ : lastTransit_ - transit;
-        jitter_ += (double(delta) - jitter_) / 16.0;
-    }
-    haveTransit_ = true;
-    lastTransit_ = transit;
-}
-void RtpTrackStats::sendNack(const std::vector<uint16_t> &sequences, const rtc::message_callback &send) {
-    std::vector<std::pair<uint16_t, uint16_t>> groups;
-    for (auto sequence : sequences) {
-        if (groups.empty() || sequence < groups.back().first ||
-            uint16_t(sequence - groups.back().first) > 16) {
-            groups.emplace_back(sequence, uint16_t(0));
-        } else {
-            groups.back().second |= uint16_t(1u << (sequence - groups.back().first - 1));
-        }
-    }
-    if (groups.empty() || groups.size() > 32)
-        groups.resize(std::min<size_t>(groups.size(), 32));
-    uint32_t ssrc = 0;
-    {
-        std::lock_guard lock(mutex_);
-        ssrc = videoSsrc_;
-        ++nacksSent_;
-    }
-    auto message =
-        rtc::make_message(rtc::RtcpNack::Size(unsigned(groups.size())), rtc::Message::Control);
-    auto *nack = reinterpret_cast<rtc::RtcpNack *>(message->data());
-    nack->preparePacket(ssrc, unsigned(groups.size()));
-    auto *parts = reinterpret_cast<rtc::RtcpNackPart *>(nack->parts);
-    for (size_t i = 0; i < groups.size(); ++i) {
-        parts[i].setPid(groups[i].first);
-        parts[i].setBlp(groups[i].second);
-    }
-    send(message);
+    // RFC 3550 interarrival jitter with signed 32-bit timestamp extension.
+    // Arrival time is monotonic; wall-clock adjustments must not create spikes.
+    jitterTracker_.observe(now, timestamp);
 }
 NetworkStats RtpTrackStats::snapshot() {
     NetworkStats out;
     std::lock_guard lock(mutex_);
-    const auto now = nowMs();
+    const auto now = monotonicMs();
     if (started_ && now - windowStart_ >= 500) {
         const auto elapsed = now - windowStart_;
         const auto total = windowReceived_ + windowLost_;
         windowLoss_ = total ? double(windowLost_) * 100.0 / double(total) : -1;
-        windowJitter_ = jitter_ / double(clockRate_) * 1000.0;
+        windowJitter_ = jitterTracker_.jitterMs();
         windowBitrate_ = double(windowBytes_) * 8.0 * 1000.0 / double(elapsed) / 1000000.0;
         windowStart_ = now;
         windowReceived_ = windowLost_ = windowBytes_ = 0;

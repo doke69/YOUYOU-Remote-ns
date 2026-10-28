@@ -1,5 +1,8 @@
 param([string]$Apk = $env:UU_REFERENCE_APK, [int]$Jobs = 6,
-      [ValidateSet('ON','OFF')][string]$MediaDispatch='ON', [switch]$PrivatePackage)
+      [ValidateSet('ON','OFF')][string]$MediaDispatch='ON',
+      [ValidateSet('FULL','FALLBACK')][string]$ResourceMode='FULL',
+      [string]$UiAssetDir='',
+      [switch]$PrivatePackage)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
@@ -31,9 +34,11 @@ try {
     $configure = @('-S', '.', '-B', 'build-nx', '-G', 'Ninja', '-DCMAKE_TOOLCHAIN_FILE=cmake/switch.cmake', '-DCMAKE_BUILD_TYPE=Release')
     $version=[regex]::Match((Get-Content CMakeLists.txt -Raw),'project\(UURemote-ns VERSION ([\d.]+)').Groups[1].Value
     if(!$version){throw 'Cannot determine source version'}
-    $configure += @("-DUU_BUILD_LABEL=$version","-DUU_MEDIA_DISPATCH=$MediaDispatch",'-DUU_SRTP_MBEDTLS=ON',
+    $configure += @("-DUU_BUILD_LABEL=$version-beta","-DUU_RESOURCE_MODE=$ResourceMode",
+        "-DUU_MEDIA_DISPATCH=$MediaDispatch",'-DUU_SRTP_MBEDTLS=ON',
         '-DUU_RECOVERY_FOCUS=OFF','-DUU_SWITCH_BATCH_RX=OFF','-DUU_RECEIVE_TIMESTAMPS=OFF',
         '-DUU_TWCC_FOUNDATION=OFF','-DUU_TWCC_OBSERVE_CLIENT=OFF','-DUU_TWCC_SEND_EXPERIMENT=OFF')
+    if ($UiAssetDir) { $configure += "-DUU_UI_ASSET_DIR=$($UiAssetDir.Replace('\','/'))" }
     $localNinja = Join-Path $projectRoot '.tools/ninja/ninja.exe'
     if (Test-Path -LiteralPath $localNinja) { $configure += "-DCMAKE_MAKE_PROGRAM=$($localNinja.Replace('\','/'))" }
     & $cmakeExe @configure

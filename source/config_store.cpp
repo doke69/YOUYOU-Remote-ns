@@ -1,7 +1,10 @@
 #include "config_store.hpp"
+#include "config_migration.hpp"
+#include "config_value.hpp"
 #include "diagnostics.hpp"
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <map>
 #include <sstream>
 #include <string>
@@ -19,30 +22,24 @@ constexpr const char *kDirectory = "sdmc:/switch/UURemote-ns";
 constexpr const char *kPath = "sdmc:/switch/UURemote-ns/config.ini";
 constexpr const char *kBackup = "sdmc:/switch/UURemote-ns/config.ini.bak";
 constexpr const char *kTemplatePath = "romfs:/default-config.ini";
-constexpr unsigned kConfigVersion = 2;
+constexpr unsigned kConfigVersion = 3;
 
 // Keep this in sync with romfs/default-config.ini. It is used only if the
 // packaged resource is missing (e.g. a development build with a custom RomFS).
 constexpr const char *kFallbackTemplate =
-    "config_version=2\n"
+    "config_version=3\n"
     "width=1280\n"
     "height=720\n"
     "fps=60\n"
-    "quality=6\n"
+    "quality=3\n"
     "vsync=1\n"
     "frame_pacing=1\n"
     "software_pacing=1\n"
     "playout_delay_ms=8\n"
-    "max_bitrate_mbps=20\n"
+    "max_bitrate_mbps=0\n"
     "video_codec=hevc\n"
     "native_display=1\n";
 
-std::string trim(std::string value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return {};
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
 std::string readFile(const std::string &path) {
     std::ifstream file(path, std::ios::binary);
     std::ostringstream out;
@@ -57,19 +54,15 @@ std::vector<std::string> linesOf(const std::string &text) {
     return lines;
 }
 std::string keyOf(const std::string &line) {
-    const auto equals = line.find('=');
-    if (equals == std::string::npos) return {};
-    return trim(line.substr(0, equals));
+    return config::keyOf(line);
 }
 std::string valueOf(const std::string &line) {
-    const auto equals = line.find('=');
-    if (equals == std::string::npos) return {};
-    return trim(line.substr(equals + 1));
+    return config::valueOf(line);
 }
 struct Entry {std::string key, value;};
 std::vector<Entry> templateEntries() {
     std::string text = readFile(kTemplatePath);
-    if (trim(text).empty()) text = kFallbackTemplate;
+    if (config::trim(text).empty()) text = kFallbackTemplate;
     std::vector<Entry> result;
     for (auto line : linesOf(text)) {
         if (const auto comment = line.find('#'); comment != std::string::npos)
@@ -148,16 +141,16 @@ void ensureDefaultConfig() noexcept {
     mkdir(kDirectory, 0777);
     pruneLegacyBackups();
     std::string existing = readFile(kPath);
-    if (trim(existing).empty()) {
+    if (config::trim(existing).empty()) {
         const std::string backup = readFile(kBackup);
-        if (!trim(backup).empty() && writeAtomic(backup)) {
+        if (!config::trim(backup).empty() && writeAtomic(backup)) {
             existing = backup;
             log("config-restored-from-backup");
         }
     }
-    if (trim(existing).empty()) {
+    if (config::trim(existing).empty()) {
         const std::string templateText = readFile(kTemplatePath);
-        const std::string content = trim(templateText).empty() ? kFallbackTemplate : templateText;
+        const std::string content = config::trim(templateText).empty() ? kFallbackTemplate : templateText;
         if (writeAtomic(content)) log("config-first-run");
         else log("config-first-run-write-failed");
         return;
@@ -169,9 +162,11 @@ void ensureDefaultConfig() noexcept {
     for (size_t i = 0; i < lines.size(); ++i) {
         const auto key = keyOf(lines[i]);
         if (key.empty()) continue;
-        positions[key] = i;
-        if (key == "config_version") {
-            try {version = unsigned(std::stoul(valueOf(lines[i])));} catch (...) {version = 0;}
+        const bool inserted = positions.emplace(key, i).second;
+        if (key == "config_version" && inserted) {
+            int parsed = 0;
+            version = config::parseInt(valueOf(lines[i]), parsed) && parsed >= 0
+                          ? unsigned(parsed) : 0;
         }
     }
     if (version > kConfigVersion) {
@@ -181,6 +176,14 @@ void ensureDefaultConfig() noexcept {
 
     bool changed = false;
     bool migrated = false;
+    QualityConfigMigration qualityMigration;
+    if(version < kConfigVersion) {
+        qualityMigration = migrateQualityConfigLines(lines);
+        if(qualityMigration.changed) {
+            changed = true;
+            migrated = true;
+        }
+    }
     for (const auto &entry : templateEntries()) {
         const auto found = positions.find(entry.key);
         if (found == positions.end()) {
@@ -220,6 +223,18 @@ void ensureDefaultConfig() noexcept {
     if (writeAtomic(content)) {
         if (migrated) log(("config-migrated-v"+versionText).c_str());
         else log(("config-completed-v"+versionText).c_str());
+        if (qualityMigration.changed) {
+            const auto fact="config-quality-preset-migrated-from-q"+std::to_string(qualityMigration.fromQuality)+
+                "-cap"+std::to_string(qualityMigration.fromMbps)+"-to-q"+std::to_string(qualityMigration.toQuality);
+            log(fact.c_str());
+        } else if (qualityMigration.duplicateKeys) {
+            log("config-quality-preset-migration-pending-duplicate");
+        } else if (qualityMigration.invalidCustom) {
+            log("config-quality-preset-preserved-invalid-q6-cap");
+        } else if (qualityMigration.legacyCustom) {
+            const auto fact="config-custom-quality-preserved-q6-cap"+std::to_string(qualityMigration.fromMbps);
+            log(fact.c_str());
+        }
     } else log("config-migration-write-failed");
 #endif
 }
@@ -235,20 +250,11 @@ void ConfigStore::reload() {
 #else
     std::ifstream file("config.ini");
 #endif
-    auto clean=[](std::string value) {
-        const auto first=value.find_first_not_of(" \t\r\n");
-        if(first==std::string::npos)return std::string{};
-        const auto last=value.find_last_not_of(" \t\r\n");
-        return value.substr(first,last-first+1);
-    };
     std::string line;
     while(std::getline(file,line)) {
-        if(const auto comment=line.find('#');comment!=std::string::npos) line.erase(comment);
-        const auto equals=line.find('=');
-        if(equals==std::string::npos) continue;
-        const auto key=clean(line.substr(0,equals));
+        const auto key=config::keyOf(line);
         if(key.empty()) continue;
-        parsed.emplace(key,clean(line.substr(equals+1)));
+        parsed.emplace(key,config::valueOf(line));
     }
     {
         std::lock_guard lock(mutex_);
@@ -272,7 +278,68 @@ int ConfigStore::integer(const std::string &key,int fallback,int minimum,int max
         if(found!=values_.end()) text=found->second;
     }
     if(text.empty()) return fallback;
-    try {return std::clamp(std::stoi(text),minimum,maximum);}
-    catch(...) {return fallback;}
+    if(key == "fps")
+        return config::choice(text, fallback, {30, 60});
+    return config::integer(text, fallback, minimum, maximum);
+}
+void saveQualityConfig(int width, int height, int fps, int quality, bool vsync,
+                       int playoutDelay, int maxBitrateMbps, bool hevc) {
+#ifdef __SWITCH__
+    const std::string path = "sdmc:/switch/UURemote-ns/config.ini";
+#else
+    const std::string path = "config.ini";
+#endif
+    std::ifstream input(path);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) lines.push_back(line);
+    input.close();
+    const std::string framePacing = config::framePacingFromLines(lines);
+    std::string retained;
+    for (const auto &source : lines) {
+        const auto key = config::keyOf(source);
+        if (key == "frame_pacing") continue;
+        if (key != "width" && key != "height" && key != "fps" && key != "quality" &&
+            key != "vsync" && key != "playout_delay_ms" && key != "max_bitrate_mbps" &&
+            key != "video_codec")
+            retained += source + '\n';
+    }
+    std::ofstream output(path + ".quality-tmp", std::ios::trunc);
+    output << retained << "width=" << width << "\nheight=" << height << "\nfps=" << fps << "\nquality=" << quality << '\n';
+    output << "vsync=" << (vsync ? 1 : 0) << '\n';
+    output << "frame_pacing=" << framePacing << "\nplayout_delay_ms=" << playoutDelay << '\n';
+    output << "max_bitrate_mbps=" << maxBitrateMbps << '\n';
+    output << "video_codec=" << (hevc?"hevc":"h264") << '\n';
+    output.close();
+    if (!output) throw std::runtime_error("画质设置保存失败");
+    const auto backup = path + ".bak";
+    std::ifstream existing(path);
+    const bool hadConfig = bool(existing);
+    existing.close();
+    if (hadConfig) {
+        // Keep exactly one fixed backup; the old timestamped copies are no
+        // longer generated. Remove any previous backup before replacing it.
+        std::remove(backup.c_str());
+        if (std::rename(path.c_str(), backup.c_str()) != 0)
+            throw std::runtime_error("画质设置保存失败");
+    }
+    if (std::rename((path + ".quality-tmp").c_str(), path.c_str()) != 0) {
+        if (hadConfig) std::rename(backup.c_str(), path.c_str());
+        throw std::runtime_error("画质设置保存失败，已尝试恢复原配置");
+    }
+#ifdef __SWITCH__
+    // Remove legacy timestamped backups left by earlier builds. Only the fixed
+    // config.ini.bak remains.
+    if (DIR *dir = opendir("sdmc:/switch/UURemote-ns")) {
+        const std::string prefix = "config.ini.before-quality-";
+        while (auto *entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name.rfind(prefix, 0) == 0)
+                std::remove(("sdmc:/switch/UURemote-ns/" + name).c_str());
+        }
+        closedir(dir);
+    }
+#endif
+    ConfigStore::instance().reload();
 }
 } // namespace uu

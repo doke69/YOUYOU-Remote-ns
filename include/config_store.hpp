@@ -10,6 +10,12 @@ namespace uu {
 // this is a no-op.
 void ensureDefaultConfig() noexcept;
 
+// Persist a quality change through the same first-wins parser used by reload.
+// All managed keys are written once; unknown lines/comments and one fixed .bak
+// are retained. Frame pacing keeps the first parsed value (including 0 #comment).
+void saveQualityConfig(int width, int height, int fps, int quality, bool vsync,
+                       int playoutDelay, int maxBitrateMbps, bool hevc);
+
 // Thread-safe read-only view of config.ini for all modules. Reload replaces the
 // map atomically; readers never observe a partially parsed file.
 class ConfigStore {

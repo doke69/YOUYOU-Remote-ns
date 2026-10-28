@@ -1,4 +1,4 @@
-# 构建 YOUYOU远程 0.3.72
+# 构建 YOUYOU远程 0.3.73 Beta
 
 ## 环境
 
@@ -17,7 +17,7 @@ python3 scripts/patch_deps.py
 python3 scripts/extract_key.py /path/to/your/reference.apk
 cmake -S . -B build-nx -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=cmake/switch.cmake -DCMAKE_BUILD_TYPE=Release \
-  -DUU_BUILD_LABEL=0.3.72 -DUU_MEDIA_DISPATCH=ON -DUU_SRTP_MBEDTLS=ON \
+  -DUU_BUILD_LABEL=0.3.73-beta -DUU_MEDIA_DISPATCH=ON -DUU_SRTP_MBEDTLS=ON \
   -DUU_RECOVERY_FOCUS=OFF -DUU_SWITCH_BATCH_RX=OFF \
   -DUU_RECEIVE_TIMESTAMPS=OFF -DUU_TWCC_FOUNDATION=OFF \
   -DUU_TWCC_OBSERVE_CLIENT=OFF -DUU_TWCC_SEND_EXPERIMENT=OFF
@@ -38,4 +38,4 @@ Windows 可在设置 DEVKITPRO 后使用 `scripts/build.ps1 -Apk <本地APK路�
 
 fetch_deps.py 校验锁定归档哈希。patch_deps.py 对照 manifest 先校验全部源文件，再应用31份覆盖文件；再次运行应应用0份。覆盖文件保留原许可证，能复现当前开发依赖的源文件，详见 dependency-overrides.md。
 
-旧版曾做过依赖获取和覆盖验证；0.3.72 公开快照尚需在干净环境重新验证完整构建及真机回归。
+旧版曾做过依赖获取和覆盖验证；0.3.73 Beta 公开快照尚需在干净环境重新验证完整构建及真机回归。

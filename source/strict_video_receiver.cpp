@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #include <rtc/rtp.hpp>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -109,11 +110,13 @@ StrictVideoReceiver::StrictVideoReceiver(bool rtx, int ms, Output out, bool hevc
 }
 StrictVideoReceiver::~StrictVideoReceiver() { shutdown(); }
 void StrictVideoReceiver::shutdown() {
-    std::lock_guard lock(mutex_);
-    if (stopped_) return;
-    stopped_ = true;
-    send_ = {};
-    noteEvent("shutdown", clockMs());
+    {
+        std::lock_guard lock(mutex_);
+        if (stopped_) return;
+        stopped_ = true;
+        send_ = {};
+        noteEvent("shutdown", clockMs());
+    }
     flush();
 }
 void StrictVideoReceiver::setSources(uint32_t primary, uint32_t retransmission) {
@@ -675,12 +678,11 @@ void StrictVideoReceiver::tick() {
     tickTotalUs_+=wall;tickMaxUs_=std::max(tickMaxUs_,wall);
 }
 void StrictVideoReceiver::flush() {
-#ifdef _WIN32
-    _mkdir(directory());
-#else
-    mkdir(directory(), 0777);
-#endif
-    std::ofstream info(std::string(directory()) + "/receiver_v2.txt");
+    std::ostringstream info,trace,events;
+    {
+    // Capture bounded numeric/text diagnostics under the receiver lock. No
+    // filesystem operation or later read of mutable receiver fields escapes it.
+    std::lock_guard lock(mutex_);
     info << "diagnostic_revision=rx54\nreceiver_started_ms=" << startedAtMs_
          << "\nsnapshot_ms=" << clockMs() << "\nstopped=" << stopped_ << '\n';
     info << "session_marker_written=" << sessionMarkerWritten_ << "\nevents_dropped=" << eventsDropped_ << '\n';
@@ -709,11 +711,22 @@ void StrictVideoReceiver::flush() {
          << "\nidr_skip_attempts=" << idrSkipAttempts_ << "\nidr_skip_failures=" << idrSkipFailures_
          << "\nprobe_pli=" << probePli_ << "\nrecovery_pli=" << recoveryPli_
          << "\nmax_repair_attempts=" << kMaxRepairAttempts << '\n';
-    std::ofstream trace(std::string(directory()) + "/receiver_v2_frames.csv");
     trace << "rtp_timestamp,packets,bytes,age_ms,result\n";
-    std::ofstream events(std::string(directory()) + "/receiver_events.csv");
     events << "time_ms,event,deadline_ms,pending,blocked_ms,waiting_idr,last_pli_ms,delivered\n";
     for (const auto &event : events_) events << event << '\n';
     for (const auto &line : trace_) trace << line << '\n';
+    frames_.clear();requested_.clear();buffered_=retained_=0;
+    }
+#ifdef _WIN32
+    _mkdir(directory());
+#else
+    mkdir(directory(), 0777);
+#endif
+    std::ofstream infoFile(std::string(directory()) + "/receiver_v2.txt");
+    std::ofstream traceFile(std::string(directory()) + "/receiver_v2_frames.csv");
+    std::ofstream eventsFile(std::string(directory()) + "/receiver_events.csv");
+    infoFile<<info.str();traceFile<<trace.str();eventsFile<<events.str();
+    infoFile.flush();traceFile.flush();eventsFile.flush();
+    if(!infoFile || !traceFile || !eventsFile) diagnostic("receiver-diagnostics-write-failed");
 }
 } // namespace uu

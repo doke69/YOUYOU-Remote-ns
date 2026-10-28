@@ -1,6 +1,8 @@
 #pragma once
 #include "auth.hpp"
+#include "input_admission.hpp"
 #include "media.hpp"
+#include "quality_confirmation.hpp"
 #include "stream_stats.hpp"
 #include "transport.hpp"
 #include "video_assembler.hpp"
@@ -36,9 +38,13 @@ struct Snapshot {
     int appliedFps = 0, appliedQuality = 0, appliedWidth = 0, appliedHeight = 0;
     int appliedBitrateMbps = 0;
     bool appliedValid = false, appliedBitrateKnown = false;
+    bool appliedFpsKnown = false, appliedQualityKnown = false;
+    bool appliedWidthKnown = false, appliedHeightKnown = false;
     // Unified setting result: ACK is accepted; only CaptureSettingSync/media
-    // can promote a setting to applied.
+    // can promote a setting to applied. Apply confirmation is tracked
+    // independently from the RPC pending state.
     bool settingAccepted=false, settingApplied=false, settingRejected=false;
+    bool settingApplyPending=false;
     int settingErrorCode=0;
     std::string settingSource;
     // Parsed forward_setting capability summary (safe, bounded strings only).
@@ -58,6 +64,7 @@ class Client {
         std::mutex mutex;
         std::condition_variable cv;
         std::deque<Event> events;
+        InputAdmission inputAdmission;
     };
     std::shared_ptr<Inbox> inbox_ = std::make_shared<Inbox>();
     std::shared_ptr<Media> media_;
@@ -104,12 +111,16 @@ class Client {
     int maxBitrateMbps_ = 0;
     bool hevc_ = false;
     bool rembAvailable_ = false, bitrateFeedbackSent_ = false;
+    unsigned rembTargetBps_ = 0;
     int64_t lastBitrateAttempt_ = 0;
     void applyBitrateCap();
     struct QualityValues {int width,height,fps,quality,cap,delay;bool vsync,hevc;};
     enum class QualityRpcKind {QualityOnly,Capture,Fps,VideoQuality};
     struct PendingQuality {QualityValues target;uint64_t id;int64_t deadline;bool acknowledged=false;bool headerOnly=false;int screenId=-1;QualityRpcKind kind=QualityRpcKind::QualityOnly;bool retried=false;};
     std::optional<PendingQuality> pendingQuality_;
+    struct PendingQualityApply {QualityValues target;uint64_t id;int64_t deadline;};
+    std::optional<PendingQualityApply> pendingQualityApply_;
+    QualityApplyTracker qualityApply_;
     bool fpsSettingSupported_=true,qualitySettingSupported_=true;
     uint64_t nextQualityRpc_=1,qualitySent_=0,qualityAcked_=0,qualityFailed_=0;
     int activeScreenId_=-1,lastQualityCode_=0;unsigned lastQualityErrors_=0;

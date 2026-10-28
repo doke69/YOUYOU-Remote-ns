@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.21)
-project(UURemote-ns VERSION 0.3.72 LANGUAGES C CXX)
-set(UU_BUILD_LABEL "${PROJECT_VERSION}" CACHE STRING "Version label for a local review candidate")
+project(UURemote-ns VERSION 0.3.73 LANGUAGES C CXX)
+set(UU_BUILD_LABEL "${PROJECT_VERSION}-beta" CACHE STRING "Version label for a local review candidate")
+set(UU_RESOURCE_MODE "FULL" CACHE STRING "Resource mode: FULL local resources or FALLBACK public assets")
+set_property(CACHE UU_RESOURCE_MODE PROPERTY STRINGS FULL FALLBACK)
+if(NOT UU_RESOURCE_MODE STREQUAL "FULL" AND NOT UU_RESOURCE_MODE STREQUAL "FALLBACK")
+    message(FATAL_ERROR "UU_RESOURCE_MODE must be FULL or FALLBACK")
+endif()
+set(UU_EFFECTIVE_BUILD_LABEL "${UU_BUILD_LABEL}")
+if(UU_RESOURCE_MODE STREQUAL "FALLBACK")
+    if(NOT UU_EFFECTIVE_BUILD_LABEL MATCHES "-(fallback|fb)$")
+        string(APPEND UU_EFFECTIVE_BUILD_LABEL "-fb")
+    endif()
+endif()
+find_program(UU_PYTHON NAMES python3 python3.exe python python.exe DOC "Python 3 interpreter for built-in checks and NACP post-processing")
 set(UU_UI_ASSET_DIR "${CMAKE_SOURCE_DIR}/romfs/ui-tv" CACHE PATH "Curated UI asset source directory (brand.rgba is excluded)")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -54,6 +66,7 @@ target_include_directories(uu_protocol PUBLIC include)
 find_package(Threads REQUIRED)
 add_library(uu_runtime source/cpu_diagnostics.cpp source/background.cpp source/diagnostics.cpp source/rtc_diagnostics.cpp)
 target_link_libraries(uu_runtime PUBLIC Threads::Threads)
+target_compile_definitions(uu_runtime PRIVATE UU_VERSION="${UU_EFFECTIVE_BUILD_LABEL}")
 if(UU_CORE_ONLY)
     enable_testing()
     add_executable(playout_policy_test tests/playout_policy_test.cpp)
@@ -62,6 +75,40 @@ if(UU_CORE_ONLY)
     add_executable(bitrate_settings_test tests/bitrate_settings_test.cpp)
     target_link_libraries(bitrate_settings_test PRIVATE uu_protocol)
     add_test(NAME bitrate_settings COMMAND bitrate_settings_test)
+    add_executable(media_integrity_test tests/media_integrity_test.cpp)
+    target_include_directories(media_integrity_test PRIVATE include)
+    add_test(NAME media_integrity COMMAND media_integrity_test)
+    add_executable(config_store_test tests/config_store_test.cpp source/config_store.cpp)
+    target_include_directories(config_store_test PRIVATE include)
+    target_link_libraries(config_store_test PRIVATE uu_runtime)
+    add_test(NAME config_store COMMAND config_store_test)
+    add_executable(input_admission_test tests/input_admission_test.cpp)
+    target_include_directories(input_admission_test PRIVATE include)
+    add_test(NAME input_admission COMMAND input_admission_test)
+    add_executable(rtp_jitter_test tests/rtp_jitter_test.cpp)
+    target_include_directories(rtp_jitter_test PRIVATE include)
+    add_test(NAME rtp_jitter COMMAND rtp_jitter_test)
+    add_executable(latest_snapshot_worker_test tests/latest_snapshot_worker_test.cpp)
+    target_include_directories(latest_snapshot_worker_test PRIVATE include)
+    target_link_libraries(latest_snapshot_worker_test PRIVATE Threads::Threads)
+    add_test(NAME latest_snapshot_worker COMMAND latest_snapshot_worker_test)
+    add_executable(diagnostics_log_test tests/diagnostics_log_test.cpp source/diagnostics.cpp)
+    target_include_directories(diagnostics_log_test PRIVATE include)
+    target_link_libraries(diagnostics_log_test PRIVATE Threads::Threads)
+    target_compile_definitions(diagnostics_log_test PRIVATE UU_VERSION="test-build")
+    target_link_options(diagnostics_log_test PRIVATE -Wl,--wrap=fopen -Wl,--wrap=fflush
+                        -Wl,--wrap=fclose -Wl,--wrap=fwrite)
+    add_test(NAME diagnostics_log COMMAND diagnostics_log_test)
+    foreach(mode fflush open write close drop failslow)
+        add_test(NAME diagnostics_log_${mode} COMMAND diagnostics_log_test ${mode})
+    endforeach()
+    add_executable(present_identity_test tests/present_identity_test.cpp)
+    target_include_directories(present_identity_test PRIVATE include)
+    add_test(NAME present_identity COMMAND present_identity_test)
+    if(UU_PYTHON)
+        add_test(NAME resource_manifest
+                 COMMAND "${UU_PYTHON}" "${CMAKE_SOURCE_DIR}/tests/resource_manifest_test.py")
+    endif()
     add_executable(protocol_test tests/protocol_test.cpp)
     target_link_libraries(protocol_test PRIVATE uu_protocol)
     add_test(NAME protocol COMMAND protocol_test)
@@ -164,7 +211,7 @@ target_sources(UURemote-ns PRIVATE source/runtime_profile.cpp)
 if(UU_MEDIA_DISPATCH)
     target_sources(UURemote-ns PRIVATE source/media_dispatch_queue.cpp)
 endif()
-target_compile_definitions(UURemote-ns PRIVATE UU_VERSION="${UU_BUILD_LABEL}")
+target_compile_definitions(UURemote-ns PRIVATE UU_VERSION="${UU_EFFECTIVE_BUILD_LABEL}")
 if(UU_RECOVERY_FOCUS)
     target_compile_definitions(UURemote-ns PRIVATE UU_RECOVERY_FOCUS=1)
 endif()
@@ -195,6 +242,20 @@ if(UU_SWITCH)
     endif()
     set(UU_ROMFS_DIR "${CMAKE_BINARY_DIR}/romfs")
     file(MAKE_DIRECTORY "${UU_ROMFS_DIR}")
+    # Resource mode is validated before copying anything. FULL requires the
+    # curated private UI directory; FALLBACK intentionally omits those images.
+    set(UU_RESOURCE_VERIFY_ARGS verify --mode "${UU_RESOURCE_MODE}" --root "${CMAKE_SOURCE_DIR}")
+    if(UU_RESOURCE_MODE STREQUAL "FULL")
+        list(APPEND UU_RESOURCE_VERIFY_ARGS --asset-dir "${UU_UI_ASSET_DIR}")
+    endif()
+    execute_process(COMMAND "${UU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/resource_manifest.py"
+                            ${UU_RESOURCE_VERIFY_ARGS}
+                    RESULT_VARIABLE UU_RESOURCE_VERIFY_RESULT
+                    OUTPUT_VARIABLE UU_RESOURCE_VERIFY_OUTPUT
+                    ERROR_VARIABLE UU_RESOURCE_VERIFY_ERROR)
+    if(NOT UU_RESOURCE_VERIFY_RESULT EQUAL 0)
+        message(FATAL_ERROR "Resource validation failed (${UU_RESOURCE_MODE}):\n${UU_RESOURCE_VERIFY_ERROR}")
+    endif()
     configure_file("${CMAKE_SOURCE_DIR}/romfs/signing.key" "${UU_ROMFS_DIR}/signing.key" COPYONLY)
     configure_file("${CMAKE_SOURCE_DIR}/romfs/default-config.ini" "${UU_ROMFS_DIR}/default-config.ini" COPYONLY)
     # Unmodified OFL fonts, bundled with their redistribution license.
@@ -205,7 +266,6 @@ if(UU_SWITCH)
         configure_file("${font_source}" "${UU_ROMFS_DIR}/fonts/${font}" COPYONLY)
         list(APPEND UU_FONT_ASSETS "${font_source}")
     endforeach()
-    find_program(UU_PYTHON NAMES python3 python3.exe python python.exe DOC "Python 3 interpreter for NACP title post-processing")
     if(NOT UU_PYTHON)
         message(FATAL_ERROR "Python 3 interpreter required for NACP title post-processing")
     endif()
@@ -224,17 +284,21 @@ if(UU_SWITCH)
             DEPENDS "${CMAKE_SOURCE_DIR}/shaders/${shader}" "${UU_UAM}" VERBATIM)
         list(APPEND UU_SHADER_OUTPUTS "${output}")
     endforeach()
-    file(GLOB UU_TV_ASSETS CONFIGURE_DEPENDS "${UU_UI_ASSET_DIR}/*.rgba")
-    foreach(asset IN LISTS UU_TV_ASSETS)
-        get_filename_component(asset_name "${asset}" NAME)
-        if(asset_name STREQUAL "brand.rgba")
-            continue()
-        endif()
-        file(MAKE_DIRECTORY "${UU_ROMFS_DIR}/ui-tv")
-        configure_file("${asset}" "${UU_ROMFS_DIR}/ui-tv/${asset_name}" COPYONLY)
-    endforeach()
+    set(UU_TV_ASSETS)
+    if(UU_RESOURCE_MODE STREQUAL "FULL")
+        file(GLOB UU_TV_ASSETS CONFIGURE_DEPENDS "${UU_UI_ASSET_DIR}/*.rgba")
+        foreach(asset IN LISTS UU_TV_ASSETS)
+            get_filename_component(asset_name "${asset}" NAME)
+            if(asset_name STREQUAL "brand.rgba")
+                continue()
+            endif()
+            file(MAKE_DIRECTORY "${UU_ROMFS_DIR}/ui-tv")
+            configure_file("${asset}" "${UU_ROMFS_DIR}/ui-tv/${asset_name}" COPYONLY)
+        endforeach()
+    endif()
     # Own-generated assets are always available in a public/normal build,
-    # independent of the optional curated external asset directory.
+    # independent of the optional curated external asset directory. They
+    # override same-named private assets in FULL mode.
     set(UU_OWN_UI_ASSETS
         "${CMAKE_SOURCE_DIR}/assets/youyou-mark.rgba"
         "${CMAKE_SOURCE_DIR}/assets/touch.rgba"
@@ -245,13 +309,53 @@ if(UU_SWITCH)
         configure_file("${asset}" "${UU_ROMFS_DIR}/ui-tv/${asset_name}" COPYONLY)
     endforeach()
     list(APPEND UU_TV_ASSETS ${UU_OWN_UI_ASSETS})
+    set(UU_RESOURCE_MODE_VERIFY_EXTRA)
+    if(UU_RESOURCE_MODE STREQUAL "FULL")
+        set(UU_RESOURCE_MODE_VERIFY_EXTRA --asset-dir "${UU_UI_ASSET_DIR}")
+    endif()
+    # Compiled shader outputs do not exist at configure time; the NRO command
+    # below re-runs this verifier after shader compilation and before packing.
     add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
-        COMMAND "${DEVKITPRO}/tools/bin/nacptool" --create "YOUYOU" "UURemote contributors" "${UU_BUILD_LABEL}" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
+        COMMAND "${UU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/resource_manifest.py"
+                verify --mode "${UU_RESOURCE_MODE}" --root "${CMAKE_SOURCE_DIR}"
+                --romfs-dir "${UU_ROMFS_DIR}" ${UU_RESOURCE_MODE_VERIFY_EXTRA}
+        COMMAND "${DEVKITPRO}/tools/bin/nacptool" --create "YOUYOU" "UURemote contributors" "${UU_EFFECTIVE_BUILD_LABEL}" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
         COMMAND "${UU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/fix_nacp_title.py" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
         COMMAND "${DEVKITPRO}/tools/bin/elf2nro" "$<TARGET_FILE:UURemote-ns>" "${CMAKE_BINARY_DIR}/UURemote-ns.nro" "--nacp=${CMAKE_BINARY_DIR}/UURemote-ns.nacp" "--icon=${CMAKE_SOURCE_DIR}/assets/youyou-icon.jpg" "--romfsdir=${UU_ROMFS_DIR}"
-        DEPENDS UURemote-ns ${UU_TV_ASSETS} "${CMAKE_SOURCE_DIR}/assets/youyou-icon.jpg" "${CMAKE_SOURCE_DIR}/scripts/fix_nacp_title.py" "${CMAKE_SOURCE_DIR}/romfs/signing.key"
+        DEPENDS UURemote-ns ${UU_TV_ASSETS} "${CMAKE_SOURCE_DIR}/assets/youyou-icon.jpg"
+                "${CMAKE_SOURCE_DIR}/romfs/default-config.ini"
+                "${CMAKE_SOURCE_DIR}/scripts/fix_nacp_title.py"
+                "${CMAKE_SOURCE_DIR}/scripts/resource_manifest.py"
+                "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+                "${CMAKE_SOURCE_DIR}/scripts/dependency-overrides/manifest.json"
+                "${CMAKE_SOURCE_DIR}/romfs/signing.key"
         ${UU_SHADER_OUTPUTS} ${UU_FONT_ASSETS} VERBATIM)
-    add_custom_target(nro ALL DEPENDS "${CMAKE_BINARY_DIR}/UURemote-ns.nro")
+    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/UURemote-ns.manifest.json"
+        COMMAND "${UU_PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/resource_manifest.py" manifest
+                --mode "${UU_RESOURCE_MODE}" --root "${CMAKE_SOURCE_DIR}"
+                --romfs-dir "${UU_ROMFS_DIR}" --nro "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
+                --elf "$<TARGET_FILE:UURemote-ns>"
+                --output "${CMAKE_BINARY_DIR}/UURemote-ns.manifest.json"
+                --version "${PROJECT_VERSION}" --label "${UU_EFFECTIVE_BUILD_LABEL}"
+                --option "UU_RESOURCE_MODE=${UU_RESOURCE_MODE}"
+                --option "UU_BUILD_LABEL=${UU_EFFECTIVE_BUILD_LABEL}"
+                --option "UU_MEDIA_DISPATCH=${UU_MEDIA_DISPATCH}"
+                --option "UU_SRTP_MBEDTLS=${UU_SRTP_MBEDTLS}"
+                --option "UU_RECOVERY_FOCUS=${UU_RECOVERY_FOCUS}"
+                --option "UU_SWITCH_BATCH_RX=${UU_SWITCH_BATCH_RX}"
+                --option "UU_RECEIVE_TIMESTAMPS=${UU_RECEIVE_TIMESTAMPS}"
+                --option "UU_TWCC_FOUNDATION=${UU_TWCC_FOUNDATION}"
+                --option "UU_TWCC_OBSERVE_CLIENT=${UU_TWCC_OBSERVE_CLIENT}"
+                --option "UU_TWCC_SEND_EXPERIMENT=${UU_TWCC_SEND_EXPERIMENT}"
+                --option "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+        DEPENDS "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
+                "${CMAKE_SOURCE_DIR}/scripts/resource_manifest.py"
+                "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+                "${CMAKE_SOURCE_DIR}/scripts/dependency-overrides/manifest.json"
+                "${CMAKE_SOURCE_DIR}/romfs/default-config.ini"
+        VERBATIM)
+    add_custom_target(nro ALL DEPENDS "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
+                                    "${CMAKE_BINARY_DIR}/UURemote-ns.manifest.json")
 else()
     find_package(PkgConfig REQUIRED)
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/romfs/fonts")

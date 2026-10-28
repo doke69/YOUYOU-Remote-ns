@@ -141,6 +141,15 @@ int main(int argc, char **argv) {
                   "Audio queue failure was hidden");
             media.audio(silence, sizeof(silence), media.generation());
             check(media.status().empty(), "Successful audio retry retained stale error");
+            const int delay = media.stats().playoutDelayMs;
+            const auto held = queuedBytes.load();
+            media.audio(silence, sizeof(silence), media.generation(), 0);
+            if (delay > 0)
+                check(queuedBytes == held, "Timestamped audio skipped the playout hold");
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay + 90));
+            media.audio(silence, sizeof(silence), media.generation(), 960 * 3);
+            check(queuedBytes >= held + 4u * 960u * 4u,
+                  "Playout hold did not release the concealed Opus frames");
 #endif
         }
 #ifdef UU_MEDIA_FAULT_TEST

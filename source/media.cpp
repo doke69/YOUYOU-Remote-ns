@@ -1,20 +1,26 @@
 #include "cpu_diagnostics.hpp"
 #include "media.hpp"
+#include "media_integrity.hpp"
 #include "playout_policy.hpp"
 #include "background.hpp"
 #include "config_store.hpp"
 #include "diagnostics.hpp"
+#include "runtime/latest_snapshot_worker.hpp"
 #ifdef __SWITCH__
 #include "live_telemetry.hpp"
 #endif
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sys/stat.h>
+#include <vector>
 #ifdef _WIN32
 #include <direct.h>
 #endif
@@ -230,8 +236,8 @@ struct Media::Impl {
     uint64_t playoutOverflowDrop = 0, playoutEmptyRepeat = 0, playoutHold = 0;
     bool pacing = mediaConfigInt("frame_pacing",1,0,1)!=0;
     int playoutDelayMs = mediaConfigInt("playout_delay_ms",35,0,100);
-    bool haveInputTimestamp = false, havePlayoutClock = false;
-    int64_t highestInputTimestamp = 0, clockTimestamp = 0, clockWallMs = 0;
+    bool haveInputTimestamp = false;
+    int64_t highestInputTimestamp = 0;
     int64_t lastPresentedTimestamp = AV_NOPTS_VALUE;
     uint64_t presentationSkipped = 0, clockResets = 0, missingTimestamps = 0;
     uint64_t pictureEmpty = 0, pictureEmptyNoReady = 0, pictureEmptyFuture = 0;
@@ -243,14 +249,6 @@ struct Media::Impl {
     uint64_t ageBreakdownSamples = 0;
     uint64_t skipDue = 0, skipBound = 0;
     int selectedLateMs = 0;
-    double framePeriodMs = 16.667;
-    int64_t cadenceTimestamp = AV_NOPTS_VALUE;
-    // Experimental presentation-only correction; RTP and decoded pixels stay intact.
-    int cadenceSmoothingMs=mediaConfigInt("cadence_smoothing_ms",0,0,4);
-    int64_t smoothedTimestamp=AV_NOPTS_VALUE;
-    double smoothedDueMs=0;
-    uint64_t smoothedFrames=0;
-    int maxDueShiftMs=0;
     std::deque<std::string> playoutTrace;
     void tracePicture(const Picture &picture, int64_t now, const char *reason, int64_t targetMs = 0) {
         // Bounded numeric-only trace, independent of the AU/video dump switch.
@@ -372,6 +370,9 @@ struct Media::Impl {
     std::string error;
     uint64_t serial = 0;
     std::atomic<uint64_t> generation{1};
+    // Incremented on same-generation recovery (input overflow) and reset;
+    // captured by the codec worker when it dequeues an AU.
+    std::atomic<uint64_t> recovery{0};
     std::atomic<bool> keyframeRequested{true};
     std::atomic<bool> hardware{false};
     std::atomic<int64_t> lastFrameMs{0};
@@ -397,8 +398,22 @@ struct Media::Impl {
     std::atomic<bool> decoderFailed{false};
     enum class AudioStatus { Ready, Unavailable, QueueFailed };
     std::atomic<AudioStatus> audioStatus{AudioStatus::Ready};
+    // RTP timestamps share the video playout delay. Held packets stay ordered
+    // until that deadline; only a short gap is concealed.
+    std::map<int64_t, std::vector<uint8_t>> audioHold;
+    bool audioAnchored=false, audioHaveClock=false, audioHavePlay=false;
+    int64_t audioAnchorRtp=0, audioAnchorDueMs=0, audioExtendedRtp=0, audioPlayRtp=0;
+    uint32_t audioLastRtp32=0;
+    int audioDelayMs=0, audioFrameSamples=960;
+    std::array<int16_t,5760*2> audioPcm{};
+    void resetAudioSchedule();
+    void queueAudioPcm(int samples);
+    void concealAudioUntil(int64_t rtp);
+    void releaseAudio();
+    void ingestAudio(const uint8_t *data, size_t size, std::optional<uint32_t> timestamp);
     Impl() {
       try {
+        audioDelayMs=playoutDelayMs;
         SDL_AudioSpec spec{};
         spec.freq = 48000;
         spec.format = AUDIO_S16SYS;
@@ -439,12 +454,43 @@ struct Media::Impl {
         Picture diagnosticPicture_;
         std::string codecText, encoderText;
         bool diag_=false, diagnosticHevc_=false, hardware=false, pacing=false;
-        int width=0, height=0, playoutDelayMs=0, cadenceSmoothingMs=0, maxDueShiftMs=0;
+        int width=0, height=0, playoutDelayMs=0;
         size_t readyFrames=0;
         uint64_t auCount_=0, decodeErrors=0, droppedUnits=0, keyframeCount=0;
-        uint64_t presentationSkipped=0, clockResets=0, missingTimestamps=0, smoothedFrames=0, order=0;
+        uint64_t presentationSkipped=0, clockResets=0, missingTimestamps=0, order=0;
         double fps=0, decodeMs=0;
     };
+    struct DiagnosticJob {
+        uint64_t order;
+        size_t bytes;
+        std::unique_ptr<DiagnosticDump> dump;
+        size_t retainedBytes() const noexcept { return bytes; }
+    };
+    std::mutex diagnosticSubmitMutex;
+    std::unique_ptr<runtime::LatestSnapshotWorker<DiagnosticJob>> diagnosticWriter;
+    std::atomic<bool> diagnosticWriterUnavailable{false};
+    void queueDiagnostics(DiagnosticDump &&dump) noexcept {
+        if(dump.playoutTrace.empty() && dump.auDump_.empty()) return;
+        // Only CPU pixels are written. Never retain a hardware surface for a
+        // diagnostic that cannot use it, especially across slow storage writes.
+        dump.diagnosticPicture_.hardwareFrame.reset();
+        size_t bytes=dump.auDump_.capacity();
+        for(const auto &line:dump.playoutTrace) bytes+=line.capacity();
+        if(dump.diagnosticPicture_.pixels) bytes+=dump.diagnosticPicture_.pixels->capacity();
+        try {
+            std::lock_guard lock(diagnosticSubmitMutex);
+            if(diagnosticWriterUnavailable) return;
+            if(!diagnosticWriter)
+                diagnosticWriter=std::make_unique<runtime::LatestSnapshotWorker<DiagnosticJob>>(
+                    96u*1024u*1024u,[](const DiagnosticJob &job){writeDiagnostics(*job.dump);});
+            const auto order=dump.order;
+            if(!diagnosticWriter->submit({order,bytes,std::make_unique<DiagnosticDump>(std::move(dump))}))
+                diagnostic("media-diagnostics-snapshot-rejected");
+        } catch(...) {
+            diagnosticWriterUnavailable=true;
+            diagnosticException("media-diagnostics-worker-unavailable",std::current_exception());
+        }
+    }
     // Caller owns mutex, or has joined the decoder during destruction.
     DiagnosticDump takeDiagnostics() {
         DiagnosticDump d;
@@ -470,9 +516,6 @@ struct Media::Impl {
         d.presentationSkipped=presentationSkipped;
         d.clockResets=clockResets;
         d.missingTimestamps=missingTimestamps;
-        d.cadenceSmoothingMs=cadenceSmoothingMs;
-        d.smoothedFrames=smoothedFrames;
-        d.maxDueShiftMs=maxDueShiftMs;
         d.readyFrames=ready.size();
         return d;
     }
@@ -547,11 +590,24 @@ struct Media::Impl {
             info << "frame_pacing=" << d.pacing << "\nplayout_delay_ms=" << d.playoutDelayMs
                  << "\nready_frames=" << d.readyFrames << "\npresentation_skipped=" << d.presentationSkipped
                  << "\nplayout_clock_resets=" << d.clockResets << "\nmissing_frame_timestamps=" << d.missingTimestamps << '\n';
-            info << "cadence_smoothing_ms=" << d.cadenceSmoothingMs << "\nsmoothed_frames=" << d.smoothedFrames
-                 << "\nmax_due_shift_ms=" << d.maxDueShiftMs << '\n';
+            // Legacy diagnostic keys are intentionally inactive and fixed at 0.
+            info << "cadence_smoothing_ms=0\nsmoothed_frames=0\nmax_due_shift_ms=0\n";
         }
     }
-    void flushDiagnostics() { writeDiagnostics(takeDiagnostics()); }
+    void flushDiagnostics() {
+        queueDiagnostics(takeDiagnostics());
+        if(diagnosticWriter) {
+            // Final storage drain is intentionally joined, not a hard timeout.
+            diagnosticWriter->shutdown();
+            const auto stats=diagnosticWriter->stats();
+            char text[192];
+            std::snprintf(text,sizeof text,"media-diagnostics-completed-%llu-replaced-%llu-rejected-%llu-failures-%llu-peak-bytes-%llu",
+                (unsigned long long)stats.completed,(unsigned long long)stats.replaced,
+                (unsigned long long)stats.rejected,(unsigned long long)stats.failures,
+                (unsigned long long)stats.peakBytes);
+            diagnostic(text);
+        }
+    }
     static AVPixelFormat chooseFormat(AVCodecContext *context, const AVPixelFormat *formats) {
 #ifdef __SWITCH__
         for (auto p = formats; *p != AV_PIX_FMT_NONE; ++p)
@@ -722,6 +778,7 @@ struct Media::Impl {
         // Diagnostic stage EMAs (microseconds): send, receive/drain, frame
         // processing + publish. Existing decodeMs semantics are unchanged.
         double stageSendUs=0, stageRecvUs=0, stagePublishUs=0;
+        bool receiveEofLogged=false;
         auto ema=[](double value,double sample){return value<=0?sample:value+(sample-value)*kDecodeStageEmaAlpha;};
         // Codec state belongs only to this worker. Generation checks protect
         // publication; reset never touches a live codec or waits for its fence.
@@ -736,6 +793,7 @@ struct Media::Impl {
         while (true) {
             EncodedUnit unit;
             uint64_t currentGeneration;
+            uint64_t currentRecovery;
             bool flushCodec=false;
             {
                 std::unique_lock lock(mutex);
@@ -747,6 +805,7 @@ struct Media::Impl {
                     // Driver/fence waits must not block picture() or reset().
                     lock.unlock();
                     avcodec_flush_buffers(ctx);
+                    receiveEofLogged=false;
                     lock.lock();
                     // Recheck stop/clear and generation after the unlocked wait.
                     continue;
@@ -759,6 +818,7 @@ struct Media::Impl {
                 queueWaitLastMs=unit.enqueuedMs?std::max<int64_t>(0,dequeuedMs-unit.enqueuedMs):0;
                 queueWaitMaxMs=std::max(queueWaitMaxMs,queueWaitLastMs);
                 currentGeneration = generation.load();
+                currentRecovery = recovery.load();
             }
             const uint64_t activeGeneration=generation.load();
             if(activeGeneration!=stageEpoch) {
@@ -768,16 +828,20 @@ struct Media::Impl {
             }
             if (currentGeneration != activeGeneration)
                 continue;
+            if (currentRecovery != recovery.load())
+                continue;
             const auto wanted=unit.hevc?AV_CODEC_ID_HEVC:AV_CODEC_ID_H264;
             if(wanted!=activeCodec) {
                 av_frame_unref(frame);av_frame_unref(cpu);av_packet_unref(packet);
                 sws_freeContext(sws);sws=nullptr;
                 if(!openDecoder(ctx,wanted)) {decoderFailed=true;goto done;}
                 activeCodec=wanted;
+                receiveEofLogged=false;
                 std::lock_guard lock(mutex);
-                if(currentGeneration!=generation.load()) continue;
+                if(!mediaPublishAllowed(currentGeneration,generation.load(),
+                                        currentRecovery,recovery.load())) continue;
                 presentationSkipped+=ready.size();resetPlayout();
-                havePlayoutClock=false;codecText=unit.hevc?"H.265 Main":"H.264";
+                codecText=unit.hevc?"H.265 Main":"H.264";
             }
             uu_cpu_mark(1);
             av_packet_unref(packet);
@@ -799,12 +863,47 @@ struct Media::Impl {
                     const auto frameReceived=std::chrono::steady_clock::now();
                     recvNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                                frameReceived-receiveStarted).count();
-                    if(receiveResult!=0) break;
+                    const auto disposition=classifyReceiveResult(receiveResult,AVERROR(EAGAIN),AVERROR_EOF);
+                    if(disposition==ReceiveDisposition::Again) break;
+                    if(disposition==ReceiveDisposition::Eof) {
+                        if(!receiveEofLogged) {
+                            char message[96];
+                            std::snprintf(message,sizeof message,"video-receive-eof-generation-%llu",
+                                static_cast<unsigned long long>(currentGeneration));
+                            diagnostic(message);
+                            receiveEofLogged=true;
+                        }
+                        break;
+                    }
+                    if(disposition==ReceiveDisposition::Error) {
+                        const bool current=mediaPublishAllowed(currentGeneration,generation.load(),
+                                                               currentRecovery,recovery.load());
+                        if(current) {
+                            {
+                                std::lock_guard lock(mutex);
+                                if(mediaPublishAllowed(currentGeneration,generation.load(),
+                                                       currentRecovery,recovery.load())) {
+                                    ++decodeErrors;
+                                    keyframeRequested=true;
+                                }
+                            }
+                            char message[128];
+                            std::snprintf(message,sizeof message,
+                                "video-receive-error-code-%d-generation-%llu-recovery-%llu",
+                                receiveResult,
+                                static_cast<unsigned long long>(currentGeneration),
+                                static_cast<unsigned long long>(currentRecovery));
+                            diagnostic(message);
+                        }
+                        break;
+                    }
+                    receiveEofLogged=false;
                     StageTimer publishTimer(publishNs,frameReceived);
                     bool validEpoch=false;
                     {
                         std::lock_guard lock(mutex);
-                        validEpoch=currentGeneration==generation.load();
+                        validEpoch=mediaPublishAllowed(currentGeneration,generation.load(),
+                                                       currentRecovery,recovery.load());
                         if(validEpoch) {
                             ++decodedTotal;
 #ifdef __SWITCH__
@@ -818,7 +917,8 @@ struct Media::Impl {
                     const bool damaged = frame->decode_error_flags != 0;
                     if (damaged) {
                         std::lock_guard lock(mutex);
-                        if(currentGeneration==generation.load()) {
+                        if(mediaPublishAllowed(currentGeneration,generation.load(),
+                                               currentRecovery,recovery.load())) {
                             ++decodeErrors;
                             keyframeRequested = true;
                         }
@@ -829,12 +929,14 @@ struct Media::Impl {
                         av_frame_unref(cpu);
                         {
                             std::lock_guard lock(mutex);
-                            if(currentGeneration==generation.load()) ++cpuTransfers;
+                            if(mediaPublishAllowed(currentGeneration,generation.load(),
+                                                   currentRecovery,recovery.load())) ++cpuTransfers;
                         }
                         if (av_hwframe_transfer_data(cpu, frame, 0) < 0) {
                             {
                                 std::lock_guard lock(mutex);
-                                if(currentGeneration==generation.load()) {
+                                if(mediaPublishAllowed(currentGeneration,generation.load(),
+                                                       currentRecovery,recovery.load())) {
                                     ++decodeErrors;
                                     keyframeRequested = true;
                                 }
@@ -858,7 +960,8 @@ struct Media::Impl {
                     bool show=false;
                     {
                         std::lock_guard lock(mutex);
-                        show=currentGeneration==generation.load() &&
+                        show=mediaPublishAllowed(currentGeneration,generation.load(),
+                                                  currentRecovery,recovery.load()) &&
                             (!damaged || (!strictReceiver_ && (cleanFrames==0 || now-lastFrameMs.load()>2000)));
                     }
                     if (show) {
@@ -923,8 +1026,9 @@ struct Media::Impl {
                         }
                         if(converted) {
                             std::lock_guard lock(mutex);
-                            if (currentGeneration == generation.load()) {
-                                if (diag_ && (!diagnosticPicture_.pixels || serial == 60))
+                            if (mediaPublishAllowed(currentGeneration,generation.load(),
+                                                     currentRecovery,recovery.load())) {
+                                if (diag_ && p.pixels && (!diagnosticPicture_.pixels || serial == 60))
                                     diagnosticPicture_ = p;
                                 p.serial = ++serial;
                                 ++publishedTotal;
@@ -978,7 +1082,8 @@ struct Media::Impl {
                 drain();
             else {
                 std::lock_guard lock(mutex);
-                if(currentGeneration==generation.load()) {
+                if(mediaPublishAllowed(currentGeneration,generation.load(),
+                                       currentRecovery,recovery.load())) {
                     ++decodeErrors;
                     keyframeRequested = true;
                 }
@@ -988,7 +1093,8 @@ struct Media::Impl {
                                           .count();
             const double millis = double(decodeMicros) / 1000.0;
             std::lock_guard lock(mutex);
-            if(currentGeneration!=generation.load()) continue;
+            if(!mediaPublishAllowed(currentGeneration,generation.load(),
+                                     currentRecovery,recovery.load())) continue;
             atomicMax(decodeMaxUs, uint64_t(std::max<int64_t>(0,decodeMicros)));
             if(decodeMicros>8000) ++decodeGt8;
             if(decodeMicros>16000) ++decodeGt16;
@@ -1044,10 +1150,10 @@ void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::op
         if (impl_->queue.size() >= maxQueuedFrames || bytesLimit) {
             impl_->droppedUnits += impl_->queue.size();
             impl_->queue.clear();impl_->queueBytes=0;
+            ++impl_->recovery;
             impl_->clear = true;
             impl_->keyframeRequested = true;
             impl_->presentationSkipped+=impl_->ready.size();impl_->resetPlayout();
-            impl_->havePlayoutClock=false;
         }
         int64_t extended=AV_NOPTS_VALUE;
         if(timestamp) {
@@ -1063,22 +1169,99 @@ void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::op
     }
     impl_->cv.notify_one();
 }
-void Media::audio(const uint8_t *data, size_t size, uint64_t generation) {
+namespace {
+int opusFrameSamples(int samples) {
+    switch (samples) {
+    case 120: case 240: case 480: case 960: case 1920: case 2880: return samples;
+    default: return 960;
+    }
+}
+}
+void Media::Impl::resetAudioSchedule() {
+    audioHold.clear();
+    audioAnchored=false;audioHaveClock=false;audioHavePlay=false;
+    audioAnchorRtp=audioAnchorDueMs=audioExtendedRtp=audioPlayRtp=0;
+    audioLastRtp32=0;audioFrameSamples=960;
+}
+void Media::Impl::queueAudioPcm(int samples) {
+    if(samples<=0 || !audioDevice) return;
+    const int volume=volumePercent.load();
+    if(volume!=100) for(int i=0;i<samples*2;++i) audioPcm[size_t(i)]=int16_t(int(audioPcm[size_t(i)])*volume/100);
+    // A device queue past 200 ms is already late. Drop this frame and leave
+    // the samples that are still playing.
+    if(SDL_GetQueuedAudioSize(audioDevice) > 48000u * 4u / 5u) return;
+    audioStatus=SDL_QueueAudio(audioDevice,audioPcm.data(),Uint32(samples*4))==0 ?
+        AudioStatus::Ready : AudioStatus::QueueFailed;
+}
+void Media::Impl::concealAudioUntil(int64_t rtp) {
+    const int frame=opusFrameSamples(audioFrameSamples);
+    if(!audioHavePlay) {
+        audioPlayRtp=rtp;audioHavePlay=true;return;
+    }
+    if(rtp<=audioPlayRtp+frame/2) return;
+    int concealed=0;
+    while(audioPlayRtp+frame/2<rtp && concealed<frame*3) {
+        const int samples=opus_decode(opus,nullptr,0,audioPcm.data(),frame,0);
+        if(samples<=0) break;
+        queueAudioPcm(samples);
+        audioPlayRtp+=samples;concealed+=samples;audioFrameSamples=samples;
+    }
+    if(rtp-audioPlayRtp>opusFrameSamples(audioFrameSamples)) {
+        opus_decoder_ctl(opus,OPUS_RESET_STATE);
+        audioPlayRtp=rtp;
+    }
+}
+void Media::Impl::releaseAudio() {
+    const auto now=mediaClockMs();
+    while(!audioHold.empty()) {
+        const auto it=audioHold.begin();
+        const int64_t due=audioAnchorDueMs+(it->first-audioAnchorRtp)*1000/48000;
+        if(due>now) break;
+        const int frame=opusFrameSamples(audioFrameSamples);
+        if(audioHavePlay && it->first+frame/2<audioPlayRtp) {audioHold.erase(it);continue;}
+        concealAudioUntil(it->first);
+        const int samples=opus_decode(opus,it->second.data(),int(it->second.size()),audioPcm.data(),5760,0);
+        if(samples>0) {
+            audioFrameSamples=samples;
+            queueAudioPcm(samples);
+            audioPlayRtp=it->first+samples;audioHavePlay=true;
+        }
+        audioHold.erase(it);
+    }
+    while(audioHold.size()>16) audioHold.erase(audioHold.begin());
+}
+void Media::Impl::ingestAudio(const uint8_t *data, size_t size, std::optional<uint32_t> timestamp) {
+    if(!timestamp) {
+        const int samples=opus_decode(opus,data,int(size),audioPcm.data(),5760,0);
+        if(samples>0) {audioFrameSamples=samples;queueAudioPcm(samples);}
+        return;
+    }
+    int64_t extended;
+    if(!audioHaveClock) {
+        audioHaveClock=true;audioLastRtp32=*timestamp;audioExtendedRtp=int64_t(*timestamp);extended=audioExtendedRtp;
+    } else {
+        const int32_t delta=int32_t(*timestamp-audioLastRtp32);
+        audioLastRtp32=*timestamp;audioExtendedRtp+=delta;extended=audioExtendedRtp;
+    }
+    const int frame=opusFrameSamples(audioFrameSamples);
+    if(audioHavePlay && extended+frame/2<audioPlayRtp) return;
+    if(!audioAnchored) {
+        audioAnchored=true;audioAnchorRtp=extended;audioAnchorDueMs=mediaClockMs()+audioDelayMs;
+    } else if(!audioHavePlay && extended<audioAnchorRtp) {
+        audioAnchorDueMs-=(audioAnchorRtp-extended)*1000/48000;audioAnchorRtp=extended;
+        const auto now=mediaClockMs();
+        if(audioAnchorDueMs<now) audioAnchorDueMs=now;
+    }
+    if(!audioHold.count(extended)) audioHold.emplace(extended,std::vector<uint8_t>(data,data+size));
+    releaseAudio();
+}
+void Media::audio(const uint8_t *data, size_t size, uint64_t generation, std::optional<uint32_t> timestamp) {
     if (!size || size > 4096)
         return;
     std::lock_guard lock(impl_->audioMutex);
     if (generation != impl_->generation.load())
         return;
-    std::array<int16_t, 5760 * 2> pcm{};
-    int samples = opus_decode(impl_->opus, data, int(size), pcm.data(), 5760, 0);
-    if (samples > 0 && impl_->audioDevice) {
-        const int volume=impl_->volumePercent.load();
-        if(volume!=100)for(int i=0;i<samples*2;++i)pcm[size_t(i)]=int16_t(int(pcm[size_t(i)])*volume/100);
-        if (SDL_GetQueuedAudioSize(impl_->audioDevice) > 48000 * 4 / 5)
-            SDL_ClearQueuedAudio(impl_->audioDevice);
-        impl_->audioStatus=SDL_QueueAudio(impl_->audioDevice,pcm.data(),samples*4)==0 ?
-            Impl::AudioStatus::Ready:Impl::AudioStatus::QueueFailed;
-    }
+    impl_->ingestAudio(data, size, timestamp);
 }
 Picture Media::picture(uint64_t after, int presentationLeadMs) {
     std::lock_guard lock(impl_->mutex);
@@ -1092,13 +1275,19 @@ void Media::setNativeOutput(bool enabled) { impl_->nativeOutput.store(enabled); 
 void Media::setPlayoutDelay(int milliseconds) {
     std::lock_guard lock(impl_->mutex);
     milliseconds=std::clamp(milliseconds,0,100);
-    if(impl_->playoutDelayMs==milliseconds && impl_->pacing) return;
+    if(impl_->playoutDelayMs==milliseconds) return;
+    const int previous=impl_->playoutDelayMs;
     const auto now=mediaClockMs();
     for(const auto &p:impl_->ready) impl_->tracePicture(p,now,"settings_changed");
     impl_->presentationSkipped+=impl_->ready.size();
     impl_->resetPlayout();
-    impl_->pacing=true;impl_->playoutDelayMs=milliseconds;
-    impl_->havePlayoutClock=false;
+    // Delay is a presentation setting; pacing remains independently controlled
+    // by frame_pacing (Impl::pacing). Do not turn pacing on from this setter.
+    impl_->playoutDelayMs=milliseconds;
+    std::lock_guard audioLock(impl_->audioMutex);
+    impl_->audioDelayMs=milliseconds;
+    if(impl_->audioAnchored) impl_->audioAnchorDueMs+=milliseconds-previous;
+    impl_->releaseAudio();
 }
 void Media::reset() {
     const Uint32 resetStarted=SDL_GetTicks();
@@ -1109,6 +1298,7 @@ void Media::reset() {
         // No codec wait, file I/O or image conversion under the shared lock.
         diagnosticDump=impl_->takeDiagnostics();
         impl_->generation.fetch_add(1);
+        ++impl_->recovery;
         impl_->auDump_.clear();
         impl_->auCount_ = 0;
         impl_->diagnosticPicture_ = {};
@@ -1118,7 +1308,7 @@ void Media::reset() {
         impl_->queue.clear();
         impl_->latest = {};
         impl_->resetPlayout();
-        impl_->haveInputTimestamp=false;impl_->havePlayoutClock=false;
+        impl_->haveInputTimestamp=false;
         impl_->lastPresentedTimestamp=AV_NOPTS_VALUE;
         impl_->presentationSkipped=0;impl_->clockResets=0;impl_->missingTimestamps=0;
         impl_->pictureEmpty=0;impl_->pictureEmptyNoReady=0;impl_->pictureEmptyFuture=0;
@@ -1126,9 +1316,6 @@ void Media::reset() {
         impl_->selectedAgeTotalMs=0;impl_->selectedAgeSamples=0;impl_->selectedAgeMaxMs=0;
         impl_->decodeToQueueTotalMs=0;impl_->queueWaitTotalMs=0;impl_->ageBreakdownSamples=0;
         impl_->skipDue=0;impl_->skipBound=0;impl_->selectedLateMs=0;
-        impl_->framePeriodMs=16.667;impl_->cadenceTimestamp=AV_NOPTS_VALUE;
-        impl_->smoothedTimestamp=AV_NOPTS_VALUE;impl_->smoothedDueMs=0;
-        impl_->smoothedFrames=0;impl_->maxDueShiftMs=0;
         impl_->playoutTrace.clear();
         impl_->clear = true;
         impl_->width = 0;
@@ -1154,9 +1341,7 @@ void Media::reset() {
         impl_->hintedCodecPublished_=false;
         impl_->encoderText = "—";
     }
-    if(!diagnosticDump.playoutTrace.empty() || !diagnosticDump.auDump_.empty()) {
-        uu::backgroundTask([dump=std::move(diagnosticDump)] { Impl::writeDiagnostics(dump); });
-    }
+    impl_->queueDiagnostics(std::move(diagnosticDump));
     diagnostic(("media-reset-flush-ms-"+std::to_string(SDL_GetTicks()-resetStarted)).c_str());
     diagnostic(("media-reset-trace-queued-ms-"+std::to_string(SDL_GetTicks()-resetStarted)).c_str());
     impl_->cv.notify_one();
@@ -1190,6 +1375,7 @@ void Media::reset() {
     std::unique_lock audioLock(impl_->audioMutex);
     diagnostic(("media-reset-audio-lock-ms-"+std::to_string(SDL_GetTicks()-audioLockStarted)).c_str());
     const Uint32 audioClearStarted=SDL_GetTicks();
+    impl_->resetAudioSchedule();
     if (impl_->audioDevice)
         SDL_ClearQueuedAudio(impl_->audioDevice);
     diagnostic(("media-reset-audio-clear-ms-"+std::to_string(SDL_GetTicks()-audioClearStarted)).c_str());

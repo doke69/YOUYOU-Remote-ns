@@ -407,63 +407,6 @@ void recordSelectedPath(const std::string &summary) {
     std::ofstream file(dir+"/selected_path.txt");
     file << summary;
 }
-void saveQuality(int width, int height, int fps, int quality, bool vsync, int playoutDelay, int maxBitrateMbps, bool hevc) {
-#ifdef __SWITCH__
-    const std::string path = "sdmc:/switch/UURemote-ns/config.ini";
-#else
-    const std::string path = "config.ini";
-#endif
-    std::ifstream input(path);
-    std::string line, retained, framePacing = "1";
-    while (std::getline(input, line)) {
-        const auto key = trim(line.substr(0, line.find('=')));
-        if (key == "frame_pacing") {
-            const auto value = trim(line.substr(line.find('=') + 1));
-            framePacing = value == "0" ? "0" : "1";
-            continue;
-        }
-        if (key != "width" && key != "height" && key != "fps" && key != "quality" && key != "vsync" &&
-            key != "playout_delay_ms" && key != "max_bitrate_mbps" && key != "video_codec") retained += line + '\n';
-    }
-    input.close();
-    std::ofstream output(path + ".quality-tmp", std::ios::trunc);
-    output << retained << "width=" << width << "\nheight=" << height << "\nfps=" << fps << "\nquality=" << quality << '\n';
-    output << "vsync=" << (vsync ? 1 : 0) << '\n';
-    output << "frame_pacing=" << framePacing << "\nplayout_delay_ms=" << playoutDelay << '\n';
-    output << "max_bitrate_mbps=" << maxBitrateMbps << '\n';
-    output << "video_codec=" << (hevc?"hevc":"h264") << '\n';
-    output.close();
-    if (!output) throw std::runtime_error("画质设置保存失败");
-    const auto backup = path + ".bak";
-    std::ifstream existing(path);
-    const bool hadConfig = bool(existing);
-    existing.close();
-    if (hadConfig) {
-        // Keep exactly one fixed backup; the old timestamped copies are no
-        // longer generated. Remove any previous backup before replacing it.
-        std::remove(backup.c_str());
-        if (std::rename(path.c_str(), backup.c_str()) != 0)
-            throw std::runtime_error("画质设置保存失败");
-    }
-    if (std::rename((path + ".quality-tmp").c_str(), path.c_str()) != 0) {
-        if (hadConfig) std::rename(backup.c_str(), path.c_str());
-        throw std::runtime_error("画质设置保存失败，已尝试恢复原配置");
-    }
-#ifdef __SWITCH__
-    // Remove legacy timestamped backups left by earlier builds. Only the fixed
-    // config.ini.bak remains.
-    if (DIR *dir = opendir("sdmc:/switch/UURemote-ns")) {
-        const std::string prefix = "config.ini.before-quality-";
-        while (auto *entry = readdir(dir)) {
-            const std::string name = entry->d_name;
-            if (name.rfind(prefix, 0) == 0)
-                std::remove(("sdmc:/switch/UURemote-ns/" + name).c_str());
-        }
-        closedir(dir);
-    }
-#endif
-    ConfigStore::instance().reload();
-}
 } // namespace
 void Client::saveIceDiagnostics() {
     if(!diagEnabled() || !iceDiagnostics_.is_object()) return;
@@ -540,8 +483,8 @@ Client::Client(std::string key, std::string client, std::shared_ptr<Media> media
     state_.vsync = configInt("vsync",1,0,1) != 0;
     state_.playoutDelayMs = configInt("playout_delay_ms",8,0,100);
     // Media reads config.ini independently. Apply the 8 ms fallback only when
-    // the key is absent and pacing is enabled, preserving saved values and an
-    // explicit frame_pacing=0 (setPlayoutDelay would otherwise force pacing on).
+    // the key is absent and pacing is enabled; setPlayoutDelay only updates the
+    // delay and frame_pacing owns whether pacing is enabled.
     if(configValue("playout_delay_ms").empty() && configInt("frame_pacing",1,0,1)!=0)
         media_->setPlayoutDelay(state_.playoutDelayMs);
     autoReconnect_=configInt("auto_reconnect",1,0,1)!=0;
@@ -575,6 +518,12 @@ void Client::post(std::string type, Json data, uint64_t generation) {
 void Client::command(const std::string &name, Json data) {
     if (name == "disconnect" || name == "logout" || name == "cancel" || name == "sms-open" || name == "login")
         cancel_ = true;
+    if (isPeerInputCommand(name)) {
+        if (tryEnqueuePeerInput(inbox_->mutex, inbox_->inputAdmission, inbox_->events,
+                                Event{name, std::move(data), 0}))
+            inbox_->cv.notify_one();
+        return;
+    }
     post(name, std::move(data));
 }
 void Client::drainEvents() {
@@ -740,33 +689,53 @@ void Client::handle(const Event &event) {
         const int syncWidth=data.value("width",0),syncHeight=data.value("height",0);
         const int64_t syncBitrate=data.value("bitrate",int64_t(0));
         const int syncMbps=int(syncBitrate>0?(syncBitrate+500000)/1000000:0);
-        const int targetFps=pendingQuality_?pendingQuality_->target.fps:streamFps_;
-        const int targetQuality=pendingQuality_?pendingQuality_->target.quality:streamQuality_;
-        const int targetWidth=pendingQuality_?pendingQuality_->target.width:streamWidth_;
-        const int targetHeight=pendingQuality_?pendingQuality_->target.height:streamHeight_;
-        const int targetCap=pendingQuality_?pendingQuality_->target.cap:maxBitrateMbps_;
-        const bool complete=hasFps && hasQuality && hasWidth && hasHeight;
-        const bool matches=complete &&
-            syncFps==targetFps && syncQuality==targetQuality &&
-            syncWidth==targetWidth && syncHeight==targetHeight &&
-            (!hasBitrate || !targetCap || syncMbps==targetCap);
+        const QualityValues *pendingTarget=pendingQuality_?&pendingQuality_->target:
+            (pendingQualityApply_?&pendingQualityApply_->target:nullptr);
+        const int targetFps=pendingTarget?pendingTarget->fps:streamFps_;
+        const int targetQuality=pendingTarget?pendingTarget->quality:streamQuality_;
+        const int targetWidth=pendingTarget?pendingTarget->width:streamWidth_;
+        const int targetHeight=pendingTarget?pendingTarget->height:streamHeight_;
+        const int targetCap=pendingTarget?pendingTarget->cap:maxBitrateMbps_;
+        const QualityApplicationTarget target{targetWidth,targetHeight,targetFps,targetQuality,targetCap};
+        // Evidence is accumulated for the lifetime of the current request.
+        // Split sync messages can therefore jointly prove a complete match.
+        if(hasFps)qualityApply_.evidence.observeFps(syncFps);
+        if(hasQuality)qualityApply_.evidence.observeQuality(syncQuality);
+        if(hasWidth)qualityApply_.evidence.observeWidth(syncWidth);
+        if(hasHeight)qualityApply_.evidence.observeHeight(syncHeight);
+        if(hasBitrate)qualityApply_.evidence.observeBitrate(syncMbps);
+        if(qualityApply_.evidence.anyKnown())qualityApply_.accept();
+        const bool awaitingConfirmation=bool(pendingQuality_ || pendingQualityApply_);
+        const uint64_t pendingId=qualityApply_.pending?qualityApply_.pendingRequestId:0;
+        const bool matches=qualityApply_.evaluate(target);
+        uint64_t applyConfirmedId=matches?pendingId:0;
+        if(matches)pendingQualityApply_.reset();
         {
             std::lock_guard lock(stateMutex_);
-            if(hasFps)state_.appliedFps=syncFps;
-            if(hasQuality)state_.appliedQuality=syncQuality;
-            if(hasWidth)state_.appliedWidth=syncWidth;
-            if(hasHeight)state_.appliedHeight=syncHeight;
-            if(hasBitrate){state_.appliedBitrateMbps=syncMbps;state_.appliedBitrateKnown=true;}
-            state_.appliedValid=syncFields!=0;
+            const auto &evidence=qualityApply_.evidence;
+            state_.appliedFps=evidence.fps;state_.appliedFpsKnown=evidence.fpsKnown;
+            state_.appliedQuality=evidence.quality;state_.appliedQualityKnown=evidence.qualityKnown;
+            state_.appliedWidth=evidence.width;state_.appliedWidthKnown=evidence.widthKnown;
+            state_.appliedHeight=evidence.height;state_.appliedHeightKnown=evidence.heightKnown;
+            state_.appliedBitrateMbps=evidence.bitrateMbps;
+            state_.appliedBitrateKnown=evidence.bitrateKnown;
+            state_.appliedValid=evidence.anyKnown();
             if(state_.appliedValid){
                 state_.settingAccepted=true;
-                // Partial sync is evidence for the fields it carries, not proof
-                // that the whole request was applied.
                 state_.settingApplied=matches;
+                state_.settingApplyPending=qualityApply_.pending;
                 state_.settingRejected=false;
                 state_.settingErrorCode=0;
                 state_.settingSource="sync";
             }
+        }
+        if(matches && awaitingConfirmation){
+            {
+                std::lock_guard lock(stateMutex_);
+                state_.qualityNotice="电脑已确认实际参数";
+            }
+            qualityNoticeUntil_=monotonicMs()+6000;
+            diagnostic(("quality-apply-confirmed-"+std::to_string(applyConfirmedId)).c_str());
         }
         diagnostic(("capture-setting-sync-fps-"+std::to_string(syncFps)+
                     "-quality-"+std::to_string(syncQuality)+
@@ -829,7 +798,9 @@ void Client::handle(const Event &event) {
             return;
         }
         const auto it=channels_.find("TEXT_DATA_CHANNEL");
-        if(it==channels_.end() || !it->second->isOpen() || it->second->bufferedAmount()>65536){
+        // A non-empty SCTP send buffer is normal queuing, not a failed
+        // request. Only a missing/closed channel is a pre-send failure.
+        if(it==channels_.end() || !it->second->isOpen()){
             reconnectQuality(target,"设置通道尚未就绪，正在重连应用…");return;
         }
         if(activeScreenId_<0){
@@ -865,15 +836,24 @@ void Client::handle(const Event &event) {
                     "-bps-"+std::to_string(quality==6?uint64_t(maxBitrate)*1000000u:0)+
                     "-quality-"+std::to_string(quality)).c_str());
         pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_,rpcKind,false};
+        pendingQualityApply_.reset();
+        qualityApply_.beginRequest();
         {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";
-         state_.settingAccepted=false;state_.settingApplied=false;state_.appliedValid=false;state_.settingRejected=false;
-         state_.settingErrorCode=0;state_.settingSource="pending";state_.appliedBitrateKnown=false;}
+         state_.settingAccepted=false;state_.settingApplied=false;state_.settingApplyPending=false;
+         state_.appliedValid=false;state_.settingRejected=false;
+         state_.settingErrorCode=0;state_.settingSource="pending";
+         state_.appliedFpsKnown=false;state_.appliedQualityKnown=false;
+         state_.appliedWidthKnown=false;state_.appliedHeightKnown=false;state_.appliedBitrateKnown=false;}
         try{
-            if(!it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
-                fallbackQuality("设置发送受阻，正在重连应用…");return;
+            const bool sent=it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+            // libdatachannel returns false when the message was accepted for
+            // queueing. Keep waiting for the matching ACK unless the channel
+            // actually closed during the send.
+            if(!sent && !it->second->isOpen()){
+                fallbackQuality("设置通道已关闭，正在重连应用…");return;
             }
             ++qualitySent_;
-            diagnostic((rpcMode+"-rpc-sent-"+std::to_string(id)).c_str());
+            diagnostic((rpcMode+"-rpc-"+(sent?"sent-":"queued-")+std::to_string(id)).c_str());
         }catch(...){fallbackQuality("设置发送失败，正在重连应用…");}
     } else if(e=="quality-rpc-ack") {
         if(pendingVideoScale_ && data.at("id").get<uint64_t>()==pendingVideoScale_->id){
@@ -902,9 +882,12 @@ void Client::handle(const Event &event) {
                     "-other-"+std::to_string(other)).c_str());
         if(errors || other){
             diagnostic("quality-rpc-response-not-accepted");
+            pendingQualityApply_.reset();
+            qualityApply_.beginRequest();
             {
                 std::lock_guard lock(stateMutex_);
                 state_.settingAccepted=false;state_.settingApplied=false;
+                state_.settingApplyPending=false;
                 state_.settingRejected=true;state_.settingErrorCode=data.value("code",0);
                 state_.settingSource="ack";
             }
@@ -938,13 +921,18 @@ void Client::handle(const Event &event) {
                         QualityRpcKind::QualityOnly,true};
                     {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在重试兼容设置…";state_.appliedValid=false;}
                     auto channel=channels_.find("TEXT_DATA_CHANNEL");
-                    if(channel==channels_.end() || !channel->second->isOpen() ||
-                       !channel->second->send(reinterpret_cast<const std::byte *>(retry.data()),retry.size())){
+                    if(channel==channels_.end() || !channel->second->isOpen()){
                         fallbackQuality("兼容设置通道不可用，正在重连应用…");return;
                     }
-                    ++qualitySent_;
-                    diagnostic(("setting-unsupported-fallback-quality-update-"+
-                                std::to_string(retryId)).c_str());
+                    try{
+                        const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(retry.data()),retry.size());
+                        if(!sent && !channel->second->isOpen()){
+                            fallbackQuality("兼容设置通道已关闭，正在重连应用…");return;
+                        }
+                        ++qualitySent_;
+                        diagnostic(("setting-unsupported-fallback-quality-update-"+
+                                    std::to_string(retryId)+(sent?"-sent":"-queued")).c_str());
+                    }catch(...){fallbackQuality("兼容设置发送失败，正在重连应用…");}
                     return;
                 }
             }
@@ -955,10 +943,13 @@ void Client::handle(const Event &event) {
         // acknowledgment, not evidence of actual encoder FPS or quality.
         pendingQuality_->headerOnly=!capture;
         ++qualityAcked_;pendingQuality_->acknowledged=true;pendingQuality_->deadline=monotonicMs()+5000;
+        qualityApply_.acknowledge();
         {
             std::lock_guard lock(stateMutex_);
             state_.settingAccepted=true;
-            if(!state_.appliedValid)state_.settingApplied=false;
+            // ACK updates acceptance only. It must not erase field evidence
+            // already received for this request; finishQuality decides whether
+            // a separate apply-confirmation window is still needed.
             state_.settingRejected=false;state_.settingErrorCode=0;
             state_.settingSource="ack";
         }
@@ -1185,6 +1176,10 @@ void Client::handle(const Event &event) {
                 diagnostic("rtc-keyframe-initial");
             }
             setState("connected", "");
+            {
+                std::lock_guard lock(inbox_->mutex);
+                openInputAdmission(inbox_->inputAdmission, generation_);
+            }
         } else if (s == int(rtc::PeerConnection::State::Failed) ||
                    s == int(rtc::PeerConnection::State::Disconnected) ||
                    s == int(rtc::PeerConnection::State::Closed)) {
@@ -1566,9 +1561,9 @@ void Client::beginPeer(const Json &result) {
     audioSession->addToChain(audioStats);
     audio_->setMediaHandler(opus);
     audioStats_ = audioStats;
-    audio_->onFrame([media, mediaGeneration](rtc::binary data, rtc::FrameInfo) {
+    audio_->onFrame([media, mediaGeneration](rtc::binary data, rtc::FrameInfo info) {
         if (auto m = media.lock())
-            m->audio(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration);
+            m->audio(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration, info.timestamp);
     });
     diagnostic("rtc-channels");
     for (const auto *label : {"CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
@@ -1910,6 +1905,13 @@ void Client::disconnect() {
     const auto disconnectStarted=monotonicMs();
     diagnostic("disconnect");
 
+    // Close admission before the direct release below. Old input events already
+    // in the queue carry the old generation and are dropped by drainEvents.
+    {
+        std::lock_guard lock(inbox_->mutex);
+        closeInputAdmission(inbox_->inputAdmission);
+    }
+
     // Only clear the scheduled reconnect time, not the armed flag.
     // reconnectArmed_ is set when user initiates connection and should persist
     // through disconnect to allow automatic reconnection on transient failures.
@@ -1922,9 +1924,11 @@ void Client::disconnect() {
     feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
 #endif
     pendingQuality_.reset();
+    pendingQualityApply_.reset();
+    qualityApply_.beginRequest();
     pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
     setVideoScaleNotice("");
-    {std::lock_guard lock(stateMutex_);state_.qualityPending=false;}
+    {std::lock_guard lock(stateMutex_);state_.qualityPending=false;state_.settingApplyPending=false;}
     connectedSince_=0;
     if (strictVideo_)
         strictVideo_->shutdown();
@@ -1953,7 +1957,7 @@ void Client::disconnect() {
     }
     diagnostic(("disconnect-stage-peer-close-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
     video_.reset();
-    rembAvailable_=false;bitrateFeedbackSent_=false;lastBitrateAttempt_=0;
+    rembAvailable_=false;bitrateFeedbackSent_=false;rembTargetBps_=0;lastBitrateAttempt_=0;
     turnBridges_.clear();
     strictVideo_.reset();
     videoAssembler_.reset();
@@ -1979,9 +1983,12 @@ void Client::disconnect() {
         state_.textChannelReady=false;
         state_.controlChannelReady=false;
         state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
+        state_.settingApplyPending=false;
         state_.settingErrorCode=0;state_.settingSource="none";
         state_.appliedFps=0;state_.appliedQuality=0;state_.appliedWidth=0;state_.appliedHeight=0;
         state_.appliedBitrateMbps=0;state_.appliedValid=false;state_.appliedBitrateKnown=false;
+        state_.appliedFpsKnown=false;state_.appliedQualityKnown=false;
+        state_.appliedWidthKnown=false;state_.appliedHeightKnown=false;
         state_.serverCapabilityValid=false;
         state_.serverDisplayInfo.clear();state_.serverCodecInfo.clear();
         state_.serverCaptureImpl.clear();state_.serverEncoderImpl.clear();state_.serverVideoTrack=-1;
@@ -1991,10 +1998,10 @@ void Client::disconnect() {
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
     if(hotCap && q.quality!=6 && (!video_ || !rembAvailable_ || q.cap<=0 || !video_->requestBitrate(unsigned(q.cap)*1000000u)))
         throw std::runtime_error("码率反馈更新失败");
-    // The four v0.2 UI presets use exact-rate encoding. Keep successful normal
-    // presets, while retaining session-only handling for high-bitrate probes.
-    const bool fixedUiPreset=q.quality==6 && (q.cap==5 || q.cap==12 || q.cap==20 || q.cap==30);
-    if(q.quality!=6 || fixedUiPreset)saveQuality(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+    // Persist the selected preset or the explicit custom ceiling. A custom
+    // ceiling is field 8 and is what the test menu writes.
+    if(q.quality!=6 || (q.cap>0 && q.cap<=100))
+        saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
     media_->setPlayoutDelay(q.delay);
     const bool sizeChanged=q.width!=streamWidth_ || q.height!=streamHeight_;
     streamWidth_=q.width;streamHeight_=q.height;streamFps_=q.fps;streamQuality_=q.quality;
@@ -2011,7 +2018,7 @@ void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice
     }
     qualityNoticeUntil_=monotonicMs()+8000;
     diagnostic(("quality-target-q"+std::to_string(q.quality)+"-cap"+std::to_string(q.cap)+
-                "-feedback"+(q.quality==6?"off":"on")).c_str());
+                "-feedback"+(q.quality==6?(q.cap>0?"custom":"off"):"on")).c_str());
 }
 void Client::reconnectQuality(const QualityValues &q,const char *notice) {
     const auto device=connectedDeviceId_;commitQuality(q,false,notice);disconnect();
@@ -2025,21 +2032,62 @@ void Client::finishQuality() {
         const char *notice=pendingQuality_->headerOnly
             ? "电脑已接收，等待实际状态"
             : "电脑已接受设置，等待实际参数确认";
+        const auto requestId=pendingQuality_->id;
+        const QualityApplicationTarget target{q.width,q.height,q.fps,q.quality,q.cap};
+        const bool alreadyConfirmed=qualityApply_.evaluate(target);
         commitQuality(q,q.quality!=6 && q.cap!=maxBitrateMbps_,notice);
+        if(alreadyConfirmed){
+            pendingQualityApply_.reset();
+            {
+                std::lock_guard lock(stateMutex_);
+                state_.settingApplied=true;
+                state_.settingApplyPending=false;
+                state_.settingSource="sync";
+                state_.qualityNotice="电脑已确认实际参数";
+            }
+            qualityNoticeUntil_=monotonicMs()+6000;
+            diagnostic(("quality-apply-confirmed-"+std::to_string(requestId)+"-before-ack-commit").c_str());
+        }else{
+            pendingQualityApply_=PendingQualityApply{q,requestId,monotonicMs()+5000};
+            qualityApply_.armConfirmation(requestId);
+            {
+                std::lock_guard lock(stateMutex_);
+                state_.settingApplyPending=true;
+                state_.settingApplied=false;
+                state_.settingSource="ack";
+                state_.qualityNotice=notice;
+            }
+        }
         diagnostic(pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
         pendingQuality_.reset();
     }catch(...){fallbackQuality("在线设置未完成，正在重连应用…");}
 }
 void Client::fallbackQuality(const char *notice) {
     if(!pendingQuality_)return;
-    const auto q=pendingQuality_->target;pendingQuality_.reset();++qualityFailed_;
+    const auto q=pendingQuality_->target;pendingQuality_.reset();pendingQualityApply_.reset();qualityApply_.beginRequest();++qualityFailed_;
+    {std::lock_guard lock(stateMutex_);state_.settingApplyPending=false;}
     diagnostic("quality-rpc-fallback-reconnect");reconnectQuality(q,notice);
 }
 void Client::tickQuality() {
+    const auto now=monotonicMs();
     if(pendingQuality_){
         finishQuality();
-        if(pendingQuality_ && monotonicMs()>=pendingQuality_->deadline)
+        if(pendingQuality_ && now>=pendingQuality_->deadline)
             fallbackQuality("在线设置超时，正在重连应用…");
+    }
+    if(pendingQualityApply_ && now>=pendingQualityApply_->deadline){
+        const auto requestId=pendingQualityApply_->id;
+        pendingQualityApply_.reset();
+        qualityApply_.timeout();
+        {
+            std::lock_guard lock(stateMutex_);
+            state_.settingApplied=false;
+            state_.settingApplyPending=false;
+            state_.settingSource="ack";
+            state_.qualityNotice="电脑已应答，但未确认实际参数";
+        }
+        qualityNoticeUntil_=now+8000;
+        diagnostic(("quality-apply-confirmation-timeout-"+std::to_string(requestId)).c_str());
     }
     if(qualityNoticeUntil_ && monotonicMs()>=qualityNoticeUntil_ && !pendingQuality_){
         std::lock_guard lock(stateMutex_);state_.qualityNotice.clear();qualityNoticeUntil_=0;
@@ -2047,6 +2095,7 @@ void Client::tickQuality() {
 }
 void Client::setVideoScaleNotice(const std::string &notice) {
     std::lock_guard lock(stateMutex_);
+    if (state_.videoScaleNotice == notice) return;
     state_.videoScaleNotice=notice;
 }
 void Client::tickVideoScale() {
@@ -2055,18 +2104,31 @@ void Client::tickVideoScale() {
     nextVideoScaleCheck_=now+250;
     const auto state=snapshot();
     if(!state.streaming || pendingQuality_)return;
+    const auto media=media_->stats();
+    if(media.width<=0 || media.height<=0) {
+        // A connected session with no decodable frame must not remain a silent
+        // black/old picture. The existing toolbar/disconnect path is the manual
+        // recovery entry; no automatic retry is started here.
+        if(connectedSince_ && now-connectedSince_>10000 && state.videoScaleNotice.empty())
+            setVideoScaleNotice("尚未收到可显示画面；可返回并手动重连");
+        return;
+    }
+    if((media.width>1920 || media.height>1080) && state.videoScaleNotice.empty())
+        setVideoScaleNotice("电脑画面超出1080p，正在等待缩放；可返回并手动重连");
+    if(!pendingVideoScale_ && media.width<=streamWidth_ && media.height<=streamHeight_ &&
+       !state.videoScaleNotice.empty())
+        setVideoScaleNotice("");
     const auto channel=channels_.find("TEXT_DATA_CHANNEL");
     if(channel==channels_.end() || !channel->second->isOpen())return;
     if(activeScreenId_<0)return;
 
     if(pendingVideoScale_){
         const auto &request=*pendingVideoScale_;
-        const auto media=media_->stats();
         if(request.acknowledged && media.epoch==request.mediaEpoch &&
            media.publishedTotal>request.publishedBefore && media.width>0 && media.height>0 &&
            media.width<=request.targetWidth && media.height<=request.targetHeight){
             videoScaleVerified_=true;pendingVideoScale_.reset();
-            setVideoScaleNotice("实际视频尺寸已缩放到上限");
+            setVideoScaleNotice("");
             diagnostic(("video-scale-verified-"+std::to_string(media.width)+"x"+
                         std::to_string(media.height)).c_str());
         }else if(now>=request.deadline){
@@ -2083,7 +2145,6 @@ void Client::tickVideoScale() {
     }
     if(videoScaleAttempted_){
         if(videoScaleVerified_){
-            const auto media=media_->stats();
             if(media.width>0 && media.height>0 &&
                (media.width>streamWidth_ || media.height>streamHeight_)){
                 videoScaleVerified_=false;
@@ -2096,11 +2157,9 @@ void Client::tickVideoScale() {
         }
         return;
     }
-    const auto media=media_->stats();
-    if(media.width<=0 || media.height<=0 || media.width>16384 || media.height>16384)return;
     if(media.width<=streamWidth_ && media.height<=streamHeight_){
         videoScaleAttempted_=true;videoScaleVerified_=true;
-        setVideoScaleNotice("视频尺寸已在目标范围内");
+        setVideoScaleNotice("");
         diagnostic(("video-scale-already-within-"+std::to_string(media.width)+"x"+
                     std::to_string(media.height)).c_str());
         return;
@@ -2127,21 +2186,33 @@ void Client::tickVideoScale() {
     }
 }
 void Client::applyBitrateCap() {
-    // A configured custom encoder ceiling must not masquerade as a
-    // fixed receiver bandwidth estimate. Keep normal RTCP reports/NACKs.
-    if(streamQuality_==6 || !video_ || !video_->isOpen() || maxBitrateMbps_<=0 || bitrateFeedbackSent_) return;
+    // Native presets keep a one-shot REMB and normally pass a zero cap, so
+    // they do not enter. Custom quality uses field 8 as the ceiling and
+    // announces that same ceiling as REMB. The session repeats the stored
+    // value on later sender reports. A later custom ceiling replaces it.
+    if(!video_ || !video_->isOpen() || maxBitrateMbps_<=0) return;
+    const unsigned target=unsigned(maxBitrateMbps_)*1000000u;
+    if(streamQuality_!=6 && bitrateFeedbackSent_) return;
+    if(streamQuality_==6 && bitrateFeedbackSent_ && rembTargetBps_==target) return;
     const auto now=monotonicMs();
     if(lastBitrateAttempt_ && now-lastBitrateAttempt_<1000) return;
     if(!rembAvailable_) {
-        if(!lastBitrateAttempt_) diagnostic("bitrate-cap-not-negotiated");
+        if(!lastBitrateAttempt_)
+            diagnostic(streamQuality_==6?"bitrate-cap-custom-not-negotiated":"bitrate-cap-not-negotiated");
         lastBitrateAttempt_=now;return;
     }
     lastBitrateAttempt_=now;
     try {
-        // bps. The session repeats this stored feedback on sender reports
-        // once the primary SSRC has been bound. Never send a zero REMB.
-        bitrateFeedbackSent_=video_->requestBitrate(unsigned(maxBitrateMbps_)*1000000u);
-        diagnostic(bitrateFeedbackSent_?"bitrate-cap-feedback-configured":"bitrate-cap-feedback-unavailable");
+        if(!video_->requestBitrate(target)) {
+            diagnostic("bitrate-cap-feedback-unavailable");
+            return;
+        }
+        bitrateFeedbackSent_=true;
+        rembTargetBps_=target;
+        if(streamQuality_==6)
+            diagnostic(("bitrate-cap-feedback-custom-bps-"+std::to_string(target)).c_str());
+        else
+            diagnostic("bitrate-cap-feedback-configured");
     } catch(...) {diagnostic("bitrate-cap-feedback-send-failed");}
 }
 void Client::refreshStats(int64_t now) {

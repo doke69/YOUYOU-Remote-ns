@@ -210,7 +210,7 @@ void homeHotkeys(SDL_Renderer *r,Fonts &f) {
     aligned(r,f.hint,"键鼠模式按一下；手柄模式长按",{797,565,376,28},label);
 }
 bool opensPage(int a) {
-    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||(a>=47 && a<=58)||a==70||a==613||(a>=74 && a<=76);
+    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||a==514||(a>=47 && a<=58)||a==70||a==613||(a>=74 && a<=76);
 }
 void loginHeader(SDL_Renderer *r,Fonts &f) {
     backdrop(r);brand(r,f);
