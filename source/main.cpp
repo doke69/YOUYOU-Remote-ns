@@ -848,8 +848,7 @@ int main(int, char **) {
                     if (state.streaming) {
                         const bool captureNetworkInput=captureMenuInput;
                         if (c.disconnect) {
-                            liveUi.restoreRemoteSoundOnDisconnect(state);
-                            client.command("disconnect",{{"graceMs",220}});
+                            client.command("disconnect",{{"restoreSound",liveUi.restoreRemoteSoundOnDisconnect(state)},{"deviceId",state.activeDeviceId}});
                             continue;
                         }
                         if(liveUi.gamepadMode()) {
@@ -886,8 +885,8 @@ int main(int, char **) {
                         }
 #ifdef __SWITCH__
                         for (auto [button, keycode] :
-                             std::initializer_list<std::pair<uint64_t, int>>{{HidNpadButton_A, 13},{HidNpadButton_B, 27},
-                                {HidNpadButton_X, liveUi.mapping()==1?0:32},{HidNpadButton_Y,liveUi.mapping()==1?0:8},
+                             std::initializer_list<std::pair<uint64_t, int>>{{HidNpadButton_B, 13},{HidNpadButton_A, 27},
+                                {HidNpadButton_Y, liveUi.mapping()==1?0:32},{HidNpadButton_X,liveUi.mapping()==1?0:8},
                                 {HidNpadButton_L,liveUi.mapping()==1?18:17},{HidNpadButton_R,liveUi.mapping()==1?9:18},
                                 {HidNpadButton_Up,liveUi.mapping()==1?17:38},{HidNpadButton_Down,liveUi.mapping()==1?16:40},
                                 {HidNpadButton_Left,liveUi.mapping()==1?8:37},{HidNpadButton_Right,liveUi.mapping()==1?46:39},
@@ -898,7 +897,7 @@ int main(int, char **) {
                         }
                         for (auto [button, mouse] : std::initializer_list<std::pair<uint64_t, int>>{
                                  {HidNpadButton_ZR, liveUi.mapping()==1?0:1}, {HidNpadButton_ZL, liveUi.mapping()==1?0:2},
-                                 {HidNpadButton_X,liveUi.mapping()==1?1:0},{HidNpadButton_Y,liveUi.mapping()==1?2:0}})
+                                 {HidNpadButton_Y,liveUi.mapping()==1?1:0},{HidNpadButton_X,liveUi.mapping()==1?2:0}})
                             if (mouse && (c.held & button) != (lastHeld & button))
                                 send({{"action", (c.held & button) ? "mouse_press" : "mouse_release"},
                                       {"button", mouse}});
@@ -1140,8 +1139,11 @@ int main(int, char **) {
                             text(renderer, fonts.normal, "等待电脑发送画面...", 470, 330, muted);
 
                         if (overlay) {
-                            std::string hints =
-                                "左摇杆 鼠标  ·  ZR/ZL 点击  ·  A 确认  ·  B Esc";
+                            std::string hints = liveUi.gamepadMode()
+                                ? "手柄直连  ·  长按 − 切换模式  ·  长按 + 打开菜单"
+                                : liveUi.mapping()==1
+                                    ? "左摇杆 鼠标  ·  Y/X 左右键  ·  B 回车  ·  A Esc"
+                                    : "右摇杆 鼠标  ·  ZR/ZL 左右键  ·  B 回车  ·  A Esc";
 #ifdef __SWITCH__
                             if (appletGetOperationMode() == AppletOperationMode_Console)
                                 hints += "  ·  TV 模式触屏不可用";
@@ -1150,8 +1152,11 @@ int main(int, char **) {
                             text(renderer, fonts.normal, "YOUYOU远程", 28, 18);
                             text(renderer, fonts.small, hints, 200, 24, muted);
                             rect(renderer, 0, 650, 1280, 70, {13, 19, 25, 225});
-                            text(renderer, fonts.small,
-                                 "方向键 WASD  ·  X 空格  ·  Y Tab  ·  L Ctrl  ·  R Shift  ·  L3 画质设置",
+                            text(renderer, fonts.small, liveUi.gamepadMode()
+                                 ? "按 + 游戏菜单  ·  长按 + 本地菜单  ·  长按 − 切换模式"
+                                 : liveUi.mapping()==1
+                                     ? "方向键 Ctrl/Shift/退格/Delete  ·  L3 键盘  ·  短按 − Windows"
+                                     : "方向键 上/下/左/右  ·  Y 空格  ·  X 退格  ·  L3 键盘  ·  短按 − Tab",
                                  28, 665, muted);
                             text(renderer, fonts.small, media->status()+"  ·  垂直同步 "+(actualVsync?"开":"关"), 28, 694, muted);
                         }

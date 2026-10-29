@@ -144,10 +144,8 @@ class LiveFrontend {
         for(auto action:uu::remoteSoundActions(remoteMute,restoreSound))
             safetyAction(action,s,std::nullopt,quiet);
     }
-    void restoreRemoteSound(const uu::Snapshot &s){
-        if(!remoteMute || !restoreSound || !s.streaming || !s.controlChannelReady ||
-           s.activeDeviceId.empty())return;
-        safetyAction(16,s,std::nullopt,true);
+    bool shouldRestoreRemoteSound(const uu::Snapshot &s) const {
+        return remoteMute && restoreSound && s.streaming && !s.activeDeviceId.empty();
     }
     void push(Page p){touchTarget=-1;touchDown=false;hit=-1;stack.push_back({p,0});notice.clear();}
     void back(){
@@ -214,8 +212,8 @@ class LiveFrontend {
         if(page==Page::Resolution && a!=99){resolution=a-400;applyQuality(s);back();return;}
         if(page==Page::Codec && a!=99){codec=a-500;applyQuality(s);back();return;}
         if(page==Page::QualityPreset && a>=510 && a<=513){quality=a-510;customQuality=false;legacyQuality=false;requestedCap=0;applyQuality(s);back();return;}
-        if(page==Page::Bitrate && a>=820 && a<=825){
-            static constexpr int choices[]={8,15,20,30,40,50};
+        if(page==Page::Bitrate && a>=820 && a<=823){
+            static constexpr int choices[]={30,50,75,100};
             customMbps=choices[a-820];customQuality=true;legacyQuality=false;requestedCap=customMbps;
             applyQuality(s);back();return;
         }
@@ -276,7 +274,7 @@ class LiveFrontend {
             if(!dispatchWindowsShortcut(s,pendingShortcut)){notice="请先连接电脑";break;}
             stack.clear();draining=true;notice="已提交操作请求，等待电脑端结果";break;
         case 770:client.command("logout");client.command("login");stack.clear();draining=true;break;
-        case 81:restoreRemoteSound(s);client.command("disconnect",{{"graceMs",220}});stack.clear();draining=true;break;
+        case 81:client.command("disconnect",{{"restoreSound",shouldRestoreRemoteSound(s)},{"deviceId",s.activeDeviceId}});stack.clear();draining=true;break;
         case 90:client.command("refresh");break;
         case 2300:if(!sendingText && !keyboardText.empty()){auto n=keyboardText.size()-1;while(n && (static_cast<unsigned char>(keyboardText[n])&0xc0)==0x80)--n;keyboardText.resize(n);}break;
         case 2301:if(!sendingText && keyboardText.size()<2048)keyboardText+=' ';break;case 2302:if(!sendingText)keyboardText.clear();break;
@@ -294,7 +292,7 @@ class LiveFrontend {
     }
 public:
     bool networkOverlay=false;
-    void restoreRemoteSoundOnDisconnect(const uu::Snapshot &s){restoreRemoteSound(s);}
+    bool restoreRemoteSoundOnDisconnect(const uu::Snapshot &s)const{return shouldRestoreRemoteSound(s);}
     explicit LiveFrontend(uu::Client &c,std::shared_ptr<uu::Media> m,SDL_Renderer *r):client(c),media(std::move(m)),renderer(r){
         uu::Json p;
         if(readPrefs(prefsPath,p) || readPrefs(std::string(prefsPath)+".previous",p)){
@@ -494,8 +492,8 @@ public:
             aligned(r,f.small,"提升流畅度",{848,588,376,28},label);
             }break;
         case Page::Bitrate:title="自定义上限";{
-            static constexpr int choices[]={8,15,20,30,40,50};
-            for(int i=0;i<6;++i)row(i,"最高 "+std::to_string(choices[i])+" Mbps",820+i,true,customQuality && customMbps==choices[i]);
+            static constexpr int choices[]={30,50,75,100};
+            for(int i=0;i<4;++i)row(i,"最高 "+std::to_string(choices[i])+" Mbps",820+i,true,customQuality && customMbps==choices[i]);
             }break;
         case Page::Playout:title="播放缓冲";{int values[]={0,8,16,24,35};for(int i=0;i<5;++i)row(i,std::to_string(values[i])+" ms",550+values[i],true,bufferMs==values[i]);}
             aligned(r,f.small,"缓冲越低越跟手；网络不稳时更易卡顿",{848,556,376,60},label);break;
@@ -513,13 +511,13 @@ public:
             title="键鼠映射方案";add(445,111,165,49,"方案一",60,true,draft==1,"",Kind::Tab);add(650,111,165,49,"方案二",61,true,draft==2,"",Kind::Tab);
             const bool second=draft==2;
             const char *head[]={"左摇杆","方向键","右摇杆","正面按键"};
-            const char *one[]={"移动鼠标\n按下：显示键盘","上 Ctrl\n下 Shift\n左 Backspace\n右 Delete","方向键\n按下：显示桌面","A 回车\nB Esc\nX 鼠标左键\nY 鼠标右键"};
-            const char *two[]={"上下：滚轮\n按下：显示键盘","上 / 下 / 左 / 右","移动鼠标\n按下：Shift","A 回车\nB Esc\nX 空格\nY Backspace"};
-            image(r,"gamepad",{492,190,296,212},420,300);
+            const char *one[]={"移动鼠标\n按下：显示键盘","上 Ctrl\n下 Shift\n左 Backspace\n右 Delete","方向键\n按下：显示桌面","B 回车\nA Esc\nY 鼠标左键\nX 鼠标右键"};
+            const char *two[]={"上下：滚轮\n按下：显示键盘","上 / 下 / 左 / 右","移动鼠标\n按下：Shift","B 回车\nA Esc\nY 空格\nX Backspace"};
+            switchControllerDiagram(r,f.hint);
             text(r,f.small,second?"ZL  鼠标右键":"ZL  滚轮向上",100,222,label,320);
-            text(r,f.small,second?"L  Ctrl     -  Tab":"L  Alt     -  Windows",100,269,label,340);
+            text(r,f.small,second?"L Ctrl   短按 − Tab":"L Alt   短按 − Windows",100,269,label,340);
             text(r,f.small,second?"ZR  鼠标左键":"ZR  滚轮向下",885,222,label,300);
-            text(r,f.small,second?"R  Alt     +  工具栏":"R  Tab     +  工具栏",885,269,label,300);
+            text(r,f.small,second?"R Alt   按 + 打开菜单":"R Tab   按 + 打开菜单",885,269,label,300);
             for(int i=0;i<4;++i) {
                 text(r,f.normal,head[i],90+i*300,408,{149,191,255,255});
                 std::string lines=second?two[i]:one[i];size_t start=0;int line=0;
@@ -643,16 +641,8 @@ public:
             centered(r,f.small,"退出后需要重新扫码登录",332,label);
             add(330,438,290,72,"退出",770);add(660,438,290,72,"取消",80);break;
         case Page::About:title="关于";
-            aligned(r,f.large,"YOUYOU远程",{120,177,550,72},ink);
-            aligned(r,f.normal,"Switch 远程桌面",{120,265,550,56},ink);
-            aligned(r,f.small,std::string("版本 ")+UU_VERSION,{120,333,600,48},label);
-            aligned(r,f.small,"鼠标、触屏与手柄均可操作",{120,392,600,48},label);
-            rounded(r,{760,180,420,320},panel,12);
-            aligned(r,f.normal,"当前版本",{790,202,350,48},ink);
-            aligned(r,f.small,"保持现有传输与硬件解码路径",{790,267,350,50},label);
-            aligned(r,f.small,"显示组件：SDL2 / SDL_ttf",{790,329,350,50},label);
-            aligned(r,f.small,"字体：Noto Sans SC · OFL 1.1",{790,391,350,50},label);
-            add(120,506,300,60,"重新登录",52);break;
+            aboutInformation(r,f);
+            add(980,574,180,48,"重新登录",52);break;
         case Page::Keyboard:title="键盘输入";
             aligned(r,f.small,"先在电脑选中输入框，再编辑文字",{90,132,1100,42},label);
             add(90,190,1100,92,keyboardText.empty()?"点这里输入文字":keyboardText,2304,!sendingText);
@@ -679,7 +669,7 @@ public:
             const bool unsupported=a==750;
             const bool needsStream=(a>=71&&a<=76)||a==2303||(a>=751&&a<=753);
             if(pendingSetting || unsupported || (needsStream&&!snapshot.streaming) ||
-               (a>=751 && a<=753 && !snapshot.textChannelReady))button.enabled=false;
+               (a>=751 && a<=753 && !snapshot.controlChannelReady))button.enabled=false;
             if(unsupported && button.kind==Kind::Menu)button.value="暂未支持";
         }
         deviceOffset=std::clamp(deviceOffset,0,std::max(0,int(snapshot.devices.size())-5));

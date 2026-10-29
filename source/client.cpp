@@ -1014,8 +1014,21 @@ void Client::handle(const Event &event) {
         }
     } else if (e == "cancel" || e == "disconnect") {
         if(e=="disconnect"){
-            const int graceMs=std::clamp(data.value("graceMs",0),0,1000);
-            if(graceMs>0)std::this_thread::sleep_for(std::chrono::milliseconds(graceMs));
+            if(data.value("restoreSound",false) && data.value("deviceId",std::string{})==connectedDeviceId_){
+                const auto channel=channels_.find(systemActionChannel);
+                if(snapshot().streaming && channel!=channels_.end() && channel->second->isOpen()){
+                    const auto bytes=simpleActionMessage(nextQualityRpc_++,16,std::nullopt);
+                    try {
+                        const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+                        diagnostic(sent?"sound-restore-disconnect-sent":"sound-restore-disconnect-queued");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(220));
+                        const auto deadline=monotonicMs()+500;
+                        while(channel->second->isOpen() && channel->second->bufferedAmount()>0 && monotonicMs()<deadline)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                        if(channel->second->bufferedAmount()>0)diagnostic("sound-restore-disconnect-drain-timeout");
+                    } catch(...) {diagnostic("sound-restore-disconnect-send-failed");}
+                } else diagnostic("sound-restore-disconnect-channel-unavailable");
+            }
         }
         reconnectArmed_ = false; // User-initiated disconnect, disable auto-reconnect
         disconnect();
@@ -1998,10 +2011,7 @@ void Client::disconnect() {
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
     if(hotCap && q.quality!=6 && (!video_ || !rembAvailable_ || q.cap<=0 || !video_->requestBitrate(unsigned(q.cap)*1000000u)))
         throw std::runtime_error("码率反馈更新失败");
-    // Persist the selected preset or the explicit custom ceiling. A custom
-    // ceiling is field 8 and is what the test menu writes.
-    if(q.quality!=6 || (q.cap>0 && q.cap<=100))
-        saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+    saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
     media_->setPlayoutDelay(q.delay);
     const bool sizeChanged=q.width!=streamWidth_ || q.height!=streamHeight_;
     streamWidth_=q.width;streamHeight_=q.height;streamFps_=q.fps;streamQuality_=q.quality;
@@ -2011,6 +2021,19 @@ void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice
         setVideoScaleNotice("视频尺寸设置已变化，等待重新缩放");
     }
     if(hotCap && q.quality!=6) {bitrateFeedbackSent_=true;diagnostic("quality-remb-hot-updated");}
+    // Custom mode publishes the same ceiling as a fixed REMB. The receiving
+    // session repeats that stored value on later sender reports. Field 8 is
+    // already carried by the capture request; this updates the feedback with it.
+    if(q.quality==6 && q.cap>0 && video_ && video_->isOpen() && rembAvailable_) {
+        try {
+            const unsigned target=unsigned(q.cap)*1000000u;
+            if(video_->requestBitrate(target)) {
+                bitrateFeedbackSent_=true;
+                rembTargetBps_=target;
+                diagnostic(("bitrate-cap-feedback-custom-bps-"+std::to_string(target)).c_str());
+            } else diagnostic("bitrate-cap-feedback-unavailable");
+        } catch(...) { diagnostic("bitrate-cap-feedback-send-failed"); }
+    }
     {std::lock_guard lock(stateMutex_);
         state_.width=q.width;state_.height=q.height;state_.fps=q.fps;state_.quality=q.quality;
         state_.maxBitrateMbps=q.cap;state_.playoutDelayMs=q.delay;state_.vsync=q.vsync;state_.hevc=q.hevc;

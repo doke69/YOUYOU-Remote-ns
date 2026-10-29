@@ -124,8 +124,8 @@ int main() {
             const auto explicitChoice=uu::qualityPresetRequest(2,0);
             require(explicitChoice.quality==3 && explicitChoice.maxBitrateMbps==0);
         }
-        // v2->v3 migration: exact old UI caps become native presets; arbitrary
-        // Custom values are preserved and reported for explicit compatibility.
+        // v2->v3 migration preserves custom limits even when they match an
+        // old preset, because the original user choice cannot be distinguished.
         using Lines=std::vector<std::string>;
         auto lineValue=[](const Lines &lines,const std::string &key)->std::string{
             for(const auto &line:lines){
@@ -137,12 +137,12 @@ int main() {
         for(int i=0;i<uu::qualityPresetCount;++i){
             Lines lines={"width=1280","quality=6","max_bitrate_mbps="+std::to_string(uu::qualityPresets[i].legacyMbps),"video_codec=hevc"};
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed && migration.toQuality==i+1);
-            require(lineValue(lines,"quality")==std::to_string(i+1));
-            require(lineValue(lines,"max_bitrate_mbps")=="0");
+            require(!migration.changed && migration.legacyCustom);
+            require(lineValue(lines,"quality")=="6");
+            require(lineValue(lines,"max_bitrate_mbps")==std::to_string(uu::qualityPresets[i].legacyMbps));
             require(lineValue(lines,"video_codec")=="hevc");
             auto again=uu::migrateQualityConfigLines(lines);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom);
         }
         {
             Lines lines={"quality=6","max_bitrate_mbps=25","width=1280"};
@@ -157,12 +157,12 @@ int main() {
         {
             Lines lines={"quality=6 # old UI","max_bitrate_mbps=20 # cap","video_codec=hevc # keep","width=1280"};
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed && migration.toQuality==3);
-            require(lineValue(lines,"quality")=="3 # old UI");
-            require(lineValue(lines,"max_bitrate_mbps")=="0 # cap");
+            require(!migration.changed && migration.legacyCustom);
+            require(lineValue(lines,"quality")=="6 # old UI");
+            require(lineValue(lines,"max_bitrate_mbps")=="20 # cap");
             require(lineValue(lines,"video_codec")=="hevc # keep");
             auto again=uu::migrateQualityConfigLines(lines);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom);
         }
         {
             Lines lines={"quality=6","quality=3","max_bitrate_mbps=20"};
@@ -193,17 +193,17 @@ int main() {
             };
             auto lines=readLines();
             auto migration=uu::migrateQualityConfigLines(lines);
-            require(migration.changed);
+            require(!migration.changed && migration.legacyCustom);
             {
                 std::ofstream out(path,std::ios::trunc);
                 for(const auto &line:lines)out<<line<<'\n';
             }
             auto reloaded=readLines();
-            require(lineValue(reloaded,"quality")=="3 # old UI");
-            require(lineValue(reloaded,"max_bitrate_mbps")=="0 # cap");
+            require(lineValue(reloaded,"quality")=="6 # old UI");
+            require(lineValue(reloaded,"max_bitrate_mbps")=="20 # cap");
             require(lineValue(reloaded,"width")=="1280");
             auto again=uu::migrateQualityConfigLines(reloaded);
-            require(!again.changed && !again.legacyCustom);
+            require(!again.changed && again.legacyCustom);
             std::remove(path.c_str());
         }
         // The same production tracker used by Client: ACK must not erase

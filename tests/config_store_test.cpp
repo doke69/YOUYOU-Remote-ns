@@ -111,6 +111,12 @@ int main() {
         require(uu::ConfigStore::instance().integer("fps", 60, 30, 60) == 60, "reload after save");
         require(uu::ConfigStore::instance().value("frame_pacing") == "0", "saved pacing first value");
 
+        uu::saveQualityConfig(1280, 720, 60, 6, true, 16, 50, true);
+        uu::ConfigStore::instance().reload();
+        require(uu::ConfigStore::instance().integer("quality", 3, 1, 6) == 6, "custom quality survives reload");
+        require(uu::ConfigStore::instance().integer("max_bitrate_mbps", 0, 0, 100) == 50, "custom cap survives reload");
+        require(uu::ConfigStore::instance().integer("playout_delay_ms", 8, 0, 100) == 16, "playout delay survives reload");
+
         const std::vector<std::string> pacingLines{"frame_pacing=1 # on", "frame_pacing=0"};
         require(uu::config::framePacingFromLines(pacingLines) == "1", "save parser first wins");
         const std::vector<std::string> pacingComment{"frame_pacing=0 # off", "frame_pacing=1"};

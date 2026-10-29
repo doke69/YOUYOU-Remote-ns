@@ -13,6 +13,7 @@
 #ifdef __SWITCH__
 #include <sys/stat.h>
 #include <dirent.h>
+#include <switch.h>
 #endif
 
 namespace uu {
@@ -328,6 +329,8 @@ void saveQualityConfig(int width, int height, int fps, int quality, bool vsync,
         throw std::runtime_error("画质设置保存失败，已尝试恢复原配置");
     }
 #ifdef __SWITCH__
+    if (R_FAILED(fsdevCommitDevice("sdmc")))
+        throw std::runtime_error("画质设置写入未确认，请重试");
     // Remove legacy timestamped backups left by earlier builds. Only the fixed
     // config.ini.bak remains.
     if (DIR *dir = opendir("sdmc:/switch/UURemote-ns")) {

@@ -170,6 +170,45 @@ void aligned(SDL_Renderer *r,TTF_Font *font,const std::string &value,SDL_Rect ar
                  area.y+(area.h-entry->inkHeight)/2-entry->inkTop,src.w,src.h};
     uu::display::copy(r,entry->texture,&src,&dst);
 }
+void switchControllerDiagram(SDL_Renderer *r,TTF_Font *font) {
+    const SDL_Color shell{66,74,86,255}, controls{30,35,43,255};
+    rounded(r,{500,198,37,12},controls,5);
+    rounded(r,{743,198,37,12},controls,5);
+    rounded(r,{492,204,296,176},shell,23);
+    rounded(r,{496,207,49,170},{79,90,104,255},19);
+    rounded(r,{735,207,49,170},{79,90,104,255},19);
+    rounded(r,{548,216,184,152},{24,30,40,255},7);
+    aligned(r,font,"YOUYOU",{548,263,184,40},{112,139,164,255},true);
+    rounded(r,{503,236,32,32},controls,16);
+    aligned(r,font,"L3",{503,236,32,32},ink,true);
+    for(const auto &item:std::initializer_list<std::pair<SDL_Rect,const char *>>{
+        {{512,288,16,16},"↑"},{{512,320,16,16},"↓"},{{496,304,16,16},"←"},{{528,304,16,16},"→"},
+        {{752,233,16,16},"X"},{{752,265,16,16},"B"},{{736,249,16,16},"Y"},{{768,249,16,16},"A"}}) {
+        rounded(r,item.first,controls,8);
+        aligned(r,font,item.second,item.first,ink,true);
+    }
+    rounded(r,{744,315,32,32},controls,16);
+    aligned(r,font,"R3",{744,315,32,32},ink,true);
+    rounded(r,{506,348,12,12},controls,3);
+    rounded(r,{761,351,12,12},controls,6);
+    aligned(r,font,"−",{517,209,20,20},ink,true);
+    aligned(r,font,"+",{743,209,20,20},ink,true);
+}
+void aboutInformation(SDL_Renderer *r,Fonts &f) {
+    aligned(r,f.brand,"YOUYOU 远程",{110,142,660,46},ink);
+    aligned(r,f.small,std::string("版本 ")+UU_VERSION,{900,148,250,32},label);
+    aligned(r,f.small,"Nintendo Switch · 开源远程桌面客户端",{110,190,1000,30},label);
+    aligned(r,f.small,"本项目基于 Antman2023 开发的 UURemote-ns 进行二次开发与功能扩展，",{110,238,1060,30},ink);
+    aligned(r,f.small,"感谢原作者及所有开源贡献者的付出。",{110,268,1060,30},ink);
+    aligned(r,f.small,"本项目为非官方社区开源项目，与网易及其关联公司无隶属、合作或官方背书关系。",{110,312,1060,30},ink);
+    aligned(r,f.small,"相关商标、软件及服务的权利归各自权利人所有。",{110,342,1060,30},ink);
+    aligned(r,f.small,"项目代码遵循 GPL-3.0-or-later 开源许可证，第三方组件及资源遵循各自的许可协议。",{110,386,1060,30},ink);
+    aligned(r,f.small,"请仅连接和操作本人拥有或获授权访问的设备，并遵守相关服务条款及适用法律。",{110,430,1060,30},ink);
+    aligned(r,f.small,"项目源码与许可声明：",{110,488,1060,28},label);
+    aligned(r,f.small,"https://github.com/doke69/YOUYOU-Remote-ns",{110,516,1060,30},ink);
+    aligned(r,f.small,"上游项目：",{110,558,1060,28},label);
+    aligned(r,f.small,"https://github.com/Antman2023/UURemote-ns",{110,586,850,30},ink);
+}
 // Endpoint strings are ASCII. Use two lines before truncating an IPv6 endpoint.
 void endpointValue(SDL_Renderer *r,Fonts &f,const std::string &value,SDL_Rect area){
     int w=0,h=0;TTF_SizeUTF8(f.hint,value.c_str(),&w,&h);
@@ -350,13 +389,13 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             title="键鼠映射方案";add(445,111,165,49,"方案一",60,true,draft==1,"",Kind::Tab);add(650,111,165,49,"方案二",61,true,draft==2,"",Kind::Tab);
             const bool second=draft==2;
             const char *head[]={"左摇杆","方向键","右摇杆","正面按键"};
-            const char *one[]={"移动鼠标\n按下：显示键盘","上 Ctrl\n下 Shift\n左 Backspace\n右 Delete","方向键\n按下：显示桌面","A 回车\nB Esc\nX 鼠标左键\nY 鼠标右键"};
-            const char *two[]={"上下：滚轮\n按下：显示键盘","上 / 下 / 左 / 右","移动鼠标\n按下：Shift","A 回车\nB Esc\nX 空格\nY Backspace"};
-            image(r,"gamepad",{492,190,296,212},420,300);
+            const char *one[]={"移动鼠标\n按下：显示键盘","上 Ctrl\n下 Shift\n左 Backspace\n右 Delete","方向键\n按下：显示桌面","B 回车\nA Esc\nY 鼠标左键\nX 鼠标右键"};
+            const char *two[]={"上下：滚轮\n按下：显示键盘","上 / 下 / 左 / 右","移动鼠标\n按下：Shift","B 回车\nA Esc\nY 空格\nX Backspace"};
+            switchControllerDiagram(r,f.hint);
             text(r,f.small,second?"ZL  鼠标右键":"ZL  滚轮向上",100,222,label,320);
-            text(r,f.small,second?"L  Ctrl     -  Tab":"L  Alt     -  Windows",100,269,label,340);
+            text(r,f.small,second?"L Ctrl   短按 − Tab":"L Alt   短按 − Windows",100,269,label,340);
             text(r,f.small,second?"ZR  鼠标左键":"ZR  滚轮向下",885,222,label,300);
-            text(r,f.small,second?"R  Alt     +  工具栏":"R  Tab     +  工具栏",885,269,label,300);
+            text(r,f.small,second?"R Alt   按 + 打开菜单":"R Tab   按 + 打开菜单",885,269,label,300);
             for(int i=0;i<4;++i) {
                 text(r,f.normal,head[i],90+i*300,408,{149,191,255,255});
                 std::string lines=second?two[i]:one[i];size_t start=0;int line=0;
@@ -436,16 +475,8 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             centered(r,f.small,"此处仅演示退出流程，实际账号不受影响",332,label);
             add(330,438,290,72,"退出",770);add(660,438,290,72,"取消",80);break;
         case Page::About:title="关于";
-            aligned(r,f.large,"YOUYOU远程",{120,177,550,72},ink);
-            aligned(r,f.normal,"原生界面预览",{120,265,550,56},ink);
-            aligned(r,f.small,"界面修订 3 · 基于 v46 共用界面",{120,333,600,48},label);
-            aligned(r,f.small,"鼠标、触屏与手柄均可操作",{120,392,600,48},label);
-            rounded(r,{760,180,420,320},panel,12);
-            aligned(r,f.normal,"当前版本",{790,202,350,48},ink);
-            aligned(r,f.small,"本机离线预览，不执行远端操作",{790,267,350,50},label);
-            aligned(r,f.small,"显示组件：SDL2 / SDL_ttf",{790,329,350,50},label);
-            aligned(r,f.small,"字体：Noto Sans SC · OFL 1.1",{790,391,350,50},label);
-            add(120,506,300,60,"登录页面",52);break;
+            aboutInformation(r,f);
+            add(980,574,180,48,"登录页面",52);break;
         case Page::Keyboard:title="键盘输入";
             aligned(r,f.small,"先在电脑选中输入框，再编辑文字",{90,132,1100,42},label);
             add(90,190,1100,92,keyboardText.empty()?"点这里输入文字":keyboardText,2304);

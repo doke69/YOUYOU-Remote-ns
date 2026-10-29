@@ -17,8 +17,8 @@ struct QualityConfigMigration {
     int toQuality=0;
 };
 
-// v2 -> v3: exact old UI Custom caps become native presets. Inline comments
-// are ignored for parsing and preserved on rewritten values. Reload and this
+// v2 -> v3: preserve custom limits because the same values can represent
+// either an old UI preset or an explicitly selected custom limit. Reload and this
 // migration both use the first occurrence of a key. Duplicate quality/cap
 // entries remain unresolved and preserved (no key is rewritten), so the
 // effective first value is not silently changed; this is the F02 compatibility
@@ -60,17 +60,8 @@ inline QualityConfigMigration migrateQualityConfigLines(std::vector<std::string>
         result.unresolved=true;
         return result;
     }
-    const int preset=qualityPresetIndexForLegacyMbps(mbps);
-    if(preset<0) {
-        result.legacyCustom=true;
-        result.invalidCustom=(mbps<=0);
-        return result;
-    }
-    config::setValue(lines[std::size_t(qualityLine)],
-        std::to_string(qualityPresets[preset].quality));
-    config::setValue(lines[std::size_t(bitrateLine)],"0");
-    result.changed=true;
-    result.toQuality=qualityPresets[preset].quality;
+    result.legacyCustom=true;
+    result.invalidCustom=(mbps<=0);
     return result;
 }
 
