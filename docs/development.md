@@ -24,7 +24,7 @@ Switch 原生界面 / 手柄 / 触屏
 - 接收 FPS、解码 FPS、显示提交 FPS 和源端游戏 FPS 不同；解码耗时、网络 RTT、播放缓冲也不是端到端操作延迟。分析时保留这些边界。
 - GPU NV12 路径已有正向真机反馈，但仍有回退和资源生命周期限制，不能简化为“所有路径绝对零拷贝”。
 
-当前需要继续验证的项目、暂停研究及使用边界集中维护在[功能状态表](project-status.md)。贡献者还可阅读[构建说明](build-v52.md)、[PR1 审核记录](reviews/v52-review.md)。
+当前需要继续验证的项目、暂停研究及使用边界集中维护在[功能状态表](project-status.md)。当前构建请参阅[构建说明](build.md)；[v52 构建说明](build-v52.md)和[PR1 审核记录](reviews/v52-review.md)是历史资料。
 
 ## 历史开发记录
 
@@ -143,7 +143,7 @@ Switch 最终链接通过 `--wrap=sslConnectionRead` / `--wrap=sslConnectionWrit
 
 ## v0.1.7 系统 23.0.1 / 大气层 1.12.1 适配
 
-- 目标环境、机型差异、安装与真机自检见 [固件 23.0.1 / AMS 1.12.1 适配说明](firmware-23.0.1-ams-1.12.1.md)。
+- 目标环境和当时的适配情况见 [v0.1.7 历史记录](releases/v0.1.7.md)。
 - `source/main.cpp` 新增 `set:sys` 初始化与 `setsysGetProductModel()` / `setsysGetFirmwareVersion()`，首页底部显示机型 · 模式 · 系统版本，
   并把 `console-<机型>-<模式>-fw<x.y.z>` 写入 `connection.log`；窗口创建改为 TV 1920×1080 / 掌机 1280×720，并加 `SDL_WINDOW_RESIZABLE`
   让 devkitPro SDL2 驱动在插拔底座时自动切换，渲染逻辑尺寸仍为 1280×720。

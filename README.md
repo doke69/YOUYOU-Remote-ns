@@ -13,6 +13,7 @@
 - [进度和已知限制](docs/project-status.md)
 - [0.3.73 Beta 更新说明](docs/releases/v0.3.73-beta.md) · [历史记录](CHANGELOG.md)
 - [来源、引用与致谢](docs/credits.md)
+- [全部文档导航](docs/README.md)
 
 ## 已有功能
 
