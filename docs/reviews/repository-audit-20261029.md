@@ -15,7 +15,7 @@
 - `tests/event_queue_test.cpp` 和部分测试不在默认测试集中；它们可能用于独立或特定配置验证，静态未引用不足以证明应删除。
 - `include/transport_feedback*.hpp` 和 `source/transport_feedback*.cpp` 属于默认关闭的实验功能，CMake 有条件编译，不能当作无用文件删除。
 - `scripts/dependency-overrides/` 用于复现第三方依赖修改；31 项文件哈希与清单一致，应保留。
-- `docs/releases/`、`docs/build-v52.md`、`docs/adjustments-v52.md` 与 `docs/reviews/` 作为历史记录保留，不代表它们的操作说明适用于当前版本。
+- 历史版本和 v52 文档予以保留；后续已归档至 `docs/releases/archive-v0.1/` 与 `docs/archive/v52/`。它们的操作说明不代表适用于当前版本。
 
 ## 验证范围
 

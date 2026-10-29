@@ -23,6 +23,6 @@
 
 ## 历史资料和审查
 
-- [各版本说明](releases/)：保留历史版本记录。
-- [v52 审查记录](reviews/v52-review.md)、[v52 调整记录](adjustments-v52.md)、[v52 历史构建说明](build-v52.md)：仅适用于对应历史阶段；当前构建请使用上方构建说明。
+- [版本说明索引](releases/README.md)：当前版本及历史更新记录。
+- [v52 审查记录](archive/v52/v52-review.md)、[v52 调整记录](archive/v52/adjustments-v52.md)、[v52 历史构建说明](archive/v52/build-v52.md)：仅适用于对应历史阶段；当前构建请使用上方构建说明。
 - [仓库文件检查记录](reviews/repository-audit-20261029.md)：本次整理范围和保留理由。

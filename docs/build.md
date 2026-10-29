@@ -4,7 +4,7 @@
 
 需要 CMake 3.21+、Ninja、Python 3.12+、devkitPro Switch 工具链及对应 portlibs。Windows 工具链引导脚本另需 Python 3.14+。不要混用不同编译宏下的历史静态库。
 
-主要 SDK 包：switch-dev、switch-sdl2、switch-sdl2_ttf、switch-curl、switch-ffmpeg、switch-libopus、deko3d，以及可用的 uam 着色器编译器。SDK/依赖来源记录见 scripts/*lock.json；历史 GPU 工具版本记录见 build-v52.md。字体和项目图标随源码提供。默认使用几何图标，不需要 UU APK 提取的界面纹理。
+主要 SDK 包：switch-dev、switch-sdl2、switch-sdl2_ttf、switch-curl、switch-ffmpeg、switch-libopus、deko3d，以及可用的 uam 着色器编译器。SDK/依赖来源记录见 scripts/*lock.json；历史 GPU 工具版本记录见 [v52 构建归档](archive/v52/build-v52.md)。字体和项目图标随源码提供。默认使用几何图标，不需要 UU APK 提取的界面纹理。
 
 ## 本地参考材料
 

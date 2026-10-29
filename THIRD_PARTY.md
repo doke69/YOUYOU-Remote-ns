@@ -27,7 +27,7 @@ The native client protocol is ported from the user-provided local UURemote-web r
 
 
 ## v52 additions
-- deko3d/dekotools/uam: devkitPro upstream; use their licenses when distributing linked builds. See docs/build-v52.md for pinned source references.
+- deko3d/dekotools/uam: devkitPro upstream; use their licenses when distributing linked builds. See docs/archive/v52/build-v52.md for historical pinned source references.
 - scripts/dependency-overrides contains modified libdatachannel/libjuice source under MPL-2.0, retaining upstream notices and original pinned archive references.
 - shaders/ and the geometric UI fallback are project adaptation code. Reference APKs, extracted UU TV textures and branding, credentials, and Nintendo firmware are not included in this source import.
 
