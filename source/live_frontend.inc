@@ -9,6 +9,7 @@ class LiveFrontend {
     uu::DeviceSelection deviceSelection;
     bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true;
     bool nativeMultitouch=true;Uint32 modeNoticeUntil=0;
+    std::optional<int> lastPrivacyMode;
     bool keyboardEditRequested=false,sendingText=false,legacyQuality=false,customQuality=false;
     uu::Json safetyProfiles=uu::Json::object();std::string safetyDevice;bool safetyApplied=false;
     uint64_t textRevisionAtSend=0;
@@ -67,8 +68,11 @@ class LiveFrontend {
                 if(!profiles.is_object() || profiles.size()>16)return false;
                 for(auto it=profiles.begin();it!=profiles.end();++it){
                     if(it.key().empty() || it.key().size()>256 || !it.value().is_object())return false;
-                    for(auto setting=it.value().begin();setting!=it.value().end();++setting)
-                        if((setting.key()!="auto_lock" && setting.key()!="remote_mute" && setting.key()!="restore_sound") || !setting.value().is_boolean())return false;
+                    for(auto setting=it.value().begin();setting!=it.value().end();++setting){
+                        if(setting.key()=="privacy_mode"){
+                            if(!setting.value().is_number_integer() || setting.value().get<int>()<1 || setting.value().get<int>()>3)return false;
+                        }else if((setting.key()!="auto_lock" && setting.key()!="remote_mute" && setting.key()!="restore_sound" && setting.key()!="privacy_screen") || !setting.value().is_boolean())return false;
+                    }
                 }
             }
             p=std::move(value);return true;
@@ -126,6 +130,16 @@ class LiveFrontend {
     }
     void loadSafety(const std::string &id){
         safetyDevice=id;safetyApplied=false;
+        lastPrivacyMode.reset();
+        const auto profile=safetyProfiles.find(id);
+        if(profile!=safetyProfiles.end() && profile->is_object()){
+            const auto mode=profile->find("privacy_mode");
+            if(mode!=profile->end())lastPrivacyMode=mode->get<int>();
+            else {
+                const auto value=profile->find("privacy_screen");
+                if(value!=profile->end())lastPrivacyMode=value->get<bool>()?2:1;
+            }
+        }
         const auto settings=uu::safetySettingsFor(safetyProfiles,id);
         autoLock=settings.autoLock;remoteMute=settings.remoteMute;restoreSound=settings.restoreSound;
     }
@@ -230,7 +244,7 @@ class LiveFrontend {
                 client.command("connect",{{"deviceId",s.devices[selectedDevice]["device_id"]}});
             break;
         case 13:push(Page::Gamepad);break;case 14:push(Page::Toolbar);break;
-        case 20:push(Page::Disconnect);break;case 21:push(Page::Display);break;case 22:push(Page::Safety);break;
+        case 20:push(Page::Disconnect);break;case 21:push(Page::Display);break;case 22:push(Page::Safety);break;case 757:push(Page::ScreenProtection);break;
         case 23:push(Page::Peripherals);break;case 24:case 70:push(Page::More);break;case 25:push(Page::Windows);break;
         case 30:loadSettings(s);push(Page::Quality);break;case 31:loadSettings(s);push(Page::Picture);break;
         case 40:fps=60;applyQuality(s);break;case 41:fps=30;applyQuality(s);break;
@@ -270,6 +284,14 @@ class LiveFrontend {
             if(remoteMute)safetyAction(uu::remoteSoundAction(remoteMute,restoreSound),s);
             notice=remoteMute?"声音恢复设置已发送，请以电脑端为准":"已保存；开启电脑静音后生效";break;
         case 754:networkOverlay=!networkOverlay;save();break;
+        case 755:case 756:
+            if(s.streaming && s.textChannelReady && !s.privacyPending){
+                const int current=s.privacyKnown?int(s.privacyMode):
+                    s.privacyRequestedMode!=uu::PrivacyMode::Unknown?int(s.privacyRequestedMode):lastPrivacyMode.value_or(1);
+                const int selected=a==755?2:3;
+                client.command("privacy-screen",{{"deviceId",s.activeDeviceId},{"mode",current==selected?1:selected}});
+            }
+            break;
         case 760:
             if(!dispatchWindowsShortcut(s,pendingShortcut)){notice="请先连接电脑";break;}
             stack.clear();draining=true;notice="已提交操作请求，等待电脑端结果";break;
@@ -338,6 +360,14 @@ public:
             draftDevice=s.activeDeviceId;
         }
         if(s.activeDeviceId!=safetyDevice)loadSafety(s.activeDeviceId);
+        if(s.streaming && s.privacyKnown && !s.activeDeviceId.empty() &&
+           (!lastPrivacyMode || *lastPrivacyMode!=int(s.privacyMode))){
+            lastPrivacyMode=int(s.privacyMode);
+            if(safetyProfiles.contains(s.activeDeviceId) || safetyProfiles.size()<16){
+                safetyProfiles[s.activeDeviceId]["privacy_mode"]=int(s.privacyMode);
+                safetyProfiles[s.activeDeviceId].erase("privacy_screen");save();
+            }else saveError="已保存16台电脑的安全设置，本次隐私状态无法保存";
+        }
         if(s.streaming!=wasStreaming || s.authenticated!=wasAuthenticated){stack.clear();buttons.clear();touchTarget=-1;hit=-1;touchDown=false;draining=true;
             if(s.authenticated && !s.streaming)push(Page::Home);
             stopKeyboard();
@@ -604,13 +634,46 @@ public:
             add(90,590,320,56,"刷新频率读数",856);
             aligned(r,f.hint,"频率仅在打开本页或点刷新时读取，不会调整",{440,592,750,52},label);
             }break;
-        case Page::Safety:title="安全";
-            add(848,176,376,72,"自动解锁电脑（尚未开放）",750,false,autoUnlock,"",Kind::Toggle);
-            add(848,260,376,72,"断开后锁定电脑",751,snapshot.streaming,autoLock,"",Kind::Toggle);
-            add(848,344,376,72,"串流时电脑静音",752,snapshot.streaming,remoteMute,"",Kind::Toggle);
-            add(848,428,376,100,"远程结束后，恢复\n被控端声音设置",753,true,restoreSound,"",Kind::Toggle);
-            aligned(r,f.hint,"仅对当前电脑保存，重连时重新发送",{848,552,376,32},label);
-            aligned(r,f.hint,"开关表示所选设置，实际效果以电脑端为准",{848,590,376,32},label);break;
+        case Page::Safety:{title="安全";
+            add(848,176,376,64,"自动解锁（尚未开放）",750,false,autoUnlock,"",Kind::Toggle);
+            add(848,252,376,64,"断开后锁定电脑",751,snapshot.streaming,autoLock,"",Kind::Toggle);
+            add(848,328,376,64,"串流时电脑静音",752,snapshot.streaming,remoteMute,"",Kind::Toggle);
+            add(848,404,376,64,"结束后恢复电脑声音",753,true,restoreSound,"",Kind::Toggle);
+            const std::string current=snapshot.privacyPending?"等待确认":!snapshot.privacyKnown?"未确认":
+                snapshot.privacyMode==uu::PrivacyMode::ScreenOff?"显示屏关闭":
+                snapshot.privacyMode==uu::PrivacyMode::Normal?"隐私保护":"关闭";
+            row(4,"屏幕保护",757,true,false,current);
+            break;}
+        case Page::ScreenProtection:{title="屏幕保护";
+            const int mode=snapshot.privacyKnown?int(snapshot.privacyMode):
+                snapshot.privacyRequestedMode!=uu::PrivacyMode::Unknown?int(snapshot.privacyRequestedMode):lastPrivacyMode.value_or(1);
+            const bool ready=snapshot.streaming && snapshot.textChannelReady && !snapshot.privacyPending;
+            const std::string status=snapshot.privacyKnown?"":snapshot.privacyPending?"（等待电脑）":"（未确认）";
+            add(848,176,376,64,"隐私保护"+status,755,ready,mode==2,"",Kind::Toggle);
+            aligned(r,f.hint,"遮蔽电脑画面，远程操作继续",{868,248,336,44},label);
+            add(848,320,376,64,"关闭显示屏"+status,756,ready,mode==3,"",Kind::Toggle);
+            aligned(r,f.hint,"使用电脑端增强隐私功能",{868,392,336,44},label);
+            aligned(r,f.hint,"两种模式只能开启一种",{848,466,376,40},label);
+            std::string stateText=snapshot.privacyNotice;
+            if(stateText.empty())stateText=!snapshot.streaming?"连接电脑后可设置":!snapshot.privacyKnown?
+                lastPrivacyMode?"显示上次模式，电脑当前状态未确认":"电脑当前状态未确认":"状态由电脑端报告";
+            // Status is internal UTF-8 text; wrap within the reserved three-line
+            // area rather than truncating an important fallback/error message.
+            size_t offset=0;
+            for(int line=0;line<3 && offset<stateText.size();++line){
+                size_t end=offset;
+                while(end<stateText.size()){
+                    size_t next=end+1;
+                    while(next<stateText.size() && (uint8_t(stateText[next])&0xc0)==0x80)++next;
+                    int width=0,height=0;
+                    TTF_SizeUTF8(f.hint,stateText.substr(offset,next-offset).c_str(),&width,&height);
+                    if(width>376)break;
+                    end=next;
+                }
+                aligned(r,f.hint,stateText.substr(offset,end-offset),{848,526+line*26,376,26},label);
+                offset=end;
+            }
+            break;}
         case Page::Windows:title="Windows 快捷操作";
             row(0,"锁定桌面",74);row(1,"重启电脑",75);row(2,"关机",76);
             row(3,"任务管理器",72);row(4,"显示桌面",71);row(5,"切换窗口",73);break;
@@ -694,8 +757,8 @@ public:
                 rounded(r,{sx+(b.chosen?23:3),sy+3,22,22},ink,11);
                 const auto split=b.title.find('\n');
                 if(split==std::string::npos)aligned(r,f.small,b.title,{b.box.x+20,b.box.y,b.box.w-100,b.box.h},tint);
-                else {aligned(r,f.small,b.title.substr(0,split),{b.box.x+20,b.box.y+17,b.box.w-100,32},tint);
-                    aligned(r,f.small,b.title.substr(split+1),{b.box.x+20,b.box.y+51,b.box.w-100,32},tint);}
+                else {aligned(r,f.small,b.title.substr(0,split),{b.box.x+20,b.box.y+b.box.h/2-27,b.box.w-100,27},tint);
+                    aligned(r,f.small,b.title.substr(split+1),{b.box.x+20,b.box.y+b.box.h/2,b.box.w-100,27},tint);}
             }else if(b.kind==Kind::Icon) {
                 if(asset)image(r,asset,{b.box.x+(b.box.w-24)/2,b.box.y+(b.box.h-24)/2,24,24});
             }else if(b.kind==Kind::Button || b.kind==Kind::Tab) {

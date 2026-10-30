@@ -238,6 +238,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	if (agent->mode == AGENT_MODE_UNKNOWN) {
 		JLOG_DEBUG("Assuming controlling mode");
 		agent->mode = AGENT_MODE_CONTROLLING;
+		JLOG_INFO("UU_DIAG_ROLE_CONTROLLING");
 	}
 
 	agent_change_state(agent, JUICE_STATE_GATHERING);
@@ -491,6 +492,7 @@ int agent_get_local_description(juice_agent_t *agent, char *buffer, size_t size)
 	if (agent->mode == AGENT_MODE_UNKNOWN) {
 		JLOG_DEBUG("Assuming controlling mode");
 		agent->mode = AGENT_MODE_CONTROLLING;
+		JLOG_INFO("UU_DIAG_ROLE_CONTROLLING");
 	}
 
 	conn_unlock(agent);
@@ -543,9 +545,11 @@ int agent_set_remote_description(juice_agent_t *agent, const char *sdp) {
 		// controlled role.
 		JLOG_DEBUG("Remote ICE agent is lite, assuming controlling mode");
 		agent->mode = AGENT_MODE_CONTROLLING;
+		JLOG_INFO("UU_DIAG_ROLE_CONTROLLING");
 	} else if (agent->mode == AGENT_MODE_UNKNOWN) {
 		JLOG_DEBUG("Assuming controlled mode");
 		agent->mode = AGENT_MODE_CONTROLLED;
+		JLOG_INFO("UU_DIAG_ROLE_CONTROLLED");
 	}
 
 	// There is only one component, therefore we can unfreeze already existing pairs now
@@ -872,6 +876,9 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 					entry->transaction_id_expired = false;
 				}
 				int ret;
+				if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && entry->pair &&
+				    entry->retransmission_timeout == MIN_STUN_RETRANSMISSION_TIMEOUT)
+					JLOG_INFO("UU_DIAG_PAIR_SENT %d", i);
 				switch (entry->type) {
 				case AGENT_STUN_ENTRY_TYPE_RELAY:
 					ret = agent_send_turn_allocate_request(agent, entry, STUN_METHOD_ALLOCATE);
@@ -902,6 +909,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			switch (entry->type) {
 			case AGENT_STUN_ENTRY_TYPE_RELAY:
 				JLOG_INFO("TURN allocation failed");
+				JLOG_INFO("UU_DIAG_TURN_TIMEOUT_OR_SEND_FAILURE");
 				agent_update_gathering_done(agent);
 				break;
 
@@ -912,6 +920,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			default:
 				if (entry->pair) {
+					JLOG_INFO("UU_DIAG_PAIR_FAILED %d", i);
 					JLOG_DEBUG("Candidate pair check failed");
 					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
 				}
@@ -1388,6 +1397,7 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 			} else {
 				JLOG_DEBUG("Switching to controlled role");
 				agent->mode = AGENT_MODE_CONTROLLED;
+				JLOG_INFO("UU_DIAG_ROLE_CONTROLLED");
 				agent_update_candidate_pairs(agent);
 			}
 			break;
@@ -1404,6 +1414,7 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 			if (agent->ice_tiebreaker >= msg->ice_controlling) {
 				JLOG_DEBUG("Switching to controlling role");
 				agent->mode = AGENT_MODE_CONTROLLING;
+				JLOG_INFO("UU_DIAG_ROLE_CONTROLLING");
 				agent_update_candidate_pairs(agent);
 			} else {
 				JLOG_DEBUG("Asking remote peer to switch roles");
@@ -1503,10 +1514,12 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 					entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 					entry->next_transmission = 0;
 					pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+					JLOG_INFO("UU_DIAG_PAIR_ASYMMETRIC %d", (int)(entry - agent->entries));
 					break;
 				}
 
 				JLOG_DEBUG("Candidate pair check succeeded");
+				JLOG_INFO("UU_DIAG_PAIR_SUCCEEDED %d", (int)(entry - agent->entries));
 				pair->state = ICE_CANDIDATE_PAIR_STATE_SUCCEEDED;
 			}
 
@@ -1556,6 +1569,7 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 					                                                 : "controlling");
 					agent->mode = entry->mode == AGENT_MODE_CONTROLLING ? AGENT_MODE_CONTROLLED
 					                                                    : AGENT_MODE_CONTROLLING;
+					JLOG_INFO(agent->mode == AGENT_MODE_CONTROLLING ? "UU_DIAG_ROLE_CONTROLLING" : "UU_DIAG_ROLE_CONTROLLED");
 					juice_random(&agent->ice_tiebreaker, sizeof(agent->ice_tiebreaker));
 					agent_update_candidate_pairs(agent); // expires transaction IDs
 
@@ -1747,6 +1761,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 		}
 
 		JLOG_DEBUG("TURN allocate successful");
+		JLOG_INFO("UU_DIAG_TURN_ALLOCATED");
 
 		if (!msg->relayed.len) {
 			JLOG_ERROR("Expected relayed address in TURN Allocate response");
@@ -1797,10 +1812,12 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 	}
 	case STUN_CLASS_RESP_ERROR: {
 		if (msg->error_code == 401) { // Unauthorized
+			JLOG_INFO("UU_DIAG_TURN_CHALLENGE_401");
 			JLOG_DEBUG("Got TURN %s Unauthorized response",
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 			if (*entry->turn->credentials.realm != '\0') {
 				JLOG_ERROR("TURN authentication failed");
+				JLOG_INFO("UU_DIAG_TURN_AUTH_FAILED");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 				agent_update_gathering_done(agent);
 				return -1;
@@ -1818,6 +1835,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			agent_arm_transmission(agent, entry, 0);
 
 		} else if (msg->error_code == 438) { // Stale Nonce
+			JLOG_INFO("UU_DIAG_TURN_CHALLENGE_438");
 			JLOG_DEBUG("Got TURN %s Stale Nonce response",
 			           msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh");
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
@@ -1868,6 +1886,7 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			agent_arm_transmission(agent, entry, 0);
 
 		} else {
+			JLOG_INFO("UU_DIAG_TURN_ERROR %u", (unsigned int)msg->error_code);
 			if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED)
 				JLOG_WARN("Got TURN %s error response, code=%u",
 				          msg->msg_method == STUN_METHOD_ALLOCATE ? "Allocate" : "Refresh",
@@ -2357,6 +2376,8 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
 	entry->state = AGENT_STUN_ENTRY_STATE_IDLE;
 	entry->mode = AGENT_MODE_UNKNOWN;
 	entry->pair = pos;
+	JLOG_INFO("UU_DIAG_PAIR_CREATED %d %d %d", agent->entries_count,
+	          local ? (int)local->type : -1, remote ? (int)remote->type : -1);
 	entry->record = pos->remote->resolved;
 	entry->relay_entry = relay_entry;
 	juice_random(entry->transaction_id, STUN_TRANSACTION_ID_SIZE);

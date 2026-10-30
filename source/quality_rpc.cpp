@@ -56,6 +56,51 @@ Bytes simpleActionMessage(uint64_t seq,unsigned action,std::optional<bool> enabl
     if(enabled)integer(body,5,*enabled?2:1);
     integer(out,1,seq);integer(out,2,nowMs());message(out,3,body);return out;
 }
+// Mobile 4.44: Main21 -> RpcRequest7 -> PrivacyScreenSetting.
+// PS_NOT_SET=1, PS_NORMAL_PRIVACY=2, PS_ENHANCED_PRIVACY=3 (mobile screen off).
+Bytes privacyScreenRpc(uint64_t id,PrivacyMode mode){
+    const auto value=unsigned(mode);
+    if(!id || value<1 || value>3)throw std::invalid_argument("Invalid privacy request");
+    Bytes body,header,rpc,out;integer(body,1,mode!=PrivacyMode::Off);integer(body,2,value);
+    integer(header,1,id);message(rpc,1,header);message(rpc,7,body);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
+}
+std::optional<PrivacyRpcAck> parsePrivacyRpcAck(const uint8_t *data,size_t size) noexcept{
+    if(!data || !size || size>65536)return {};
+    PrivacyRpcAck out;bool response=false,header=false,id=false,body=false,code=false;unsigned modeFields=0;
+    Reader outer(data,size);Field f;
+    while(outer.next(f))if(f.key==22){
+        if(response || f.wire!=2)return {};response=true;
+        Reader rpc(f.data,f.size);Field r;
+        while(rpc.next(r)){
+            if(r.key==1){
+                if(header || r.wire!=2)return {};header=true;
+                Reader h(r.data,r.size);Field v;
+                while(h.next(v))if(v.key==1){if(id || v.wire!=0 || !v.value)return {};id=true;out.requestId=v.value;}
+                if(!h.good())return {};
+            }else if(r.key==3){
+                if(body || r.wire!=2)return {};body=true;
+                Reader b(r.data,r.size);Field v;
+                while(b.next(v)){
+                    if(v.key==1){if(code || v.wire!=0)return {};code=true;out.errorCode=int(int32_t(v.value));}
+                    else if(v.key==2 || v.key==3){
+                        const unsigned bit=1u<<v.key;
+                        if((modeFields&bit) || v.wire!=0 || v.value>3)return {};
+                        modeFields|=bit;
+                        if(v.key==2)out.requestedMode=static_cast<PrivacyMode>(v.value);
+                        else out.currentMode=static_cast<PrivacyMode>(v.value);
+                    }
+                }
+                if(!b.good())return {};
+            }
+        }
+        if(!rpc.good())return {};
+    }
+    // An empty privacy body has protobuf's default error_code=0. A bare header
+    // or another RPC's response must never confirm this operation.
+    if(!outer.good() || !response || !header || !id || !body)return {};
+    return out;
+}
 Bytes clipboardTextRpc(uint64_t id,const std::string &text){
     if(!id || text.empty() || text.size()>2048 || text.find('\0')!=std::string::npos)
         throw std::invalid_argument("Invalid text input size");

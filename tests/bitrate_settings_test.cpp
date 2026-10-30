@@ -47,6 +47,48 @@ static bool hasKey(const uu::Bytes &b,unsigned key) {
 }
 int main() {
     try {
+        for(auto mode:{uu::PrivacyMode::Off,uu::PrivacyMode::Normal,uu::PrivacyMode::ScreenOff}){
+            const auto packet=uu::privacyScreenRpc(17,mode);
+            const auto rpc=get(packet,21,2).bytes;
+            require(get(get(rpc,1,2).bytes,1,0).value==17);
+            const auto body=get(rpc,7,2).bytes;
+            require(get(body,1,0).value==unsigned(mode!=uu::PrivacyMode::Off));
+            require(get(body,2,0).value==unsigned(mode));
+        }
+        for(unsigned invalid:{0u,4u}){
+            bool rejected=false;
+            try{uu::privacyScreenRpc(17,static_cast<uu::PrivacyMode>(invalid));}
+            catch(const std::invalid_argument &){rejected=true;}
+            require(rejected);
+        }
+        // Main22 -> RpcResponse3. Success code 0 is omitted by the host's
+        // protobuf encoder; a header without the privacy body is not success.
+        uu::Bytes privacyOk={0xb2,0x01,0x06,0x0a,0x02,0x08,0x11,0x1a,0x00};
+        auto privacyAck=uu::parsePrivacyRpcAck(privacyOk.data(),privacyOk.size());
+        require(privacyAck && privacyAck->requestId==17 && privacyAck->errorCode==0);
+        require(privacyAck->currentMode==uu::PrivacyMode::Unknown);
+        // Requested enhanced=3 but actual normal=2 must remain distinguishable.
+        uu::Bytes fallback={0xb2,0x01,0x0a,0x0a,0x02,0x08,0x11,0x1a,0x04,0x10,0x03,0x18,0x02};
+        privacyAck=uu::parsePrivacyRpcAck(fallback.data(),fallback.size());
+        require(privacyAck && privacyAck->requestedMode==uu::PrivacyMode::ScreenOff &&
+                privacyAck->currentMode==uu::PrivacyMode::Normal);
+        for(unsigned mode:{1u,2u,3u}){
+            auto ack=fallback;ack[10]=uint8_t(mode);ack[12]=uint8_t(mode);
+            privacyAck=uu::parsePrivacyRpcAck(ack.data(),ack.size());
+            require(privacyAck && unsigned(privacyAck->requestedMode)==mode && unsigned(privacyAck->currentMode)==mode);
+        }
+        auto badMode=fallback;badMode[12]=4;
+        require(!uu::parsePrivacyRpcAck(badMode.data(),badMode.size()));
+        auto duplicate=fallback;duplicate[2]+=2;duplicate[8]+=2;duplicate.insert(duplicate.end(),{0x18,0x03});
+        require(!uu::parsePrivacyRpcAck(duplicate.data(),duplicate.size()));
+        auto badWire=fallback;badWire[11]=0x1a;
+        require(!uu::parsePrivacyRpcAck(badWire.data(),badWire.size()));
+        uu::Bytes privacyReject={0xb2,0x01,0x08,0x0a,0x02,0x08,0x11,0x1a,0x02,0x08,0x05};
+        privacyAck=uu::parsePrivacyRpcAck(privacyReject.data(),privacyReject.size());
+        require(privacyAck && privacyAck->errorCode==5);
+        require(!uu::parsePrivacyRpcAck(privacyReject.data(),privacyReject.size()-1));
+        uu::Bytes privacyHeaderOnly={0xb2,0x01,0x04,0x0a,0x02,0x08,0x11};
+        require(!uu::parsePrivacyRpcAck(privacyHeaderOnly.data(),privacyHeaderOnly.size()));
         for(int mbps:{5,12,20,30,100})for(bool hevc:{false,true}) {
             const auto bps=uint64_t(mbps)*1000000;
             auto initial=uu::connectOptions(1280,720,60,6,mbps,hevc);

@@ -5,10 +5,13 @@ class NativeTouch {
     std::vector<Finger> fingers;
     bool blocked=false;
     Uint32 lastSent=0;
+    std::optional<SDL_FPoint> lastPointer;
     uu::Json points(const std::vector<Finger> &items){
         auto out=uu::Json::array();for(const auto &f:items)out.push_back({{"id",f.id},{"x",f.x},{"y",f.y}});return out;
     }
 public:
+    std::optional<SDL_FPoint> pointerPosition()const{return lastPointer;}
+    void forgetPointer(){lastPointer.reset();}
     template<class Send>void cancel(Send send,bool wait=true){
         if(!fingers.empty())send(uu::Json{{"action","touch_native"},{"type",4},{"points",uu::Json::array()}});
         fingers.clear();blocked=wait;
@@ -32,6 +35,7 @@ public:
             next.push_back({p.finger_id,id,std::clamp((x-v.x)/float(v.w),0.f,1.f),std::clamp((y-v.y)/float(v.h),0.f,1.f)});
         }
         std::sort(next.begin(),next.end(),[](const Finger&a,const Finger&b){return a.id<b.id;});
+        if(!next.empty())lastPointer=SDL_FPoint{next.front().x,next.front().y};
         const auto data=points(next);const bool countChange=next.size()!=fingers.size();
         if(data==points(fingers) && (next.empty() || now-lastSent<250))return;
         if(!countChange && now-lastSent<16)return;

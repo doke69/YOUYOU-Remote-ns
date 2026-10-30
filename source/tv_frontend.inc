@@ -4,7 +4,7 @@ namespace tvui {
 constexpr SDL_Color bg{30,30,33,255}, panel{49,53,60,255}, blue{58,123,252,255},
     label{176,179,184,255}, ink{255,255,255,255};
 enum class Page {Home,Devices,Toolbar,Display,Quality,Picture,Peripherals,Gamepad,
-    Schemes,Guide,More,Network,Safety,Windows,Account,Login,Disconnect,Bitrate=18,Resolution,Codec,Touch,Keyboard,Stats,InputMode,Mouse,Audio,QualityPreset,Playout,Logout,About,WindowsConfirm,AppLaunch,StreamPreview,XboxLayout,DecodeProfile};
+    Schemes,Guide,More,Network,Safety,Windows,Account,Login,Disconnect,Bitrate=18,Resolution,Codec,Touch,Keyboard,Stats,InputMode,Mouse,Audio,QualityPreset,Playout,Logout,About,WindowsConfirm,AppLaunch,StreamPreview,XboxLayout,DecodeProfile,ScreenProtection};
 struct Frame {Page page; int focus=0;};
 enum class Kind {Button,Menu,Icon,Tile,Shortcut,Tab,Toggle};
 struct Button {SDL_Rect box; std::string title; int action; bool enabled=true; bool chosen=false;std::string value;Kind kind=Kind::Button;};
@@ -127,6 +127,17 @@ bool image(SDL_Renderer *r,const std::string &name,SDL_Rect dst,int w=64,int h=6
 #endif
         std::vector<unsigned char> pixels(size_t(w)*h*4);
         if(!file.read(reinterpret_cast<char*>(pixels.data()),pixels.size())){missing.push_back(name);return symbol(r,name,dst);}
+        if(name=="youyou-mark"){
+            // Apply the rounded mask once when loading the cached logo.
+            const float radius=std::min(w,h)*.22f;
+            for(int y=0;y<h;++y)for(int x=0;x<w;++x){
+                const float dx=std::max(std::abs(x+.5f-w*.5f)-(w*.5f-radius),0.f);
+                const float dy=std::max(std::abs(y+.5f-h*.5f)-(h*.5f-radius),0.f);
+                const float coverage=std::clamp(radius+.5f-std::hypot(dx,dy),0.f,1.f);
+                auto &alpha=pixels[(size_t(y)*w+x)*4+3];
+                alpha=Uint8(std::round(alpha*coverage));
+            }
+        }
         auto *surface=SDL_CreateRGBSurfaceWithFormatFrom(pixels.data(),w,h,32,w*4,SDL_PIXELFORMAT_RGBA32);
         if(!surface)return false;
         auto *texture=uu::display::textureFromSurface(r,surface);SDL_FreeSurface(surface);
@@ -249,7 +260,7 @@ void homeHotkeys(SDL_Renderer *r,Fonts &f) {
     aligned(r,f.hint,"键鼠模式按一下；手柄模式长按",{797,565,376,28},label);
 }
 bool opensPage(int a) {
-    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||a==514||(a>=47 && a<=58)||a==70||a==613||(a>=74 && a<=76);
+    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||a==514||(a>=47 && a<=58)||a==70||a==757||a==613||(a>=74 && a<=76);
 }
 void loginHeader(SDL_Renderer *r,Fonts &f) {
     backdrop(r);brand(r,f);
@@ -287,6 +298,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
     int scheme=1,draft=1,fps=snapshot.fps==30?30:60;
     int resolution=720,codec=1,quality=2,bufferMs=16,touchMode=0,inputMode=0,volume=75,mouseSpeed=2;
     bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true,networkOverlay=false,nativeMultitouch=true;
+    int previewPrivacyMode=1;
     const char *qualityNames[]={"省流","清晰","高清","原画"};
     const int qualityMbps[]={5,12,20,30};
     std::string keyboardText,pendingShortcut;
@@ -440,11 +452,19 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
         case Page::DecodeProfile:title="解码耗时分析";
             aligned(r,f.small,"离线预览不读取设备频率；运行数据请在真机串流时查看",{120,200,1000,100},label);break;
         case Page::Safety:title="安全";
-            add(848,176,376,72,"自动解锁电脑（尚未开放）",750,false,autoUnlock,"",Kind::Toggle);
-            add(848,260,376,72,"断开后锁定电脑",751,true,autoLock,"",Kind::Toggle);
-            add(848,344,376,72,"串流时电脑静音",752,true,remoteMute,"",Kind::Toggle);
-            add(848,428,376,100,"远程结束后，恢复\n被控端声音设置",753,true,restoreSound,"",Kind::Toggle);
-            aligned(r,f.small,"离线演示 · 尚未向电脑发送设置",{848,552,376,55},label);break;
+            add(848,176,376,64,"自动解锁（尚未开放）",750,false,autoUnlock,"",Kind::Toggle);
+            add(848,252,376,64,"断开后锁定电脑",751,true,autoLock,"",Kind::Toggle);
+            add(848,328,376,64,"串流时电脑静音",752,true,remoteMute,"",Kind::Toggle);
+            add(848,404,376,64,"结束后恢复电脑声音",753,true,restoreSound,"",Kind::Toggle);
+            row(4,"屏幕保护",757,true,false,previewPrivacyMode==3?"显示屏关闭":previewPrivacyMode==2?"隐私保护":"关闭");
+            aligned(r,f.hint,"离线演示，不会向电脑发送设置",{848,570,376,48},label);break;
+        case Page::ScreenProtection:title="屏幕保护";
+            add(848,176,376,64,"隐私保护",755,true,previewPrivacyMode==2,"",Kind::Toggle);
+            aligned(r,f.hint,"遮蔽电脑画面，远程操作继续",{868,248,336,44},label);
+            add(848,320,376,64,"关闭显示屏",756,true,previewPrivacyMode==3,"",Kind::Toggle);
+            aligned(r,f.hint,"使用电脑端增强隐私功能",{868,392,336,44},label);
+            aligned(r,f.hint,"两种模式只能开启一种",{848,466,376,40},label);
+            aligned(r,f.hint,"离线演示，不会操作电脑",{848,526,376,80},label);break;
         case Page::Windows:title="Windows 快捷操作";
             row(0,"锁定桌面",74);row(1,"重启电脑",75);row(2,"关机",76);
             row(3,"任务管理器",72);row(4,"显示桌面",71);row(5,"切换窗口",73);break;
@@ -635,7 +655,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             switch(action) {
             case 99:back();break;case 10:push(Page::Devices);break;case 11:push(Page::Account);break;
             case 12:push(Page::StreamPreview);break;case 14:push(Page::Toolbar);break;case 13:push(Page::Gamepad);break;
-            case 20:push(Page::Disconnect);break;case 21:push(Page::Display);break;case 22:push(Page::Safety);break;
+            case 20:push(Page::Disconnect);break;case 21:push(Page::Display);break;case 22:push(Page::Safety);break;case 757:push(Page::ScreenProtection);break;
             case 23:push(Page::Peripherals);break;case 24:push(Page::More);break;case 25:push(Page::Windows);break;
             case 30:push(Page::Quality);break;case 31:push(Page::Picture);break;
             case 40:fps=60;break;case 41:fps=30;break;
@@ -650,6 +670,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             case 630:sound=!sound;break;
             case 750:notice="自动解锁尚未开放";break;case 751:autoLock=!autoLock;break;
             case 752:remoteMute=!remoteMute;break;case 753:restoreSound=!restoreSound;break;
+            case 755:case 756:{const int selected=action==755?2:3;previewPrivacyMode=previewPrivacyMode==selected?1:selected;notice="离线演示，未向电脑发送请求";break;}
             case 754:networkOverlay=!networkOverlay;notice=networkOverlay?"常驻已开启，返回串流画面查看":"常驻网络信息已关闭";break;
             case 760:back();notice="离线预览不会向电脑执行系统操作";break;
             case 770:push(Page::Login);notice="仅切换预览页面，实际账号保持登录";break;

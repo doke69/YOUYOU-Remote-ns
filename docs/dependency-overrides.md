@@ -1,6 +1,6 @@
 # 依赖源覆盖与可复现性
 
-依赖归档来自scripts/sources.lock.json，fetch_deps.py逐个校验哈希。scripts/dependency-overrides/manifest.json记录31个修改文件的原始和修改后内容哈希；文本哈希将CRLF标准化为LF。
+依赖归档来自scripts/sources.lock.json，fetch_deps.py逐个校验哈希。scripts/dependency-overrides/manifest.json记录33个修改文件的原始和修改后内容哈希；文本哈希将CRLF标准化为LF。
 
 这些覆盖最初整理自0.3.9开发环境，后续按清单维护，保留原版权/许可证头，包括libdatachannel、libjuice、usrsctp及libSRTP构建适配。不要把所有文件统称为MPL：每份文件按自身原有许可。
 

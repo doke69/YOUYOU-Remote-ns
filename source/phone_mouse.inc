@@ -7,6 +7,7 @@ class PhoneMouse {
     unsigned held=0;
     float wheelRemainder=0;
     Uint32 wheelAt=0;
+    std::optional<SDL_FPoint> pendingPointer;
     static SDL_Rect leftBox(){return {512,568,112,80};}
     static SDL_Rect rightBox(){return {640,568,112,80};}
     static SDL_Rect middleBox(){return {1104,348,76,76};}
@@ -14,6 +15,8 @@ class PhoneMouse {
     static bool inside(int x,int y,SDL_Rect box){SDL_Point p{x,y};return SDL_PointInRect(&p,&box);}
     static unsigned button(Role r){return r==Role::Left?1:r==Role::Right?2:r==Role::Middle?3:0;}
 public:
+    void restorePointer(std::optional<SDL_FPoint> position){pendingPointer=position;}
+    void forgetPointer(){pendingPointer.reset();}
     template<class Send> void cancel(Send sendRaw,bool wait=true){
         auto send=[&](uu::Json data){data["source"]="phone_mouse";sendRaw(data);};
         for(unsigned b=1;b<=3;++b)if(held&(1u<<b))
@@ -26,6 +29,14 @@ public:
         auto send=[&](uu::Json data){data["source"]="phone_mouse";sendRaw(data);};
         if(captured || view.w<=0 || view.h<=0){cancel(sendRaw);return;}
         if(blocked){if(!touch.count)blocked=false;return;}
+        // Restore mouse input only after menu contacts have been released.
+        // Use an actual touch position, never a default or stale mouse position.
+        if(pendingPointer){
+            cursorX=pendingPointer->x;cursorY=pendingPointer->y;
+            send(uu::Json{{"action","mouse_move_absolute"},{"abs_x",cursorX},{"abs_y",cursorY}});
+            pendingPointer.reset();
+            uu::diagnostic("phone-mouse-pointer-restore-submitted");
+        }
         const int count=std::clamp(int(touch.count),0,int(std::size(touch.touches)));
         const auto end=std::begin(touch.touches)+count;
         const bool existingPointer=std::any_of(contacts.begin(),contacts.end(),[&](const Contact &c){

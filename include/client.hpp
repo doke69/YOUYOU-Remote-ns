@@ -3,6 +3,7 @@
 #include "input_admission.hpp"
 #include "media.hpp"
 #include "quality_confirmation.hpp"
+#include "quality_rpc.hpp"
 #include "stream_stats.hpp"
 #include "transport.hpp"
 #include "video_assembler.hpp"
@@ -18,6 +19,9 @@
 namespace uu {
 class TurnStreamBridge;
 struct Snapshot {
+    bool privacyPending=false,privacyKnown=false;
+    PrivacyMode privacyMode=PrivacyMode::Off,privacyRequestedMode=PrivacyMode::Unknown;
+    std::string privacyNotice;
     bool textPending=false;
     uint64_t textRevision=0;
     int textResult=0; // 0=idle, 1=pending, 2=paste submitted, 3=failed/cancelled.
@@ -98,6 +102,8 @@ class Client {
     void finishTextInput(int result,const char *notice);
     bool gamepadConnected_=false,nativeTouchActive_=false;
     uint64_t touchPackets_=0,touchFailures_=0;unsigned touchPoints_=0;
+    unsigned soacEvents_ = 0, soacRejected_ = 0;
+    bool remoteDescriptionApplied_ = false;
     std::deque<Json> earlySoac_;
     std::deque<rtc::Candidate> pendingCandidates_;
     SioPacket pending_;
@@ -145,6 +151,8 @@ class Client {
     std::set<std::string> remoteRelayEndpoints_;
     void recordIceCandidate(const char *direction, const char *stage, rtc::Candidate candidate);
     void saveIceDiagnostics();
+    struct PendingPrivacy {uint64_t id;int64_t deadline;PrivacyMode mode;};
+    std::optional<PendingPrivacy> pendingPrivacy_;
     bool rtxEnabled_ = false;
     bool sdpDumpDone_ = false;
     Json qr_;

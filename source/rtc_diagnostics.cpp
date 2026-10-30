@@ -1,5 +1,6 @@
 #include "rtc_diagnostics.hpp"
 #include "diagnostics.hpp"
+#include <cstdio>
 
 namespace uu {
 std::string rtcLogEvent(std::string_view message) {
@@ -8,6 +9,46 @@ std::string rtcLogEvent(std::string_view message) {
         message.remove_prefix(delimiter + 2);
     if (message.substr(0, 11) == "DTLS recv: ")
         message.remove_prefix(11);
+    // Debug libjuice builds prefix messages with the source file and line.
+    if (message.substr(0, 15) == "juice: agent.c:") {
+        const auto separator = message.find(": ", 15);
+        if (separator != message.npos) {
+            const auto line = message.substr(15, separator - 15);
+            if (!line.empty() && line.find_first_not_of("0123456789") == line.npos)
+                return rtcLogEvent(std::string("juice: ") + std::string(message.substr(separator + 2)));
+        }
+    }
+    // Only copy checked integer fields from our own ICE events; discard all
+    // other library text, which can contain addresses or credentials.
+    if (message.substr(0, 15) == "juice: UU_DIAG_") {
+        const std::string text(message);
+        int id = 0, local = 0, remote = 0, end = 0;
+        if (std::sscanf(text.c_str(), "juice: UU_DIAG_PAIR_CREATED %d %d %d%n", &id, &local, &remote, &end) == 3 &&
+            end == int(text.size()) && id >= 0 && id < 4096 && local >= -1 && local <= 4 && remote >= -1 && remote <= 4)
+            return "ice-pair-created-id-" + std::to_string(id) + "-local-" + std::to_string(local) + "-remote-" + std::to_string(remote);
+        for (const auto &item : {std::pair<const char *, const char *>{"SENT", "sent"}, {"FAILED", "failed"},
+                                 {"ASYMMETRIC", "asymmetric"}, {"SUCCEEDED", "succeeded"}}) {
+            const std::string format = std::string("juice: UU_DIAG_PAIR_") + item.first + " %d%n";
+            end = 0;
+            if (std::sscanf(text.c_str(), format.c_str(), &id, &end) == 1 && end == int(text.size()) && id >= 0 && id < 4096)
+                return std::string("ice-pair-") + item.second + "-id-" + std::to_string(id);
+        }
+        if (message == "juice: UU_DIAG_ROLE_CONTROLLING") return "ice-role-controlling";
+        if (message == "juice: UU_DIAG_ROLE_CONTROLLED") return "ice-role-controlled";
+        if (message == "juice: UU_DIAG_TURN_ALLOCATED") return "turn-allocated";
+        if (message == "juice: UU_DIAG_TURN_TIMEOUT_OR_SEND_FAILURE") return "turn-timeout-or-send-failure";
+        if (message == "juice: UU_DIAG_TURN_CHALLENGE_401") return "turn-auth-challenge-401";
+        if (message == "juice: UU_DIAG_TURN_CHALLENGE_438") return "turn-stale-nonce-438";
+        if (message == "juice: UU_DIAG_TURN_AUTH_FAILED") return "turn-authentication-failed";
+        end=0;
+        if(std::sscanf(text.c_str(),"juice: UU_DIAG_TURN_ERROR %d%n",&id,&end)==1 &&
+           end==int(text.size()) && id>=300 && id<=699)
+            return "turn-response-error-"+std::to_string(id);
+        return {};
+    }
+    if (message == "UU_DIAG_DTLS_START") return "rtc-dtls-start";
+    if (message == "UU_DIAG_DTLS_TX_ATTEMPT") return "rtc-dtls-first-tx-attempt";
+    if (message == "UU_DIAG_DTLS_RX_DELIVERED") return "rtc-dtls-first-rx-delivered";
     struct Rule {
         const char *prefix, *event;
     };

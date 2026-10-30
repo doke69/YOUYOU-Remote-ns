@@ -676,6 +676,7 @@ int main(int, char **) {
                 SDL_Rect viewport{0, 0, 1280, 720};
                 auto send = [&](const uu::Json &data) { client.command("input", data); };
                 tvui::LiveFrontend liveUi(client,media,renderer);
+                bool previousMultitouch=liveUi.multitouch();
                 // Restore a validated local session first; scan only when absent/revoked.
                 client.command("startup");
                 while (running) {
@@ -915,6 +916,10 @@ int main(int, char **) {
                         HidTouchScreenState touch{};
                         hidGetTouchScreenStates(&touch, 1);
                         if(liveUi.takeZoomReset())streamTouch.resetZoom();
+                        if(previousMultitouch!=liveUi.multitouch()){
+                            phoneMouse.restorePointer(liveUi.multitouch()?std::nullopt:nativeTouch.pointerPosition());
+                            previousMultitouch=liveUi.multitouch();
+                        }
                         if(liveUi.multitouch()){
                             phoneMouse.cancel(send);
                             streamTouch.cancel(send);streamTouch.resetZoom();
@@ -937,6 +942,7 @@ int main(int, char **) {
                     } else {
                         nativePadRequested=false;lastNativePad.clear();plusPending=startPulse=false;
                         if (wasStreaming) {
+                            nativeTouch.forgetPointer();phoneMouse.forgetPointer();
                             streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;
                             uu::display::resetVideo();
                             if (video) {
@@ -1175,7 +1181,8 @@ int main(int, char **) {
                             if(persistentNetwork && !liveUi.active())compactNetworkInfo(renderer,fonts.hint,panelStats,
                                 streamingSince?Uint32((now-streamingSince)/1000):0U);
                         }
-                        if(!liveUi.multitouch() && !liveUi.captures())phoneMouse.draw(renderer,fonts);
+                        if(!liveUi.multitouch() && !liveUi.captures())
+                            phoneMouse.draw(renderer,fonts);
                         liveUi.draw(renderer,fonts,state,panelStats);
                         drawMaxUs=std::max(drawMaxUs,(SDL_GetPerformanceCounter()-drawStarted)*counterToUs);
                     } else {
