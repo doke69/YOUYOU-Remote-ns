@@ -460,6 +460,7 @@ void DtlsTransport::start() {
 
 	{
 		std::lock_guard lock(mSslMutex);
+		PLOG_INFO << "UU_DIAG_DTLS_START";
 		size_t mtu = mMtu.value_or(DEFAULT_MTU) - 8 - 40; // UDP/IPv6
 		mbedtls_ssl_set_mtu(&mSsl, static_cast<unsigned int>(mtu));
 		PLOG_VERBOSE << "DTLS MTU set to " << mtu;
@@ -635,6 +636,9 @@ int DtlsTransport::WriteCallback(void *ctx, const unsigned char *buf, size_t len
 	auto *t = static_cast<DtlsTransport *>(ctx);
 	try {
 		if (len > 0) {
+			if (t->state() == State::Connecting && !t->mDiagHandshakeTx.exchange(true)) {
+				PLOG_INFO << "UU_DIAG_DTLS_TX_ATTEMPT";
+			}
 			auto b = reinterpret_cast<const byte *>(buf);
 			t->outgoing(make_message(b, b + len));
 		}
@@ -658,6 +662,9 @@ int DtlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
 			message_ptr message = std::move(*next);
 			if (t->demuxMessage(message))
 				continue;
+			if (t->state() == State::Connecting && !t->mDiagHandshakeRx.exchange(true)) {
+				PLOG_INFO << "UU_DIAG_DTLS_RX_DELIVERED";
+			}
 
 			auto bufMin = std::min(len, size_t(message->size()));
 			std::memcpy(buf, message->data(), bufMin);

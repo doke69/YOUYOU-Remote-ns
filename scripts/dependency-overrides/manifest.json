@@ -39,7 +39,7 @@
     "dependency": "libdatachannel",
     "path": "src/impl/dtlstransport.cpp",
     "upstream_sha256": "516e7d10f3ae05808655923c3e1a99ba54de937459fe73c15fb08e6951c1fd83",
-    "sha256": "e37e4fa40f58224234692b7c91d49075ebddad95a367a18ebcd52d0a737005be"
+    "sha256": "c45a55a98900776e2815902a08e38ac4a090d4bb4b406c03a253c5c9a285af71"
   },
   {
     "dependency": "libdatachannel",
@@ -123,7 +123,7 @@
     "dependency": "libjuice",
     "path": "deps/libjuice/src/agent.c",
     "upstream_sha256": "04d59845ec2fdbc7a9f19043a294a2f554a841a3ab226bdd7db8fc64a5dece5e",
-    "sha256": "a2ebab6591bdec8b2f936927ffa11eec44a898a51dfea780a464e8c674b61742"
+    "sha256": "7c17337e1bb66bf6e7354d15f68efea99cfaea154ae5744709912b2cad017dd2"
   },
   {
     "dependency": "libjuice",
@@ -184,5 +184,17 @@
     "path": "deps/libsrtp/cmake/FindMbedTLS.cmake",
     "upstream_sha256": "247d0c454e012744245c8692085e0a6df451f0f83d255766eec136fc8182ac98",
     "sha256": "b1844644404524881e23ae801c0784a48442af0e5429c9a94a87f0b83eec6e2a"
+  },
+  {
+    "dependency": "libdatachannel",
+    "path": "src/impl/dtlstransport.hpp",
+    "upstream_sha256": "ec3a9ecb29448cdcc16ddc1fdda1db79dbf2088485a936eace231d3bef2ea51b",
+    "sha256": "ad22d2eb83bc20451f310a6cf5e3285e7ca6803f7d208bbb33b6631564085934"
+  },
+  {
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/addr.c",
+    "upstream_sha256": "0798c56fb9127b05187d2cf4a0f0cddbf3eb6d1a5e70fbfc1f411f1db0f21234",
+    "sha256": "40ff153379f76b24b8ae8c9bad73be62e8a44c78c33afc3766926ba9519d65d1"
   }
 ]

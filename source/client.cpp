@@ -7,6 +7,7 @@
 #include "turn_stream.hpp"
 #include "rtc_diagnostics.hpp"
 #include "rtc_signaling.hpp"
+#include "signaling_envelope.hpp"
 #include "signal_pump.hpp"
 #include <algorithm>
 #include <array>
@@ -364,6 +365,15 @@ bool privateCandidate(rtc::Candidate &candidate) {
     return std::sscanf(address->c_str(), "%u.%u.%u.%u", &a,&b,&c,&d) == 4 &&
            (a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254));
 }
+// Diagnostic projection: never include candidate addresses, ports or SDP.
+std::string candidateDiagnostic(rtc::Candidate candidate) {
+    const bool resolved = candidate.resolve(rtc::Candidate::ResolveMode::Simple);
+    const auto family = candidate.family();
+    const char *scope = !resolved ? "unresolved" : privateCandidate(candidate) ? "private" : "other";
+    return "type-" + std::to_string(int(candidate.type())) +
+           "-family-" + std::to_string(int(family)) +
+           "-transport-" + std::to_string(int(candidate.transportType())) + "-scope-" + scope;
+}
 std::string candidateIdentity(rtc::Candidate candidate) {
     if(!candidate.resolve(rtc::Candidate::ResolveMode::Simple)) return {};
     if(!candidate.address() || !candidate.port()) return {};
@@ -427,6 +437,8 @@ void Client::saveIceDiagnostics() {
     } catch(...) { diagnostic("ice-diagnostics-unavailable"); }
 }
 void Client::recordIceCandidate(const char *direction, const char *stage, rtc::Candidate candidate) {
+    diagnostic((std::string("ice-candidate-") + direction + "-" + stage + "-" +
+                candidateDiagnostic(candidate)).c_str());
     // Keep relay correlation even when detailed diagnostics are disabled.
     if(std::string(direction)=="remote" && candidate.type()==rtc::Candidate::Type::Relayed) {
         const auto identity=candidateIdentity(candidate);
@@ -559,6 +571,12 @@ void Client::run() {
             }
             tickQuality();
             tickVideoScale();
+            if(pendingPrivacy_ && monotonicMs()>=pendingPrivacy_->deadline){
+                pendingPrivacy_.reset();
+                std::lock_guard lock(stateMutex_);state_.privacyPending=false;state_.privacyKnown=false;
+                state_.privacyNotice="电脑未确认屏幕保护模式，请检查主机版本和权限";
+                diagnostic("privacy-screen-timeout");
+            }
             if(pendingText_ && monotonicMs()>=pendingText_->deadline)
                 finishTextInput(3,"电脑未确认文字同步，请重试；尚未粘贴");
             if (strictVideo_)
@@ -621,7 +639,19 @@ void Client::run() {
                     diagnostic(("timeout-peer-state-" + std::to_string(int(peer_->state()))).c_str());
                     diagnostic(("timeout-ice-state-" + std::to_string(int(peer_->iceState()))).c_str());
                 }
-                throw std::runtime_error("连接超时，请检查电脑和网络后重试");
+                diagnostic(("signal-timeout-soac-events-" + std::to_string(soacEvents_) +
+                            "-rejected-" + std::to_string(soacRejected_)).c_str());
+                if (!remoteDescriptionApplied_) {
+                    diagnostic("signal-timeout-waiting-description");
+                    throw std::runtime_error("连接超时：未取得有效的电脑协商应答，请检查电脑端和信令连接");
+                }
+                if (iceState_ != rtc::PeerConnection::IceState::Connected &&
+                    iceState_ != rtc::PeerConnection::IceState::Completed) {
+                    diagnostic("signal-timeout-waiting-ice");
+                    throw std::runtime_error("连接超时：电脑协商已完成，但直连或中继路径未建立");
+                }
+                diagnostic("signal-timeout-waiting-secure-channels");
+                throw std::runtime_error("连接超时：网络路径已建立，但加密或数据通道未就绪");
             }
             if (!qr_.is_null() && monotonicMs() >= qrNext_)
                 pollQr();
@@ -633,6 +663,16 @@ void Client::run() {
             const auto reason = rtcLogEvent(error.what());
             if (!reason.empty())
                 diagnostic(reason.c_str());
+            if (peer_) {
+                diagnostic(("failure-peer-state-" + std::to_string(int(peer_->state())) +
+                            "-ice-state-" + std::to_string(int(peer_->iceState()))).c_str());
+                rtc::Candidate local, remote;
+                if (peer_->getSelectedCandidatePair(&local, &remote))
+                    diagnostic(("failure-selected-local-" + candidateDiagnostic(local) +
+                                "-remote-" + candidateDiagnostic(remote)).c_str());
+                else
+                    diagnostic("failure-selected-pair-unavailable");
+            }
             disconnect();
             if (cancel_) {
                 cancel_ = false;
@@ -1075,6 +1115,48 @@ void Client::handle(const Event &event) {
         socket_->open(url, room.at("token").get<std::string>());
         lastPacket_ = monotonicMs();
         deadline_ = monotonicMs() + 45000;
+    } else if(e=="privacy-screen") {
+        if(pendingPrivacy_)return;
+        const auto state=snapshot();
+        if(data.at("deviceId").get<std::string>()!=connectedDeviceId_)return;
+        const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+        if(!state.streaming || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
+            std::lock_guard lock(stateMutex_);state_.privacyNotice="电脑RPC通道尚未就绪，请稍后重试";return;
+        }
+        const auto modeValue=data.at("mode").get<unsigned>();
+        if(modeValue<1 || modeValue>3){diagnostic("privacy-screen-invalid-mode");return;}
+        const auto mode=static_cast<PrivacyMode>(modeValue);const auto id=nextQualityRpc_++;
+        const auto bytes=privacyScreenRpc(id,mode);
+        try{
+            channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+        }catch(const std::exception &){
+            std::lock_guard lock(stateMutex_);state_.privacyKnown=false;state_.privacyNotice="屏幕保护请求发送失败，当前模式未确认";return;
+        }
+        pendingPrivacy_=PendingPrivacy{id,monotonicMs()+8000,mode};
+        std::lock_guard lock(stateMutex_);state_.privacyPending=true;state_.privacyRequestedMode=mode;state_.privacyNotice="正在等待电脑确认屏幕保护模式…";
+        diagnostic(("privacy-screen-request-mode-"+std::to_string(modeValue)).c_str());
+    } else if(e=="privacy-screen-ack") {
+        if(!pendingPrivacy_ || data.at("id").get<uint64_t>()!=pendingPrivacy_->id)return;
+        const auto requested=pendingPrivacy_->mode;pendingPrivacy_.reset();
+        const int code=data.at("code").get<int>();
+        const auto reported=static_cast<PrivacyMode>(data.at("current_mode").get<unsigned>());
+        const auto echoed=static_cast<PrivacyMode>(data.at("requested_mode").get<unsigned>());
+        std::lock_guard lock(stateMutex_);state_.privacyPending=false;
+        // The parser owns mode validation. Only the PC's current mode confirms state.
+        if(reported!=PrivacyMode::Unknown){state_.privacyMode=reported;state_.privacyKnown=true;}
+        else state_.privacyKnown=false;
+        if(code!=0)state_.privacyNotice="电脑未完成屏幕保护设置，错误码 "+std::to_string(code);
+        else if(echoed!=PrivacyMode::Unknown && echoed!=requested)
+            state_.privacyNotice="电脑返回的请求模式不一致，请核对当前屏幕状态";
+        else if(reported==PrivacyMode::Unknown)
+            state_.privacyNotice="电脑已接受请求，但未返回实际模式，请核对显示器";
+        else if(requested==PrivacyMode::ScreenOff && reported==PrivacyMode::Normal)
+            state_.privacyNotice="关闭显示屏未生效，电脑已回退到隐私保护";
+        else if(reported!=requested)state_.privacyNotice="电脑当前模式与请求不同，请核对显示器";
+        else state_.privacyNotice=reported==PrivacyMode::Off?"电脑报告已关闭屏幕保护":
+            reported==PrivacyMode::Normal?"电脑报告已开启隐私保护":"电脑报告显示屏已关闭，请确认实际效果";
+        diagnostic(("privacy-screen-response-code-"+std::to_string(code)+"-requested-"+
+                    std::to_string(unsigned(requested))+"-current-"+std::to_string(unsigned(reported))).c_str());
     } else if(e=="text-channel-state") {
         std::lock_guard lock(stateMutex_);state_.textChannelReady=data.get<bool>();
     } else if(e=="control-channel-state") {
@@ -1157,7 +1239,9 @@ void Client::handle(const Event &event) {
         }
 #endif
     } else if (e == "candidate") {
+        const auto sendStarted = monotonicMs();
         emit("soac", soac(remote_, "candidate", data, ice_, control_));
+        diagnostic(("signal-send-candidate-ms-" + std::to_string(monotonicMs() - sendStarted)).c_str());
         recordIceCandidate("local","sent",rtc::Candidate(data.at("candidate").get<std::string>(),"0"));
         diagnostic("soac-candidate-sent");
     } else if (e == "ice-state" || e == "gathering-state" || e == "signaling-state") {
@@ -1322,8 +1406,10 @@ void Client::dispatch(const SioPacket &p) {
         emit("room_info", nullptr, "room");
         return;
     }
-    if (p.type == 1 || p.type == 4)
+    if (p.type == 1 || p.type == 4) {
+        diagnostic(p.type == 1 ? "signal-socketio-disconnect" : "signal-socketio-connect-error");
         throw std::runtime_error("UU 信令拒绝连接");
+    }
     if (p.type == 3 || p.type == 6) {
         auto it = acks_.find(p.id);
         if (it == acks_.end())
@@ -1388,11 +1474,22 @@ void Client::dispatch(const SioPacket &p) {
                 if(!flat.empty())diagnostic(("forward-setting-"+flat).c_str());
             }
         }
-        if (event == "soac" && p.data.size() > 1) {
+        if (event == "soac") {
+            ++soacEvents_;
+            if (soacEvents_ <= 8) diagnostic("soac-event-received");
+            if (p.data.size() <= 1) {
+                ++soacRejected_;
+                diagnostic("soac-rejected-missing-envelope");
+                throw std::runtime_error("电脑协商消息缺少内容，无法建立连接");
+            }
             if (peer_)
                 handleSoac(p.data[1]);
             else if (earlySoac_.size() < 128)
                 earlySoac_.push_back(p.data[1]);
+            else {
+                diagnostic("soac-early-queue-overflow");
+                throw std::runtime_error("连接建立前的协商消息过多，请重新连接");
+            }
         } else if (event == "released" || event == "left")
             throw std::runtime_error("远控权限已释放或电脑已退出房间");
         if (p.id >= 0)
@@ -1412,6 +1509,9 @@ void Client::beginPeer(const Json &result) {
     ice_ = result.at("ice_id");
     rtc::Configuration config;
     config.disableAutoNegotiation = true;
+    diagnostic("ice-address-format-numeric-v1");
+    diagnostic(result.value("force_relay", false) ? "ice-force-relay-1" : "ice-force-relay-0");
+    // The ICE dependency reports role changes through fixed diagnostic events.
     iceDiagnostics_={{"version",UU_VERSION},{"force_relay",result.value("force_relay",false)},
                      {"candidates",Json::array()},{"path_history",Json::array()},{"truncated",false},
                      {"route_policy",configInt("route_policy",1,0,1)?"ipv6-lan-public-relay":"rfc-default"}};
@@ -1457,6 +1557,8 @@ void Client::beginPeer(const Json &result) {
     auto relayIndex=[](Relay type){return type==Relay::TurnTls?2:type==Relay::TurnTcp?1:0;};
     for(const auto &server:config.iceServers)
         if(server.type==rtc::IceServer::Type::Turn) ++available[relayIndex(server.relayType)];
+    diagnostic(("turn-advertised-udp-"+std::to_string(available[0])+"-tcp-"+
+                std::to_string(available[1])+"-tls-"+std::to_string(available[2])).c_str());
     const auto requested=configValue("turn_transport");
     int mode=requested=="tls"?2:requested=="tcp"?1:requested=="udp"?0:reconnectAttempts_%3;
 #ifndef __SWITCH__
@@ -1467,6 +1569,7 @@ void Client::beginPeer(const Json &result) {
         diagnostic("turn-transport-requested-mode-unavailable");
     }
     turnUplinkMode_=mode==2?"TLS":mode==1?"TCP":"UDP";
+    diagnostic(mode==2?"turn-selected-tls":mode==1?"turn-selected-tcp":"turn-selected-udp");
     std::vector<rtc::IceServer> filtered;
     for(auto server:config.iceServers) {
         if(server.type==rtc::IceServer::Type::Stun) {filtered.push_back(std::move(server));continue;}
@@ -1608,6 +1711,7 @@ void Client::beginPeer(const Json &result) {
                 const auto settingSync=parseCaptureSettingSync(bytes,size);
                 const auto ack=acceptRpc?parseCaptureRpcAck(bytes,size):std::optional<CaptureRpcAck>{};
                 const auto textAck=acceptRpc?parseTextRpcAck(bytes,size):std::optional<TextRpcAck>{};
+                const auto privacyAck=acceptRpc?parsePrivacyRpcAck(bytes,size):std::optional<PrivacyRpcAck>{};
                 std::string streamerShape,channelShape;
                 if(verboseDiagnostics() && streamerData)
                     streamerShape=streamerDataShape(bytes,size);
@@ -1617,7 +1721,7 @@ void Client::beginPeer(const Json &result) {
                     diagnostic(("streamer-data-"+streamerShape).c_str());
                 if(!channelShape.empty())
                     diagnostic(("channel-data-"+labelText+"-"+channelShape).c_str());
-                if(!screens && !ack && !textAck && !settingSync)return;
+                if(!screens && !ack && !textAck && !privacyAck && !settingSync)return;
                 if(auto queue=inbox.lock()){
                     std::lock_guard lock(queue->mutex);
                     if(queue->events.size()>124)return;
@@ -1638,12 +1742,13 @@ void Client::beginPeer(const Json &result) {
                     }
                     if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
                     if(textAck)queue->events.push_back({"text-input-ack",{{"id",textAck->requestId},{"status",textAck->status}},generation});
+                    if(privacyAck)queue->events.push_back({"privacy-screen-ack",{{"id",privacyAck->requestId},{"code",privacyAck->errorCode},{"requested_mode",unsigned(privacyAck->requestedMode)},{"current_mode",unsigned(privacyAck->currentMode)}},generation});
                     queue->cv.notify_one();
                 }
             });
         }
     }
-    setState("connecting", "正在建立音视频通道…");
+    setState("connecting", "正在等待电脑协商应答…");
     diagnostic("rtc-offer");
     peer_->setLocalDescription();
     for (const auto &e : earlySoac_)
@@ -1651,15 +1756,24 @@ void Client::beginPeer(const Json &result) {
     earlySoac_.clear();
 }
 void Client::handleSoac(const Json &packet) {
-    if (!packet.contains("data") || !packet["data"].is_object())
-        return;
-    const auto &d = packet["data"];
-    if (d.contains("ice_id")) {
-        auto idString = [](const Json &id) { return id.is_string() ? id.get<std::string>() : id.dump(); };
-        if (idString(d["ice_id"]) != idString(ice_))
+    const auto status = inspectSoac(packet, ice_);
+    if (status != SoacStatus::Accepted) {
+        ++soacRejected_;
+        if (status == SoacStatus::SessionMismatch || status == SoacStatus::UnknownType) {
+            if (soacRejected_ <= 8)
+                diagnostic(status == SoacStatus::SessionMismatch ? "soac-rejected-session-mismatch"
+                                                                 : "soac-ignored-unknown-type");
             return;
+        }
+        diagnostic(status == SoacStatus::InvalidEnvelope ? "soac-rejected-invalid-envelope"
+                                                         : "soac-rejected-invalid-payload");
+        throw std::runtime_error("电脑协商消息格式不兼容，无法建立连接");
     }
-    const auto type = d.value("type", std::string{});
+    const auto &d = packet.at("data");
+    const auto &type = d.at("type").get_ref<const std::string &>();
+    // Record receipt before codec validation, without SDP or session identifiers.
+    if (type == "answer") diagnostic("soac-answer-received");
+    else if (type == "offer" || type == "restart_ice") diagnostic("soac-offer-received");
 #ifdef UU_TWCC_OBSERVE_CLIENT
     if (type == "offer" || type == "answer" || type == "restart_ice") {
         stopFeedbackObservation();
@@ -1721,17 +1835,20 @@ void Client::handleSoac(const Json &packet) {
             }
         }
     }
-    if (type == "answer")
-        diagnostic("soac-answer-received");
-    else if (type == "offer" || type == "restart_ice")
-        diagnostic("soac-offer-received");
+    const auto signalStarted = monotonicMs();
     const auto result = applyRemoteSignal(*peer_, d, pendingCandidates_);
+    if (type == "answer" || type == "offer" || type == "restart_ice" || type == "candidate")
+        diagnostic(("signal-apply-" + type + "-ms-" + std::to_string(monotonicMs() - signalStarted)).c_str());
     if(type=="candidate" && (result==RemoteSignal::CandidateApplied || result==RemoteSignal::CandidateQueued)) {
         const auto &source=d.contains("candidate") && d["candidate"].is_object()?d["candidate"]:d;
         recordIceCandidate("remote",result==RemoteSignal::CandidateApplied?"applied":"queued",
                            rtc::Candidate(source.at("candidate").get<std::string>(),"0"));
     }
     if(result==RemoteSignal::Description) {
+        remoteDescriptionApplied_ = true;
+        if (!snapshot().streaming && iceState_ != rtc::PeerConnection::IceState::Connected &&
+            iceState_ != rtc::PeerConnection::IceState::Completed)
+            setState("connecting", "电脑已应答，正在检测可用网络路径…");
 #ifdef UU_TWCC_OBSERVE_CLIENT
         try {
             feedbackRemoteCaps_ = twcc::NegotiationCapabilities::fromSdp(
@@ -1941,7 +2058,9 @@ void Client::disconnect() {
     qualityApply_.beginRequest();
     pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
     setVideoScaleNotice("");
-    {std::lock_guard lock(stateMutex_);state_.qualityPending=false;state_.settingApplyPending=false;}
+    pendingPrivacy_.reset();
+    {std::lock_guard lock(stateMutex_);state_.qualityPending=false;state_.settingApplyPending=false;
+        state_.privacyPending=false;state_.privacyKnown=false;state_.privacyMode=PrivacyMode::Off;state_.privacyRequestedMode=PrivacyMode::Unknown;state_.privacyNotice.clear();}
     connectedSince_=0;
     if (strictVideo_)
         strictVideo_->shutdown();
@@ -1955,6 +2074,8 @@ void Client::disconnect() {
     deadline_ = 0;
     lastKeyframeRequest_ = 0;
     qr_ = nullptr;
+    soacEvents_ = soacRejected_ = 0;
+    remoteDescriptionApplied_ = false;
     earlySoac_.clear();
     pendingCandidates_.clear();
     acks_.clear();
@@ -2257,6 +2378,9 @@ void Client::refreshStats(int64_t now) {
             stats.remoteEndpoint=endpoint(remote);
             const auto summary="transport="+stats.transport+"\nlocal="+stats.localEndpoint+"\nremote="+stats.remoteEndpoint+"\n";
             if (summary!=lastSelectedPath_) {
+                diagnostic(("ice-selected-local-" + candidateDiagnostic(local) +
+                            "-remote-" + candidateDiagnostic(remote) +
+                            "-remote-relay-match-" + (matchedRemoteRelay ? "1" : "0")).c_str());
                 recordSelectedPath(summary);lastSelectedPath_=summary;
                 if(diagEnabled()) {
                     auto &history=iceDiagnostics_["path_history"];

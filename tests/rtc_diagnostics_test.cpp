@@ -21,6 +21,15 @@ int main() {
         check(uu::rtcLogEvent("juice: Using TURN server private-host private-token").empty());
         check(uu::rtcLogEvent("SDP private-token: SCTP connected").empty());
         check(uu::rtcLogEvent("private-token").empty());
+        check(uu::rtcLogEvent("juice: UU_DIAG_ROLE_CONTROLLING") == "ice-role-controlling");
+        check(uu::rtcLogEvent("juice: UU_DIAG_TURN_ALLOCATED") == "turn-allocated");
+        check(uu::rtcLogEvent("juice: UU_DIAG_TURN_ERROR 403") == "turn-response-error-403");
+        check(uu::rtcLogEvent("juice: UU_DIAG_TURN_ERROR 403 private-token").empty());
+        check(uu::rtcLogEvent("juice: agent.c:241: UU_DIAG_ROLE_CONTROLLING") == "ice-role-controlling");
+        check(uu::rtcLogEvent("juice: UU_DIAG_PAIR_CREATED 3 0 2") == "ice-pair-created-id-3-local-0-remote-2");
+        check(uu::rtcLogEvent("juice: UU_DIAG_PAIR_SUCCEEDED 3") == "ice-pair-succeeded-id-3");
+        check(uu::rtcLogEvent("juice: UU_DIAG_PAIR_SUCCEEDED 3 private-token").empty());
+        check(uu::rtcLogEvent("UU_DIAG_DTLS_RX_DELIVERED") == "rtc-dtls-first-rx-delivered");
         check(uu::rtcLogEvent("Handshake failed [code=1234567890] private-token") ==
               "rtc-dtls-handshake-error");
         std::array<uint8_t, 32> packet{};

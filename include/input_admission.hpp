@@ -16,7 +16,7 @@ inline bool isPeerInputCommand(const std::string &name) {
     // Short-lived remote actions. Login/refresh/connect/local config stay
     // generation 0 and are intentionally not gated here.
     return name == "input" || name == "release" || name == "text-input" ||
-           name == "text-input-cancel" || name == "system-action";
+           name == "text-input-cancel" || name == "system-action" || name == "privacy-screen";
 }
 
 inline void openInputAdmission(InputAdmission &admission, uint64_t generation) {
