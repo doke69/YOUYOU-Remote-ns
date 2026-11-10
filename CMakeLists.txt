@@ -305,7 +305,8 @@ if(UU_SWITCH)
     set(UU_OWN_UI_ASSETS
         "${CMAKE_SOURCE_DIR}/assets/youyou-mark.rgba"
         "${CMAKE_SOURCE_DIR}/assets/touch.rgba"
-        "${CMAKE_SOURCE_DIR}/assets/mouse.rgba")
+        "${CMAKE_SOURCE_DIR}/assets/mouse.rgba"
+        "${CMAKE_SOURCE_DIR}/assets/pointer.rgba")
     foreach(asset IN LISTS UU_OWN_UI_ASSETS)
         get_filename_component(asset_name "${asset}" NAME)
         file(MAKE_DIRECTORY "${UU_ROMFS_DIR}/ui-tv")

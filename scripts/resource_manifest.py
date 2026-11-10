@@ -18,7 +18,7 @@ PRIVATE_UI = [
     "picture.rgba", "radio.rgba", "radio_empty.rgba", "refresh.rgba",
     "safety.rgba", "sound.rgba", "windows.rgba",
 ]
-OWN_UI = ["youyou-mark.rgba", "touch.rgba", "mouse.rgba"]
+OWN_UI = ["youyou-mark.rgba", "touch.rgba", "mouse.rgba", "pointer.rgba"]
 FONTS = ["NotoSansSC-Regular.otf", "NotoSansSC-Bold.otf", "OFL.txt"]
 SHADERS = ["nv12.vert", "nv12.frag", "ui.vert", "ui.frag"]
 LICENSES = [

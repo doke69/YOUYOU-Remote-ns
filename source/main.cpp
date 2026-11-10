@@ -1181,8 +1181,17 @@ int main(int, char **) {
                             if(persistentNetwork && !liveUi.active())compactNetworkInfo(renderer,fonts.hint,panelStats,
                                 streamingSince?Uint32((now-streamingSince)/1000):0U);
                         }
-                        if(!liveUi.multitouch() && !liveUi.captures())
+                        // The stream only carries the pointer the PC can still capture.
+                        // Applications that hide or replace the system cursor inside
+                        // their own window leave the client with nothing to show, and
+                        // no mouse message brings it back. Draw the arrow locally in
+                        // phone-pointer mode, the way the Android client already does.
+                        if(!liveUi.multitouch() && !liveUi.captures()) {
+                            tvui::image(renderer,"pointer",
+                                SDL_Rect{touchView.x+int(cursorX*touchView.w)-1,
+                                         touchView.y+int(cursorY*touchView.h)-1,32,32},64,64);
                             phoneMouse.draw(renderer,fonts);
+                        }
                         liveUi.draw(renderer,fonts,state,panelStats);
                         drawMaxUs=std::max(drawMaxUs,(SDL_GetPerformanceCounter()-drawStarted)*counterToUs);
                     } else {
