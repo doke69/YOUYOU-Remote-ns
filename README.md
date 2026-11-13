@@ -116,5 +116,3 @@ libcurl 处理 HTTPS / TLS WebSocket；libdatachannel 及其依赖处理 ICE、D
 <p>
   <img src="assets/donate/alipay.jpg" alt="支付宝收款码：请我喝瓶可乐" width="180" />
 </p>
-
-使用支付宝扫一扫，或保存图片后在支付宝中识别。
