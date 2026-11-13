@@ -9,12 +9,18 @@
 namespace uu::twcc {
 // Pure helpers only: not wired to SDP, packet reception or RTCP sending.
 enum class ExtensionStatus { Found, Missing, UnsupportedProfile, Malformed };
+enum class TransportSequenceVersion { V1, V2 };
+struct FeedbackRequest {
+    bool includeTimestamps;
+    uint16_t sequenceCount;
+};
 struct TransportSequence {
     ExtensionStatus status = ExtensionStatus::Missing;
     uint16_t sequence = 0;
+    std::optional<FeedbackRequest> request{}; // V2 only; zero count means no request.
 };
 TransportSequence readTransportSequence(const uint8_t *rtp, size_t size,
-                                        uint8_t negotiatedExtensionId);
+    uint8_t negotiatedExtensionId, TransportSequenceVersion version = TransportSequenceVersion::V1);
 
 enum class EncodeStatus { Ok, InvalidInput, SplitRequired, PacketTooLarge };
 struct EncodedFeedback {
@@ -28,11 +34,14 @@ struct EncodedFeedback {
 // Missing means not yet observed, not a declaration of permanent packet loss.
 // At most 512 statuses; no implicit sequence tracking. An all-missing range
 // requires an explicit reference on the same monotonic clock.
+// V2 requests may omit receive deltas. Status symbols/reference time and
+// normal delta-range validation remain; the default V1 encoding is unchanged.
 EncodedFeedback encodeFeedback(uint32_t senderSsrc, uint32_t mediaSsrc,
     uint16_t baseSequence, uint8_t feedbackCount,
     const std::vector<std::optional<int64_t>> &arrivalTimesUs,
     size_t maxPacketBytes = 1200,
-    std::optional<int64_t> emptyReferenceUs = std::nullopt);
+    std::optional<int64_t> emptyReferenceUs = std::nullopt,
+    bool includeTimestamps = true);
 
 enum class ArrivalStatus { Accepted, Duplicate, TooOld, WindowFull, AmbiguousSequence, InvalidTime };
 struct RecordedArrival { ArrivalStatus status; int64_t extendedSequence = 0; };
@@ -47,7 +56,8 @@ struct ArrivalSlice {
 class ArrivalWindow {
   public:
     static constexpr size_t Capacity = 4096;
-    RecordedArrival record(uint16_t transportSequence, int64_t arrivalUs);
+    RecordedArrival record(uint16_t transportSequence, int64_t arrivalUs,
+        bool evictOldest = false, std::optional<int64_t> protectedFirst = std::nullopt);
     std::optional<ArrivalSlice> snapshot(int64_t first, size_t count) const;
     bool retireBefore(int64_t nextSequence);
     void reset();
@@ -75,12 +85,18 @@ struct PreparedFeedback {
     uint8_t feedbackCount = 0;
     bool overlap = false;
 };
+enum class FeedbackMode { Periodic, Requested };
+enum class RequestStatus { Queued, WrongMode, NoRequest, InvalidRange, HistoryUnavailable, QueueFull, QueuedWithUnretainedPrefix };
 // Single owner/external mutex, like ArrivalWindow. Timing must be chosen by
 // the caller: no implicit bandwidth estimator, RTCP budget or network sends.
 class FeedbackCoordinator {
   public:
-    explicit FeedbackCoordinator(FeedbackTiming timing);
+    explicit FeedbackCoordinator(FeedbackTiming timing, FeedbackMode mode = FeedbackMode::Periodic);
     RecordedArrival record(uint16_t sequence, int64_t arrivalUs);
+    // Request anchor MUST be the extended sequence returned by record(), not
+    // a fresh uint16_t subtraction. Retains the requested base when history
+    // starts later; unavailable prefix positions have no receive timestamp.
+    RequestStatus request(int64_t extendedSequence, FeedbackRequest request);
     // A prepared packet remains byte-identical until committed or reset.
     // The pointer is valid only until a modifying call; copy under the same
     // external lock if it must be sent outside that lock.
@@ -100,6 +116,15 @@ class FeedbackCoordinator {
     bool reported(int64_t sequence) const;
     void retireHistory();
     FeedbackTiming timing_;
+    FeedbackMode mode_;
+    struct RequestedRange {
+        int64_t next = 0, last = 0;
+        bool includeTimestamps = true;
+        int64_t referenceUs = 0;
+    };
+    static constexpr size_t RequestCapacity = 8;
+    std::array<RequestedRange, RequestCapacity> requests_{};
+    size_t requestHead_ = 0, requestCount_ = 0;
     ArrivalWindow history_;
     std::array<int64_t, ArrivalWindow::Capacity> reported_{};
     std::optional<Pending> pending_;

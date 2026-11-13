@@ -15,6 +15,10 @@ int main() {
             uu::rtcLogEvent("initSctpTransport@320: Could not bind usrsctp socket, errno=22 private-token") ==
             "rtc-sctp-bind-error-code-22");
         check(uu::rtcLogEvent("SCTP connected") == "rtc-sctp-connected");
+        check(uu::rtcLogEvent("TURN stream bridge failed on selected relay path") == "failure-turn-bridge");
+        check(uu::rtcLogEvent("Invalid compressed SDP base64 private-token") == "failure-sdp-compression");
+        check(uu::rtcLogEvent("Invalid signaling attachment reference") == "failure-signal-attachment");
+        check(uu::rtcLogEvent("Control acknowledgement belongs to another session") == "failure-control-session");
         check(uu::rtcLogEvent("信令连接已断开") == "failure-signal-read");
         check(uu::rtcLogEvent("远控权限已释放或电脑已退出房间") == "failure-control-released");
         check(uu::rtcLogEvent("Signaling write timeout private-token") == "failure-signal-write-timeout");

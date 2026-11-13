@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct AVFrame;
 namespace uu {
@@ -72,6 +73,9 @@ struct MediaStats {
 class Media {
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    void submitVideo(const uint8_t *data, size_t size, uint64_t generation,
+                     std::optional<uint32_t> timestamp, bool hevc,
+                     std::optional<bool> validatedKeyframe, std::vector<uint8_t> *owner);
 
   public:
     Media();
@@ -79,6 +83,8 @@ class Media {
     void video(const uint8_t *data, size_t size, uint64_t generation,
                std::optional<uint32_t> timestamp = std::nullopt, bool hevc = false,
                std::optional<bool> validatedKeyframe = std::nullopt);
+    void video(std::vector<uint8_t> data, uint64_t generation,
+               std::optional<uint32_t> timestamp, bool hevc, bool validatedKeyframe);
     void audio(const uint8_t *data, size_t size, uint64_t generation,
                std::optional<uint32_t> timestamp = std::nullopt);
     uint64_t generation() const;

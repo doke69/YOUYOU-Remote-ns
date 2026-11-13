@@ -13,7 +13,10 @@
 #include "track.hpp"
 
 #include "impl/logcounter.hpp"
+#include "impl/threadpool.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <utility>
 
@@ -25,12 +28,39 @@
 
 namespace rtc {
 
+namespace {
+
+int64_t steadyNowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+} // namespace
+
 static impl::LogCounter COUNTER_BAD_RTP_HEADER(plog::warning, "Number of malformed RTP headers");
 static impl::LogCounter COUNTER_UNKNOWN_PPID(plog::warning, "Number of Unknown PPID messages");
 static impl::LogCounter COUNTER_BAD_NOTIF_LEN(plog::warning,
                                               "Number of Bad-Lengthed notifications");
 static impl::LogCounter COUNTER_BAD_SCTP_STATUS(plog::warning,
                                                 "Number of unknown SCTP_STATUS errors");
+
+void RtcpReceivingSession::setRtcpIdentity(SSRC senderSsrc, string cname) {
+	mRtcpSenderSsrc = senderSsrc;
+	mRtcpCname = std::move(cname);
+	if (!hasRtcpIdentity()) {
+		mRtcpSenderSsrc = 0;
+		mRtcpCname.clear();
+	}
+}
+
+bool RtcpReceivingSession::hasRtcpIdentity() const {
+	return mRtcpSenderSsrc != 0 && remb_detail::validCname(mRtcpCname);
+}
+
+void RtcpReceivingSession::scheduleSenderReportReply(std::function<void()> reply) {
+    impl::ThreadPool::Instance().enqueueDetached(std::move(reply));
+}
 
 void RtcpReceivingSession::incoming(message_vector &messages, const message_callback &send) {
 	size_t kept=0;
@@ -58,7 +88,11 @@ void RtcpReceivingSession::incoming(message_vector &messages, const message_call
 				continue;
 			}
 
-			mSsrc = rtp->ssrc();
+			// Only received primary RTP establishes the REMB target. SR/RR
+			// sender SSRCs below remain valid RR/PLI identities but must not be
+			// used to invent feedback targets.
+			mRtpSsrc = rtp->ssrc();
+			mSsrc = mRtpSsrc;
 
 			updateSeq(rtp->seqNumber());
 
@@ -87,16 +121,28 @@ void RtcpReceivingSession::incoming(message_vector &messages, const message_call
 				mSsrc = rr->senderSSRC();
 				rr->log();
 			} else if (rr->header.payloadType() == 200) { // SR
-				mSsrc = rr->senderSSRC();
+				const SSRC srSsrc = rr->senderSSRC();
+				mSsrc = srSsrc;
 				auto sr = reinterpret_cast<const RtcpSr *>(message->data());
 				mSyncRTPTS = sr->rtpTimestamp();
 				mSyncNTPTS = sr->ntpTimestamp();
+				if (mRtpSsrc != 0 && srSsrc == mRtpSsrc) {
+					// DLSR uses the monotonic receive time of the most recent SR
+					// that matches the primary media source. Keeping it separate
+					// from mSyncNTPTS preserves the existing RR fallback.
+					mLastSrNtp = sr->ntpTimestamp();
+					mLastSrMs = steadyNowMs();
+					mHaveLastSr = true;
+				}
 				sr->log();
 
-				// TODO For the time being, we will send RR's/REMB's when we get an SR
-				pushRR(send, 0);
-				if (unsigned int bitrate = mRequestedBitrate.load(); bitrate > 0)
-					pushREMB(send, bitrate);
+				// A session with a local identity and a known primary media SSRC
+				// always reports as RR + SDES(CNAME); REMB is appended only when a
+				// target has been requested. Without an identity or target the
+				// original bare RR path is retained (for example audio).
+				const unsigned int bitrate = mRequestedBitrate.load();
+				if (!pushCompoundFeedback(send, bitrate))
+					pushRR(send, 0);
 			}
 			break;
 		}
@@ -110,18 +156,61 @@ void RtcpReceivingSession::incoming(message_vector &messages, const message_call
 }
 
 bool RtcpReceivingSession::requestBitrate(unsigned int bitrate, const message_callback &send) {
-	PLOG_DEBUG << "Requesting bitrate: " << bitrate << std::endl;
+	// Do not store the target before the first primary RTP packet or without a
+	// stable local identity: a later SR must not resurrect unvalidated feedback.
+	if (!hasRtcpIdentity() || mRtpSsrc == 0)
+		return false;
+	if (bitrate == 0) {
+		mRequestedBitrate.store(0);
+		return true;
+	}
+	if (!pushCompoundFeedback(send, bitrate))
+		return false;
 	mRequestedBitrate.store(bitrate);
-	pushREMB(send, bitrate);
 	return true;
 }
 
-void RtcpReceivingSession::pushREMB(const message_callback &send, unsigned int bitrate) {
-	auto message = make_message(RtcpRemb::SizeWithSSRCs(1), Message::Control);
-	auto remb = reinterpret_cast<RtcpRemb *>(message->data());
-	remb->preparePacket(mSsrc, 1, bitrate);
-	remb->setSsrc(0, mSsrc);
-	send(message);
+RembReportBlockValues RtcpReceivingSession::makeReportBlockValues() {
+	RembReportBlockValues report;
+	report.mediaSsrc = mRtpSsrc;
+
+	const uint32_t extendedMax = mCycles + uint32_t(mMaxSeq);
+	const uint32_t expected = extendedMax - mBaseSeq + 1;
+	const int64_t totalLost = int64_t(expected) - int64_t(mReceived);
+	report.packetsLost = int32_t(std::clamp<int64_t>(totalLost, -8388608, 8388607));
+
+	const uint32_t expectedInterval = expected - mExpectedPrior;
+	mExpectedPrior = expected;
+	const uint32_t receivedInterval = mReceived - mReceivedPrior;
+	mReceivedPrior = mReceived;
+	const int64_t lostInterval = int64_t(expectedInterval) - int64_t(receivedInterval);
+	report.fractionLost = uint8_t(expectedInterval && lostInterval > 0
+	                                  ? std::min<int64_t>(255, (lostInterval * 256) / expectedInterval)
+	                                  : 0);
+
+	report.highestSeqNo = uint16_t(mMaxSeq);
+	report.seqNoCycles = uint16_t(mCycles >> 16);
+	report.jitter = mJitter;
+	if (mHaveLastSr) {
+		report.lastSr = uint32_t(mLastSrNtp >> 16);
+		report.delaySinceLastSr = remb_detail::dlsrUnits(steadyNowMs(), mLastSrMs);
+	}
+	return report;
+}
+
+bool RtcpReceivingSession::pushCompoundFeedback(const message_callback &send,
+                                                unsigned int bitrate) {
+	if (!hasRtcpIdentity() || mRtpSsrc == 0)
+		return false;
+
+	const RembReportBlockValues report = makeReportBlockValues();
+	auto packet = bitrate == 0
+	                  ? makeCompoundRrSdes(mRtcpSenderSsrc, mRtcpCname, report)
+	                  : makeCompoundRemb(mRtcpSenderSsrc, mRtcpCname, bitrate, report);
+	if (packet.empty())
+		return false;
+	send(make_message(packet.begin(), packet.end(), Message::Control));
+	return true;
 }
 
 void RtcpReceivingSession::pushRR(const message_callback &send, unsigned int lastSrDelay) {

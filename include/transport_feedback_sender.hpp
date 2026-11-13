@@ -39,10 +39,11 @@ enum class FeedbackPollResult {
 };
 enum class FeedbackStopReason {
     None, Requested, ClockInvalid, PendingExpired, SendFailureLimit,
-    CommitRejected, InternalFailure
+    CommitRejected, InternalFailure, StartupTimeout, MissingExtensionTimeout
 };
 struct FeedbackSendCounters {
     uint64_t submitted = 0, sendFailures = 0, budgetDeferred = 0;
+    uint64_t attemptedBytes = 0, submittedBytes = 0; // Plain compound RTCP, before SRTCP/network overhead.
     FeedbackStopReason stopped = FeedbackStopReason::None;
 };
 // Scheduler-driven, one poller per observer; creates no thread/socket/timer.

@@ -28,6 +28,21 @@ class Reader {
     }
     bool good()const{return valid && p==end;}
 };
+bool parsePrivacyStatus(const uint8_t *data,size_t size,PrivacyRpcAck &out) {
+    Reader body(data,size);Field v;unsigned seen=0;
+    while(body.next(v))if(v.key>=1 && v.key<=3){
+        const unsigned bit=1u<<v.key;
+        if((seen&bit) || v.wire!=0)return false;
+        seen|=bit;
+        if(v.key==1)out.errorCode=int(int32_t(v.value));
+        else {
+            if(v.value>3)return false;
+            if(v.key==2)out.requestedMode=static_cast<PrivacyMode>(v.value);
+            else out.currentMode=static_cast<PrivacyMode>(v.value);
+        }
+    }
+    return body.good();
+}
 }
 // APK Main.Message field 3 / General.SimpleAction field 1; enum values
 // recovered from cg.d1. These are one-way commands, not acknowledged RPCs.
@@ -67,7 +82,7 @@ Bytes privacyScreenRpc(uint64_t id,PrivacyMode mode){
 }
 std::optional<PrivacyRpcAck> parsePrivacyRpcAck(const uint8_t *data,size_t size) noexcept{
     if(!data || !size || size>65536)return {};
-    PrivacyRpcAck out;bool response=false,header=false,id=false,body=false,code=false;unsigned modeFields=0;
+    PrivacyRpcAck out;bool response=false,header=false,id=false,body=false;
     Reader outer(data,size);Field f;
     while(outer.next(f))if(f.key==22){
         if(response || f.wire!=2)return {};response=true;
@@ -80,18 +95,7 @@ std::optional<PrivacyRpcAck> parsePrivacyRpcAck(const uint8_t *data,size_t size)
                 if(!h.good())return {};
             }else if(r.key==3){
                 if(body || r.wire!=2)return {};body=true;
-                Reader b(r.data,r.size);Field v;
-                while(b.next(v)){
-                    if(v.key==1){if(code || v.wire!=0)return {};code=true;out.errorCode=int(int32_t(v.value));}
-                    else if(v.key==2 || v.key==3){
-                        const unsigned bit=1u<<v.key;
-                        if((modeFields&bit) || v.wire!=0 || v.value>3)return {};
-                        modeFields|=bit;
-                        if(v.key==2)out.requestedMode=static_cast<PrivacyMode>(v.value);
-                        else out.currentMode=static_cast<PrivacyMode>(v.value);
-                    }
-                }
-                if(!b.good())return {};
+                if(!parsePrivacyStatus(r.data,r.size,out))return {};
             }
         }
         if(!rpc.good())return {};
@@ -100,6 +104,32 @@ std::optional<PrivacyRpcAck> parsePrivacyRpcAck(const uint8_t *data,size_t size)
     // or another RPC's response must never confirm this operation.
     if(!outer.good() || !response || !header || !id || !body)return {};
     return out;
+}
+std::optional<PrivacyRpcAck> parsePrivacyStateNotify(const uint8_t *data,size_t size) noexcept{
+    if(!data || !size || size>65536)return {};
+    PrivacyRpcAck out;bool change=false,privacy=false;unsigned which=0;
+    Reader outer(data,size);Field f;
+    while(outer.next(f))if(f.key==15){
+        if(change || f.wire!=2)return {};change=true;
+        Reader state(f.data,f.size);Field s;
+        while(state.next(s)){
+            // Known SystemStateChange fields are a oneof, not a batch.
+            if(s.key>=1 && s.key<=6){if(++which>1 || s.wire!=2)return {};}
+            if(s.key==5){
+                if(privacy || s.wire!=2)return {};privacy=true;
+                if(!parsePrivacyStatus(s.data,s.size,out))return {};
+            }
+        }
+        if(!state.good())return {};
+    }
+    if(!outer.good() || !change || !privacy)return {};
+    return out;
+}
+Bytes cursorCaptureRpc(uint64_t id){
+    if(!id)throw std::invalid_argument("Invalid cursor capture request");
+    Bytes body,header,rpc,out;integer(body,1,1);
+    integer(header,1,id);message(rpc,1,header);message(rpc,5,body);
+    integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
 }
 Bytes clipboardTextRpc(uint64_t id,const std::string &text){
     if(!id || text.empty() || text.size()>2048 || text.find('\0')!=std::string::npos)
@@ -165,7 +195,7 @@ Bytes videoQualitySettingRpc(uint64_t id,int quality){
 Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenId,int customMbps){
     if(!id || screenId<0 || !((w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080)) ||
        (fps!=30&&fps!=60) || quality<1 || quality>6 || customMbps<0 || customMbps>100 ||
-       (quality==6 && customMbps==0) || (quality!=6 && customMbps!=0))throw std::invalid_argument("Invalid capture settings");
+       (quality==6 && customMbps==0))throw std::invalid_argument("Invalid capture settings");
     Bytes capture,header,rpc,out;
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
     // Preserve the 0.3.25 capture pacing fields; these keep the host frame
@@ -175,18 +205,17 @@ Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenI
     // Connect auto-selection (-1) is not a valid online target. Use the
     // current ID advertised in Main.screens and validated against its list.
     integer(capture,4,unsigned(screenId));integer(capture,5,w);integer(capture,6,h);
-    // TV wire field 8; mobile custom-state -> capture uses bits/second.
-    // Keep chroma settings unchanged and do not treat this request as a
-    // guarantee that a static scene will generate the requested rate.
-    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
+    // Existing wire field 8 uses bits/second. A native quality enum is kept
+    // when requesting an independent limit; host execution needs separate
+    // confirmation. Explicit zero clears the prior requested ceiling.
+    integer(capture,8,uint64_t(customMbps)*1000000u);
     integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
     integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
 }
 
 Bytes qualityUpdateRpc(uint64_t id,int fps,int quality,int screenId,int customMbps){
     if(!id || screenId<0 || (fps!=30&&fps!=60) || quality<1 || quality>6 ||
-       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0) ||
-       (quality!=6&&customMbps!=0))throw std::invalid_argument("Invalid quality update");
+       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0))throw std::invalid_argument("Invalid quality update");
     Bytes capture,header,rpc,out;
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
     integer(capture,12,0);
@@ -194,7 +223,7 @@ Bytes qualityUpdateRpc(uint64_t id,int fps,int quality,int screenId,int customMb
     integer(capture,4,unsigned(screenId));
     // No resolution/max-scale/pixel fields: this request must only update the
     // encoder controls and leave the host capture resolution unchanged.
-    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
+    integer(capture,8,uint64_t(customMbps)*1000000u);
     integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
     integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
 }
@@ -206,8 +235,7 @@ Bytes videoScaleRpc(uint64_t id,int sourceWidth,int sourceHeight,
         (outputWidth==1280&&outputHeight==720) || (outputWidth==1920&&outputHeight==1080);
     if(!id || sourceWidth<1 || sourceHeight<1 || sourceWidth>16384 || sourceHeight>16384 ||
        !outputSupported || screenId<0 || (fps!=30&&fps!=60) || quality<1 || quality>6 ||
-       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0) ||
-       (quality!=6&&customMbps!=0))
+       customMbps<0 || customMbps>100 || (quality==6&&customMbps==0))
         throw std::invalid_argument("Invalid video scale request");
     Bytes capture,header,rpc,out;
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
@@ -218,7 +246,7 @@ Bytes videoScaleRpc(uint64_t id,int sourceWidth,int sourceHeight,
     // the selected stream size. The pixel pair is the mobile-style encoded
     // output bound; max_scale is kept as the same bound for hosts that use it.
     integer(capture,5,unsigned(sourceWidth));integer(capture,6,unsigned(sourceHeight));
-    if(quality==6)integer(capture,8,uint64_t(customMbps)*1000000u);
+    integer(capture,8,uint64_t(customMbps)*1000000u);
     integer(capture,10,3);
     integer(capture,14,unsigned(outputWidth));integer(capture,15,unsigned(outputHeight));
     integer(capture,16,unsigned(outputWidth));integer(capture,17,unsigned(outputHeight));

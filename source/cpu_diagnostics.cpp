@@ -8,6 +8,7 @@
 #include <switch.h>
 #endif
 namespace {
+#ifndef UU_LEAN_STATS
 struct Slot {
     std::atomic<uint32_t> handle{0};
     std::atomic<uint64_t> threadId{0}, seen{0};
@@ -21,9 +22,10 @@ struct Role {
 };
 std::array<Role,6> roles;
 constexpr bool multiSlot(unsigned role) { return role==0 || role==4; }
+#endif
 }
 extern "C" void uu_cpu_mark(unsigned role) noexcept {
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(UU_LEAN_STATS)
     if(role>=roles.size()) return;
     thread_local std::array<uint64_t,6> last{};
     const auto now=armGetSystemTick();
@@ -83,7 +85,7 @@ extern "C" void uu_cpu_mark(unsigned role) noexcept {
 namespace uu {
 std::array<CpuRoleSnapshot,6> cpuDiagnosticsSnapshot() noexcept {
     std::array<CpuRoleSnapshot,6> out{};
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(UU_LEAN_STATS)
     // The UI/telemetry thread and the client thread may both request a
     // snapshot. Serialize the collector so a delta is never observed twice.
     static std::mutex snapshotMutex;

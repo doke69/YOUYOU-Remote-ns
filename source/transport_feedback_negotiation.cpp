@@ -9,6 +9,9 @@ namespace {
 using Media = rtc::Description::Media;
 using Direction = rtc::Description::Direction;
 constexpr const char *Uri = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+constexpr const char *Uri2 = "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-02";
+constexpr const char *AbsSendTimeUri = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+constexpr const char *TransmissionOffsetUri = "urn:ietf:params:rtp-hdrext:toffset";
 bool feedbackProfile(const std::string &protocol) {
     return protocol == "RTP/AVPF" || protocol == "RTP/SAVPF" ||
            protocol == "UDP/TLS/RTP/SAVPF" || protocol == "TCP/TLS/RTP/SAVPF";
@@ -35,7 +38,8 @@ bool isDirection(std::string_view line) {
 // Small capability projection only. Unknown lines are never copied or logged.
 // Deliberately rejects extended negotiation-only IDs and duplicate definitions;
 // this is a final usable mapping inspector, not an offer negotiation engine.
-bool projectCapabilities(std::string_view raw, std::string &projection, bool &singleTransport) {
+bool projectCapabilities(std::string_view raw, std::string &projection, bool &singleTransport,
+                         bool installedSdkView = false) {
     singleTransport = false;
     if (raw.empty() || raw.size() > 256 * 1024) return false;
     CapabilitySection session;
@@ -53,8 +57,8 @@ bool projectCapabilities(std::string_view raw, std::string &projection, bool &si
             line.find('\0') != std::string_view::npos) return false;
         if (starts(line, "a=group:BUNDLE") &&
             (line.size() == 14 || line[14] == ' ' || line[14] == '\t')) {
-            if (current != &session || haveBundle) return false;
-            haveBundle = true;
+            if (current != &session) return false;
+            std::vector<std::string> parsedMids;
             auto mids = line.substr(14);
             while (!mids.empty()) {
                 const auto first = mids.find_first_not_of(" \t");
@@ -62,13 +66,19 @@ bool projectCapabilities(std::string_view raw, std::string &projection, bool &si
                 mids.remove_prefix(first);
                 const auto endMid = mids.find_first_of(" \t");
                 const auto mid = mids.substr(0, endMid);
-                if (bundleMids.size() >= 16 ||
-                    std::find(bundleMids.begin(), bundleMids.end(), mid) != bundleMids.end()) return false;
-                bundleMids.emplace_back(mid);
+                if (parsedMids.size() >= 16 ||
+                    std::find(parsedMids.begin(), parsedMids.end(), mid) != parsedMids.end()) return false;
+                parsedMids.emplace_back(mid);
                 if (endMid == std::string_view::npos) break;
                 mids.remove_prefix(endMid);
             }
-            if (bundleMids.empty()) return false;
+            if (parsedMids.empty()) return false;
+            if (haveBundle) {
+                if (!installedSdkView || parsedMids != bundleMids) return false;
+            } else {
+                bundleMids = std::move(parsedMids);
+                haveBundle = true;
+            }
         } else if (line == "a=rtcp-mux") {
             if (current == &session) return false;
             current->rtcpMux = true;
@@ -105,7 +115,7 @@ bool projectCapabilities(std::string_view raw, std::string &projection, bool &si
             }
             current->extensions.push_back({std::move(map), std::string(line) + "\r\n"});
             if (current != &session) mediaExtensions = true;
-        } else if (starts(line, "a=rtpmap:") || starts(line, "a=rtcp-fb:") ||
+        } else if (starts(line, "a=rtpmap:") || starts(line, "a=fmtp:") || starts(line, "a=rtcp-fb:") ||
                    line == "a=bundle-only") {
             if (current == &session) return false;
             current->attributes.append(line.data(), line.size());
@@ -184,6 +194,13 @@ const Media *findMid(const rtc::Description &d, const std::string &mid) {
     }
     return found;
 }
+std::vector<int> extensionIds(const rtc::Description::Entry &media) {
+    // This SDK exposes extIds only as non-const, while extMap throws for an
+    // absent ID. Copy the small sanitized entry instead of probing 1..255 or
+    // casting away const. This runs only at description changes, never on RTP.
+    auto view = media;
+    return view.extIds();
+}
 bool ambiguous(const rtc::Description &d) {
     if (d.mediaCount() > 16) return true;
     for (int i = 0; i < d.mediaCount(); ++i) {
@@ -207,6 +224,8 @@ NegotiationResult inspectNegotiation(const rtc::Description &local, const rtc::D
     if (primaryVideoPayloadType < 0 || primaryVideoPayloadType > 127) return {};
     if (ambiguous(local) || ambiguous(remote)) return {NegotiationStatus::AmbiguousMedia, 0, 0};
     int commonId = 0;
+    int commonLegacyId = 0;
+    TransportSequenceVersion commonVersion = TransportSequenceVersion::V1;
     unsigned videos = 0;
     bool anyReceiveVideo = false;
     for (int i = 0; i < remote.mediaCount(); ++i) {
@@ -218,32 +237,38 @@ NegotiationResult inspectNegotiation(const rtc::Description &local, const rtc::D
         if (!feedbackProfile(l->protocol()) || !feedbackProfile(r->protocol())) return {};
         const bool video = r->type() == "video";
         if (video) anyReceiveVideo = true;
-        int id = 0;
-        for (int candidate = 1; candidate <= 255; ++candidate) {
+        int id1 = 0, id2 = 0;
+        const auto localIds = extensionIds(*l);
+        for (const int candidate : extensionIds(*r)) {
             const auto *map = r->extMap(candidate);
-            if (!map) continue;
-            if (map->uri == "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-02")
+            if (!map || (map->uri != Uri && map->uri != Uri2)) continue;
+            if (std::find(localIds.begin(), localIds.end(), candidate) == localIds.end()) continue;
+            const auto *localMap = l->extMap(candidate);
+            if (localMap->uri != map->uri) continue;
+            auto &selected = map->uri == Uri2 ? id2 : id1;
+            if (selected || !map->attributes.empty() || !localMap->attributes.empty())
                 return {NegotiationStatus::UnsupportedExtension, 0, 0};
-            if (map->uri != Uri) continue;
-            if (id || !map->attributes.empty()) return {NegotiationStatus::UnsupportedExtension, 0, 0};
-            id = candidate;
+            if (!receives(localMap->direction) || !sends(map->direction)) return {};
+            selected = candidate;
         }
+        // TV Answer selection prefers 02; its packet parser tries 02 before
+        // 01. Retain a genuinely negotiated 01 mapping as a packet fallback.
+        const int id = id2 ? id2 : id1;
+        const int legacyId = id2 ? id1 : 0;
+        const auto version = id2 ? TransportSequenceVersion::V2 : TransportSequenceVersion::V1;
         if (!id) {
             if (video) return {};
             continue;
         }
-        const auto *rmap = r->extMap(id), *lmap = l->extMap(id);
-        if (!lmap || lmap->uri != Uri || !lmap->attributes.empty() ||
-            !receives(lmap->direction) || !sends(rmap->direction)) {
-            // A global observer must not treat an unnegotiated audio extension
-            // as part of the negotiated video transport sequence space.
-            return {};
-        }
-        if (commonId && commonId != id) return {NegotiationStatus::InconsistentId, 0, 0};
+        if (commonId && (commonId != id || commonVersion != version || commonLegacyId != legacyId))
+            return {NegotiationStatus::InconsistentId, 0, 0};
         commonId = id;
+        commonLegacyId = legacyId;
+        commonVersion = version;
         unsigned compatible = 0;
         for (const int pt : r->payloadTypes()) {
             if (video && pt != primaryVideoPayloadType) continue;
+            if (!l->hasPayloadType(pt)) continue;
             const auto *rm = r->rtpMap(pt), *lm = l->rtpMap(pt);
             if (!rm || !lm || rm->format.empty() || lm->format.empty() ||
                 !sameFormat(rm->format, lm->format) || rm->clockRate != lm->clockRate) continue;
@@ -259,11 +284,16 @@ NegotiationResult inspectNegotiation(const rtc::Description &local, const rtc::D
         for (int i = 0; i < description->mediaCount(); ++i) {
             const auto *m = mediaAt(*description, i);
             if (!m || m->isRemoved()) continue;
-            if (const auto *map = m->extMap(commonId); map && map->uri != Uri)
+            const auto ids = extensionIds(*m);
+            if (std::find(ids.begin(), ids.end(), commonId) != ids.end() &&
+                m->extMap(commonId)->uri != (commonVersion == TransportSequenceVersion::V2 ? Uri2 : Uri))
+                return {NegotiationStatus::InconsistentId, 0, 0};
+            if (commonLegacyId && std::find(ids.begin(), ids.end(), commonLegacyId) != ids.end() &&
+                m->extMap(commonLegacyId)->uri != Uri)
                 return {NegotiationStatus::InconsistentId, 0, 0};
         }
     }
-    return {NegotiationStatus::Ready, uint8_t(commonId), videos};
+    return {NegotiationStatus::Ready, uint8_t(commonId), videos, commonVersion, uint8_t(commonLegacyId)};
 }
 
 std::optional<NegotiationCapabilities> NegotiationCapabilities::fromSdp(
@@ -280,6 +310,115 @@ std::optional<NegotiationCapabilities> NegotiationCapabilities::fromSdp(
         return NegotiationCapabilities(sanitized.generateSdp(), type, singleTransport);
     } catch (const std::invalid_argument &) { return std::nullopt; }
       catch (const std::out_of_range &) { return std::nullopt; }
+}
+bool NegotiationCapabilities::matchesInstalledDescription(const rtc::Description &installed) const {
+    if (installed.type() != type_) return false;
+    std::string projection;
+    bool sdkTransportShape = false;
+    if (!projectCapabilities(std::string(installed), projection, sdkTransportShape, true)) return false;
+    // Preserve singleTransport_ from the original wire snapshot. Generated
+    // rtcp-mux/BUNDLE lines must never create transport consent retroactively.
+    const rtc::Description sanitized(projection, type_);
+    return projection_ == sanitized.generateSdp();
+}
+bool FeedbackCapabilitiesResult::allowsRemb(std::string_view videoMid, int primaryVideoPayloadType) const {
+    if (status != NegotiationStatus::Ready) return false;
+    return std::any_of(media.begin(), media.end(), [&](const MediaFeedbackCapabilities &entry) {
+        return entry.mid == videoMid && entry.payloadType == primaryVideoPayloadType &&
+            std::find(entry.feedback.begin(), entry.feedback.end(), "goog-remb") != entry.feedback.end();
+    });
+}
+FeedbackCapabilitiesResult inspectMediaFeedbackCapabilities(const NegotiationCapabilities &localCaps,
+                                                             const NegotiationCapabilities &remoteCaps,
+                                                             int primaryVideoPayloadType) {
+    using Type = rtc::Description::Type;
+    FeedbackCapabilitiesResult result;
+    if (!((localCaps.type_ == Type::Offer && remoteCaps.type_ == Type::Answer) ||
+          (localCaps.type_ == Type::Answer && remoteCaps.type_ == Type::Offer))) return result;
+    if (primaryVideoPayloadType < 0 || primaryVideoPayloadType > 127) return result;
+    result.localIsOfferer = localCaps.type_ == Type::Offer;
+    if (!localCaps.singleTransport_ || !remoteCaps.singleTransport_) {
+        result.status = NegotiationStatus::UnsupportedTransport;
+        return result;
+    }
+    // Both inputs were validated and canonicalized by fromSdp. Do not parse
+    // raw or credential-bearing descriptions here, or relax observer admission.
+    const rtc::Description local(localCaps.projection_, localCaps.type_);
+    const rtc::Description remote(remoteCaps.projection_, remoteCaps.type_);
+    if (ambiguous(local) || ambiguous(remote)) {
+        result.status = NegotiationStatus::AmbiguousMedia;
+        return result;
+    }
+    for (int i = 0; i < remote.mediaCount(); ++i) {
+        const auto *r = mediaAt(remote, i);
+        if (!r || r->isRemoved() || (r->type() != "video" && r->type() != "audio")) continue;
+        const auto *l = findMid(local, r->mid());
+        if (!l || l->isRemoved() || !receives(l->direction()) || !sends(r->direction())) continue;
+        if (l->type() != r->type()) {
+            result.status = NegotiationStatus::AmbiguousMedia;
+            result.media.clear();
+            return result;
+        }
+        if (!feedbackProfile(l->protocol()) || !feedbackProfile(r->protocol())) continue;
+        for (const int pt : r->payloadTypes()) {
+            if (r->type() == "video" && pt != primaryVideoPayloadType) continue;
+            if (!l->hasPayloadType(pt)) continue;
+            const auto *rm = r->rtpMap(pt), *lm = l->rtpMap(pt);
+            if (!rm || !lm || rm->format.empty() || !sameFormat(rm->format, lm->format) ||
+                rm->clockRate != lm->clockRate || sameFormat(rm->format, "rtx")) continue;
+            MediaFeedbackCapabilities media;
+            media.mid = r->mid(); media.codec = rm->format;
+            media.payloadType = pt; media.clockRate = rm->clockRate;
+            auto localFeedback = lm->rtcpFbs, remoteFeedback = rm->rtcpFbs;
+            // Wildcard feedback applies to each codec in this media section.
+            // Keep the complete name/parameter pair: nack != nack pli.
+            for (const auto &attribute : l->attributes())
+                if (starts(attribute, "rtcp-fb:* ")) localFeedback.push_back(attribute.substr(10));
+            for (const auto &attribute : r->attributes())
+                if (starts(attribute, "rtcp-fb:* ")) remoteFeedback.push_back(attribute.substr(10));
+            for (const auto &entry : localFeedback)
+                if (std::find(remoteFeedback.begin(), remoteFeedback.end(), entry) != remoteFeedback.end())
+                    media.feedback.push_back(entry);
+            std::sort(media.feedback.begin(), media.feedback.end());
+            media.feedback.erase(std::unique(media.feedback.begin(), media.feedback.end()), media.feedback.end());
+            for (const int rtxPt : r->payloadTypes()) {
+                if (!l->hasPayloadType(rtxPt)) continue;
+                const auto *rr = r->rtpMap(rtxPt), *lr = l->rtpMap(rtxPt);
+                if (!rr || !lr || !sameFormat(rr->format, "rtx") || !sameFormat(lr->format, "rtx") ||
+                    rr->clockRate != rm->clockRate || lr->clockRate != rm->clockRate) continue;
+                const auto apt = "apt=" + std::to_string(pt);
+                if (std::find(rr->fmtps.begin(), rr->fmtps.end(), apt) != rr->fmtps.end() &&
+                    std::find(lr->fmtps.begin(), lr->fmtps.end(), apt) != lr->fmtps.end())
+                    media.rtxPayloadTypes.push_back(rtxPt);
+            }
+            const auto remoteIds = extensionIds(*r);
+            for (const int localId : extensionIds(*l)) {
+                const auto *le = l->extMap(localId);
+                if (!le || !receives(le->direction)) continue;
+                const bool v1 = le->uri == Uri;
+                const bool v2 = le->uri == "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-02";
+                if (!v1 && !v2) continue;
+                for (const int remoteId : remoteIds) {
+                    const auto *re = r->extMap(remoteId);
+                    if (!re || re->uri != le->uri || !sends(re->direction)) continue;
+                    media.transportExtensions.push_back({v1 ? TransportExtensionVersion::V1 : TransportExtensionVersion::V2,
+                        uint8_t(localId), uint8_t(remoteId), le->attributes.empty() && re->attributes.empty()});
+                }
+            }
+            for (const int localId : extensionIds(*l)) {
+                const auto *le = l->extMap(localId);
+                const bool ast = le && le->uri == AbsSendTimeUri, tof = le && le->uri == TransmissionOffsetUri;
+                if ((!ast && !tof) || !receives(le->direction) || !le->attributes.empty() ||
+                    std::find(remoteIds.begin(), remoteIds.end(), localId) == remoteIds.end()) continue;
+                const auto *re = r->extMap(localId);
+                if (!re || re->uri != le->uri || !sends(re->direction) || !re->attributes.empty()) continue;
+                (ast ? media.absSendTimeId : media.transmissionOffsetId) = uint8_t(localId);
+            }
+            result.media.push_back(std::move(media));
+        }
+    }
+    if (!result.media.empty()) result.status = NegotiationStatus::Ready;
+    return result;
 }
 NegotiationResult inspectNegotiationCapabilities(const NegotiationCapabilities &localCaps,
                                                  const NegotiationCapabilities &remoteCaps,

@@ -1,12 +1,14 @@
 # 文档导航
 
-本目录按用途组织。当前版本是 **0.3.74 Beta**；历史文档记录当时的实现与验证状态，不能直接作为当前版本的使用保证。
+本目录按用途组织。当前本地整合候选为 **0.4beta**；历史文档记录当时的实现与验证状态，不能直接作为当前版本的使用保证。
 
 ## 使用和项目状态
 
 - [使用手册](user-guide.md)：登录、设备、操作与画质设置。
 - [项目状态和已知限制](project-status.md)：已实现、待验证和暂停的功能。
-- [当前版本说明](releases/v0.3.74-beta.md)与[完整更新记录](../CHANGELOG.md)。
+- [当前版本说明](releases/v0.4beta.md)与[完整更新记录](../CHANGELOG.md)。
+
+- [0.4beta 整合检阅记录](reviews/v0.4beta-integration.md)记录来源、测试与发布边界。
 
 ## 构建、开发与排查
 
@@ -14,7 +16,7 @@
 - [依赖覆盖与复现](dependency-overrides.md)：第三方依赖修改和校验。
 - [开发记录](development.md)：架构概览与历史排查；文内早期实现仅供追溯。
 - [实时诊断](live-diagnostics.md)：诊断功能与使用边界。
-- [transport-cc 实验基础](transport-feedback-foundation.md)：默认关闭的研究代码，未代表已验证互通。
+- [transport-cc 实验基础](transport-feedback-foundation.md)记录模块与协商边界。单独 CMake 的实验开关默认关闭，0.4beta 构建脚本显式使用 R67 组合，见[构建说明](build.md)。
 
 ## 分发与来源
 

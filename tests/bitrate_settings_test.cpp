@@ -2,6 +2,7 @@
 #include "quality_rpc.hpp"
 #include "quality_confirmation.hpp"
 #include "quality_presets.hpp"
+#include "route_bitrate_policy.hpp"
 #include "config_migration.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -47,6 +48,33 @@ static bool hasKey(const uu::Bytes &b,unsigned key) {
 }
 int main() {
     try {
+        // Independently specified host descriptor: Main15 / StateChange5.
+        const uu::Bytes stateNotify={0x7a,0x06,0x2a,0x04,0x10,0x03,0x18,0x02};
+        auto notified=uu::parsePrivacyStateNotify(stateNotify.data(),stateNotify.size());
+        require(notified && notified->requestId==0 && notified->requestedMode==uu::PrivacyMode::ScreenOff &&
+                notified->currentMode==uu::PrivacyMode::Normal && notified->errorCode==0);
+        for(size_t n=0;n<stateNotify.size();++n)require(!uu::parsePrivacyStateNotify(stateNotify.data(),n));
+        for(unsigned mode:{1u,2u,3u}){
+            auto packet=stateNotify;packet.back()=uint8_t(mode);
+            auto parsed=uu::parsePrivacyStateNotify(packet.data(),packet.size());
+            require(parsed && unsigned(parsed->currentMode)==mode);
+        }
+        for(const uu::Bytes bad:{uu::Bytes{0x7a,6,0x2a,4,0x10,3,0x18,4}, // invalid mode
+                                uu::Bytes{0x7a,8,0x2a,4,0x10,3,0x18,2,0x2a,0}, // duplicate body
+                                uu::Bytes{0x7a,8,0x2a,6,0x10,3,0x18,2,0x18,3}, // duplicate field
+                                uu::Bytes{0x7a,8,0x2a,4,0x10,3,0x18,2,0x12,0}, // mixed oneof
+                                uu::Bytes{0x7a,2,0x12,0}, // cursor notice is not privacy
+                                uu::Bytes{0x78,1}})
+            require(!uu::parsePrivacyStateNotify(bad.data(),bad.size()));
+        const uu::Bytes emptyState={0x7a,2,0x2a,0};
+        notified=uu::parsePrivacyStateNotify(emptyState.data(),emptyState.size());
+        require(notified && notified->currentMode==uu::PrivacyMode::Unknown);
+        const auto cursor=uu::cursorCaptureRpc(53);
+        const auto cursorRpc=get(cursor,21,2).bytes;
+        require(fields(cursorRpc).size()==2 && get(get(cursorRpc,1,2).bytes,1,0).value==53);
+        require(get(cursorRpc,5,2).bytes==uu::Bytes({0x08,0x01}));
+        // No capture settings, FPS, quality, privacy, or resolution request.
+        for(unsigned field:{2u,3u,4u,6u,7u})require(!hasKey(cursorRpc,field));
         for(auto mode:{uu::PrivacyMode::Off,uu::PrivacyMode::Normal,uu::PrivacyMode::ScreenOff}){
             const auto packet=uu::privacyScreenRpc(17,mode);
             const auto rpc=get(packet,21,2).bytes;
@@ -115,17 +143,23 @@ int main() {
         require(partialState && (partialState->fields&1u) && !(partialState->fields&16u));
         require(partialState->fps==2 && partialState->maxCustomBitrate==0);
         // Explicit resolution/quality/fps contract in the actual ConnectOptions
-        // wire: capture field 4=4 (ChooseType_RESOLUTION), field 10=0 (no
+        // wire: capture field 4=3 (ChooseType_FOLLOW_REMOTE), field 10=0 (no
         // automatic frame-quality mode), field 11=fps; decoder field 2 is the
         // codec capability and fields 3/4 are the selected size.
         for(int fps:{30,60}) for(bool hevc:{false,true}) for(auto size:{std::pair<int,int>{960,540},
                                                                     std::pair<int,int>{1280,720},
                                                                     std::pair<int,int>{1920,1080}}) {
             const auto initial=uu::connectOptions(size.first,size.second,fps,3,0,hevc);
+            const auto privacyFeatures=get(initial,11,2).bytes;
+            require(privacyFeatures==uu::Bytes({0x20,0x02})); // ff_private_screen=2 only
             const auto capture=get(initial,3,2).bytes;
             require(get(capture,1,0).value==uint64_t(fps==30?1:2));
             require(get(capture,2,0).value==3);
-            require(get(capture,4,0).value==4);
+            require(get(capture,4,0).value==3);
+            require(!hasKey(capture,6));
+            const auto local=get(capture,5,2).bytes;
+            require(get(local,1,0).value==uint64_t(size.first));
+            require(get(local,2,0).value==uint64_t(size.second));
             require(!hasKey(capture,8));
             require(get(capture,10,0).value==0);
             require(get(capture,11,0).value==uint64_t(fps));
@@ -135,11 +169,20 @@ int main() {
             require(get(decoder,3,0).value==uint64_t(size.first));
             require(get(decoder,4,0).value==uint64_t(size.second));
         }
-        // Native presets must carry quality 1..4 and no Custom field 8 on
-        // initial ConnectOptions or online capture/quality requests.
+        for(int user : {0,5,12,20,30,50,100}){
+            require(uu::effectiveBitrateMbps(user,uu::BitrateRoute::Direct)==user);
+            const int limited=user>0?std::min(user,20):20;
+            require(uu::effectiveBitrateMbps(user,uu::BitrateRoute::Relay)==limited);
+            require(uu::effectiveBitrateMbps(user,uu::BitrateRoute::Unknown)==limited);
+            require(uu::effectiveBitrateMbps(user,uu::BitrateRoute::Direct)==user); // No persistence mutation.
+        }
+        require(uu::cappedFeedbackBps(30000000,20000000)==20000000);
+        require(uu::cappedFeedbackBps(12000000,20000000)==12000000);
+        require(uu::cappedFeedbackBps(30000000,0)==30000000);
+        // Native presets with no independent ceiling keep their old wire form.
         for(int i=0;i<uu::qualityPresetCount;++i){
-            const int quality=uu::qualityPresets[i].quality;
-            require(quality==i+1 && uu::qualityPresets[i].name && uu::qualityPresets[i].legacyMbps);
+            const int quality=i+1; // Retained protocol support for saved native settings.
+            require(uu::qualityPresets[i].name && uu::qualityPresets[i].maxBitrateMbps>0);
             const auto initial=uu::connectOptions(1280,720,60,quality,0,false);
             const auto initialCapture=get(initial,3,2).bytes;
             require(get(initialCapture,2,0).value==uint64_t(quality));
@@ -149,23 +192,46 @@ int main() {
                 const auto request=get(rpc,21,2).bytes;
                 const auto setting=get(request,2,2).bytes;
                 require(get(setting,2,0).value==uint64_t(quality));
-                require(!hasKey(setting,8));
+                require(get(setting,8,0).value==0); // Explicitly clear an old independent ceiling.
             }
             const auto native=uu::videoQualitySettingRpc(9,quality);
             const auto nativeRequest=get(native,21,2).bytes;
             const auto nativeBody=get(nativeRequest,4,2).bytes;
             require(get(nativeBody,1,0).value==uint64_t(quality));
             require(!hasKey(nativeBody,8));
+            for(int cap : {5,12,20,30}){
+                const auto limited=uu::connectOptions(1280,720,60,quality,cap,false);
+                const auto body=get(limited,3,2).bytes;
+                require(get(body,2,0).value==uint64_t(quality));
+                require(get(body,8,0).value==uint64_t(cap)*1000000u);
+                for(auto rpc : {uu::qualityUpdateRpc(10,60,quality,0,cap),
+                                uu::captureSettingsRpc(11,1280,720,60,quality,0,cap),
+                                uu::videoScaleRpc(12,1920,1080,1280,720,60,quality,0,cap)}){
+                    const auto setting=get(get(rpc,21,2).bytes,2,2).bytes;
+                    require(get(setting,2,0).value==uint64_t(quality));
+                    require(get(setting,8,0).value==uint64_t(cap)*1000000u);
+                }
+            }
         }
-        // A loaded native preset preserves its local REMB cap when only another
-        // setting changes; explicit preset selection passes 0. Neither writes a
-        // Custom field 8 in preset mode.
-        {
-            const auto preserved=uu::qualityPresetRequest(2,20);
-            require(preserved.quality==3 && preserved.maxBitrateMbps==20);
-            const auto explicitChoice=uu::qualityPresetRequest(2,0);
-            require(explicitChoice.quality==3 && explicitChoice.maxBitrateMbps==0);
+        // Named shortcuts use exactly the custom Q6 wire path and their cap.
+        for(int i=0;i<uu::qualityPresetCount;++i){
+            const auto choice=uu::qualityPresetRequest(i);
+            require(choice.quality==6 && choice.maxBitrateMbps==uu::qualityPresets[i].maxBitrateMbps);
+            const auto options=uu::connectOptions(1280,720,60,choice.quality,choice.maxBitrateMbps,false);
+            const auto capture=get(options,3,2).bytes;
+            require(get(capture,2,0).value==6);
+            require(get(capture,8,0).value==uint64_t(choice.maxBitrateMbps)*1000000u);
+            for(auto rpc : {uu::qualityUpdateRpc(10,60,choice.quality,0,choice.maxBitrateMbps),
+                            uu::captureSettingsRpc(11,1280,720,60,choice.quality,0,choice.maxBitrateMbps),
+                            uu::videoScaleRpc(12,1920,1080,1280,720,60,choice.quality,0,choice.maxBitrateMbps)}){
+                const auto request=get(rpc,21,2).bytes;
+                const auto setting=get(request,2,2).bytes;
+                require(get(setting,2,0).value==6);
+                require(get(setting,8,0).value==uint64_t(choice.maxBitrateMbps)*1000000u);
+            }
+            require(uu::qualityPresetIndexForMbps(choice.maxBitrateMbps)==i);
         }
+        require(uu::qualityPresetIndexForMbps(50)==-1);
         // v2->v3 migration preserves custom limits even when they match an
         // old preset, because the original user choice cannot be distinguished.
         using Lines=std::vector<std::string>;
@@ -177,11 +243,11 @@ int main() {
             return {};
         };
         for(int i=0;i<uu::qualityPresetCount;++i){
-            Lines lines={"width=1280","quality=6","max_bitrate_mbps="+std::to_string(uu::qualityPresets[i].legacyMbps),"video_codec=hevc"};
+            Lines lines={"width=1280","quality=6","max_bitrate_mbps="+std::to_string(uu::qualityPresets[i].maxBitrateMbps),"video_codec=hevc"};
             auto migration=uu::migrateQualityConfigLines(lines);
             require(!migration.changed && migration.legacyCustom);
             require(lineValue(lines,"quality")=="6");
-            require(lineValue(lines,"max_bitrate_mbps")==std::to_string(uu::qualityPresets[i].legacyMbps));
+            require(lineValue(lines,"max_bitrate_mbps")==std::to_string(uu::qualityPresets[i].maxBitrateMbps));
             require(lineValue(lines,"video_codec")=="hevc");
             auto again=uu::migrateQualityConfigLines(lines);
             require(!again.changed && again.legacyCustom);
@@ -292,13 +358,19 @@ int main() {
         tracker.beginRequest();
         require(!tracker.evidence.anyKnown() && !tracker.accepted && !tracker.applied && !tracker.pending);
 
-        // Preset mode sends no Custom bitrate even if a local cap is present.
+        // A native preset's independent ceiling requires bitrate evidence too.
         const uu::QualityApplicationTarget preset{1280,720,60,3,20};
         tracker.beginRequest();
         tracker.evidence.observeFps(60);
         tracker.evidence.observeQuality(3);
         tracker.evidence.observeSize(1280,720);
+        require(!tracker.evaluate(preset));
+        tracker.evidence.observeBitrate(20);
         require(tracker.evaluate(preset));
+        const uu::QualityApplicationTarget cleared{1280,720,60,3,0,true};
+        require(!tracker.evaluate(cleared)); // Old 20M evidence cannot confirm removal.
+        tracker.evidence.observeBitrate(0);
+        require(tracker.evaluate(cleared));
         std::cout<<"PASS: native preset wire/cap-preserve; legacy migration/comments/duplicates/fixture; Custom wire; sync; tracker\n";
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }

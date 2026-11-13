@@ -9,6 +9,30 @@
 #include "rtc_signaling.hpp"
 #include "signaling_envelope.hpp"
 #include "signal_pump.hpp"
+#include "vibration.hpp"
+#include "dtls_rx_diagnostics.hpp"
+#ifdef UU_UDP_SEND_TIMING
+#include "udp_send_diagnostics.h"
+#ifdef UU_PACKET_STAGE_TRACE
+#include "packet_stage_trace.h"
+#endif
+#endif
+#ifdef UU_UDP_RX_TRACE
+#include "udp_receive_trace.h"
+#endif
+#include "live_telemetry.hpp"
+#if defined(__SWITCH__) && defined(UU_SWITCH_BATCH_RX)
+extern "C" void uu_juice_batch_diagnostics(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, int *);
+#ifdef UU_SWITCH_BATCH_REUSE
+#include "switch_batch_rx.h"
+#endif
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+#include "video_repair_observer.hpp"
+#endif
+#ifdef UU_MEDIA_DISPATCH
+#include "media_dispatch_queue.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -30,6 +54,12 @@
 #include <switch.h>
 #include <unistd.h>
 #include <dirent.h>
+#endif
+
+#ifdef UU_CONTROL_STAGE_TIMING
+#define UU_CONTROL_SCOPE(stage) ControlStageTiming::Scope controlScope##stage(controlStages_,ControlStageTiming::stage)
+#else
+#define UU_CONTROL_SCOPE(stage)
 #endif
 
 namespace uu {
@@ -202,29 +232,6 @@ std::optional<ForwardSettingInfo> parseForwardSetting(const Json &event) {
        out.encoder.empty() && out.track<0)return std::nullopt;
     return out;
 }
-// Client capability sent to the PC through the control event's streamer_data.
-// Resolution is a separate concept from the quality/bitrate preset; these
-// entries bound the encoder output to what the Switch can actually present.
-std::string clientCapabilityJson(int width,int height,int fps,int quality) {
-    auto display=[&](int id){
-        return Json{{"id",id},{"width",width},{"height",height},{"fps",fps},
-                    {"hdr",-2},{"type",0},{"dpi_scale",100}};
-    };
-    auto capability=[&](int codec,int w,int h){
-        return Json{{"video_codec",codec},{"codec_impl",1},{"bit_depth",8},
-                    {"chroma_sampling",1},{"max_width",w},{"max_height",h},
-                    {"width",w},{"height",h},{"max_frame_quality",quality},
-                    {"result",0}};
-    };
-    Json cap;
-    cap["remote_display_info"]=Json::array({display(0)});
-    cap["local_display_info"]=Json::array({display(0)});
-    cap["frame_quality_capability"]=Json::array({
-        capability(1,1280,720),capability(2,1280,720),
-        capability(1,1920,1080),capability(2,1920,1080)
-    });
-    return cap.dump();
-}
 // RTP and RTX have independent SSRC/sequence spaces (RFC 4588). The stock
 // receiving session keeps one sequence counter; only feed the primary stream
 // into that counter, while preserving raw RTX for the assembler downstream.
@@ -236,17 +243,57 @@ class PrimaryVideoRtcpSession final : public rtc::RtcpReceivingSession {
     uint32_t reportExpected_ = 0, reportReceived_ = 0, reportBase_ = 0;
     bool haveReport_ = false;
     std::mutex sessionMutex_;
+    std::weak_ptr<rtc::Track> track_;
+    std::weak_ptr<int> senderReportInFlight_;
     static uint32_t read32(const uint8_t *p) {
         return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3];
     }
+    // Applies the primary-video report block correction to every outgoing RR,
+    // including the RR preceding a Client-initiated or SR-repeated REMB. The
+    // caller must hold sessionMutex_. PLI and other feedback are passed through.
+    void sendCorrected(rtc::message_ptr message,const rtc::message_callback &send) {
+        if(message && message->type==rtc::Message::Control &&
+           message->size()>=rtc::RtcpRr::SizeWithReportBlocks(1)) {
+            auto *rr=reinterpret_cast<rtc::RtcpRr *>(message->data());
+            if(rr->header.payloadType()==201) {
+                // Report the actual extended maximum: cycles in the upper
+                // 16 bits, highest primary sequence in the lower 16 bits.
+                rr->getReportBlock(0)->setSeqNo(mMaxSeq,uint16_t(mCycles>>16));
+                rr->getReportBlock(0)->setJitter(uint32_t(jitter_));
+                // RFC 3550 A.3: late/duplicate primary packets can make
+                // interval loss negative. Unsigned subtraction in the
+                // base session would wrap and advertise false loss.
+                const uint32_t expected=mCycles+uint32_t(mMaxSeq)-mBaseSeq+1;
+                const bool sameSource=haveReport_ && reportBase_==mBaseSeq &&
+                    expected>=reportExpected_ && mReceived>=reportReceived_;
+                const uint32_t expectedInterval=sameSource?expected-reportExpected_:expected;
+                const uint32_t receivedInterval=sameSource?mReceived-reportReceived_:mReceived;
+                reportExpected_=expected;reportReceived_=mReceived;reportBase_=mBaseSeq;
+                haveReport_=true;
+                const int64_t intervalLost=int64_t(expectedInterval)-int64_t(receivedInterval);
+                const auto fraction=uint8_t(expectedInterval && intervalLost>0?
+                    std::min<int64_t>(255,(intervalLost*256)/expectedInterval):0);
+                const auto totalLost=std::clamp<int64_t>(int64_t(expected)-int64_t(mReceived),
+                                                        -8388608,8388607);
+                rr->getReportBlock(0)->setPacketsLost(fraction,uint32_t(totalLost));
+                if(!loggedReportFix_) {diagnostic("rtcp-primary-feedback-corrected");loggedReportFix_=true;}
+            }
+        }
+        send(std::move(message));
+    }
   public:
+    PrimaryVideoRtcpSession(uint32_t senderSsrc, std::string cname, std::weak_ptr<rtc::Track> track)
+        : track_(std::move(track)) {
+        setRtcpIdentity(senderSsrc, std::move(cname));
+    }
     bool requestKeyframe(const rtc::message_callback &send) override {
         std::lock_guard lock(sessionMutex_);
         return rtc::RtcpReceivingSession::requestKeyframe(send);
     }
     bool requestBitrate(unsigned int bitrate,const rtc::message_callback &send) override {
         std::lock_guard lock(sessionMutex_);
-        return rtc::RtcpReceivingSession::requestBitrate(bitrate,send);
+        return rtc::RtcpReceivingSession::requestBitrate(bitrate,
+            [this,&send](rtc::message_ptr message){sendCorrected(std::move(message),send);});
     }
     void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override {
         std::lock_guard lock(sessionMutex_);
@@ -287,35 +334,28 @@ class PrimaryVideoRtcpSession final : public rtc::RtcpReceivingSession {
             }
         }
         auto &accounting=direct?messages:primaryMessages;
-        rtc::RtcpReceivingSession::incoming(accounting,[this,&send](rtc::message_ptr message) {
-            if(message && message->type==rtc::Message::Control &&
-               message->size()>=rtc::RtcpRr::SizeWithReportBlocks(1)) {
-                auto *rr=reinterpret_cast<rtc::RtcpRr *>(message->data());
-                if(rr->header.payloadType()==201) {
-                    // Report the actual extended maximum: cycles in the upper
-                    // 16 bits, highest primary sequence in the lower 16 bits.
-                    rr->getReportBlock(0)->setSeqNo(mMaxSeq,uint16_t(mCycles>>16));
-                    rr->getReportBlock(0)->setJitter(uint32_t(jitter_));
-                    // RFC 3550 A.3: late/duplicate primary packets can make
-                    // interval loss negative. Unsigned subtraction in the
-                    // base session would wrap and advertise false loss.
-                    const uint32_t expected=mCycles+uint32_t(mMaxSeq)-mBaseSeq+1;
-                    const bool sameSource=haveReport_ && reportBase_==mBaseSeq &&
-                        expected>=reportExpected_ && mReceived>=reportReceived_;
-                    const uint32_t expectedInterval=sameSource?expected-reportExpected_:expected;
-                    const uint32_t receivedInterval=sameSource?mReceived-reportReceived_:mReceived;
-                    reportExpected_=expected;reportReceived_=mReceived;reportBase_=mBaseSeq;
-                    haveReport_=true;
-                    const int64_t intervalLost=int64_t(expectedInterval)-int64_t(receivedInterval);
-                    const auto fraction=uint8_t(expectedInterval && intervalLost>0?
-                        std::min<int64_t>(255,(intervalLost*256)/expectedInterval):0);
-                    const auto totalLost=std::clamp<int64_t>(int64_t(expected)-int64_t(mReceived),
-                                                            -8388608,8388607);
-                    rr->getReportBlock(0)->setPacketsLost(fraction,uint32_t(totalLost));
-                    if(!loggedReportFix_) {diagnostic("rtcp-primary-feedback-corrected");loggedReportFix_=true;}
-                }
+        rtc::RtcpReceivingSession::incoming(accounting, [this,&send](rtc::message_ptr message) {
+            // An active legacy REMB target still uses the ordered send path.
+            // Only periodic RR replies are safe to coalesce during a slow send.
+            if (mRequestedBitrate.load()) {
+                sendCorrected(std::move(message),send);
+                return;
             }
-            send(std::move(message));
+            if (!senderReportInFlight_.expired()) return;
+            sendCorrected(std::move(message), [this,&send](rtc::message_ptr report) {
+                auto ticket=std::make_shared<int>(0);
+                senderReportInFlight_=ticket;
+                scheduleSenderReportReply([track=track_, send, report=std::move(report), ticket=std::move(ticket)]() mutable {
+                    auto live=track.lock();
+                    if (!live || !live->isOpen()) return;
+                    const auto started=VideoSupplyTrace::nowUs();
+                    send(std::move(report));
+                    const auto ended=VideoSupplyTrace::nowUs();
+                    if (ended-started>=8000)
+                        diagnostic(("rtcp-sr-reply-async-slow-start-us-"+std::to_string(started)+
+                                    "-end-us-"+std::to_string(ended)).c_str());
+                });
+            });
         });
         // Keep the original packet order and both payload types for the next
         // receiver. Only accounting is filtered; retransmissions are not lost.
@@ -489,12 +529,12 @@ Client::Client(std::string key, std::string client, std::shared_ptr<Media> media
     if(streamQuality_==6 && maxBitrateMbps_==0)streamQuality_=4;
     state_.maxBitrateMbps=maxBitrateMbps_;
     hevc_=configValue("video_codec")=="hevc";state_.hevc=hevc_;
-    keyframeIntervalMs_ = configInt("keyframe_interval_ms", 4000, 0, 60000);
+    keyframeIntervalMs_ = configInt("keyframe_interval_ms", keyframeIntervalMs_, 0, 60000);
     rtxEnabled_ = configInt("rtx", 1, 0, 1) != 0;
     state_.width = streamWidth_; state_.height = streamHeight_; state_.fps = streamFps_; state_.quality = streamQuality_;
-    state_.vsync = configInt("vsync",1,0,1) != 0;
-    state_.playoutDelayMs = configInt("playout_delay_ms",8,0,100);
-    // Media reads config.ini independently. Apply the 8 ms fallback only when
+    state_.vsync = configInt("vsync",0,0,1) != 0;
+    state_.playoutDelayMs = configInt("playout_delay_ms",0,0,100);
+    // Media reads config.ini independently. Apply the default delay only when
     // the key is absent and pacing is enabled; setPlayoutDelay only updates the
     // delay and frame_pacing owns whether pacing is enabled.
     if(configValue("playout_delay_ms").empty() && configInt("frame_pacing",1,0,1)!=0)
@@ -502,6 +542,15 @@ Client::Client(std::string key, std::string client, std::shared_ptr<Media> media
     autoReconnect_=configInt("auto_reconnect",1,0,1)!=0;
     reconnectLimit_=configInt("reconnect_attempts",5,1,10);
     api_ = std::make_unique<Api>(std::move(key), std::move(client), cancel_);
+#ifdef UU_ASYNC_QUALITY_SAVE
+    qualityConfigWriter_=std::make_unique<QualityConfigWriter>();
+#endif
+#ifdef UU_VIDEO_SUPPLY_TRACE
+    videoSupplyTrace_=std::make_shared<VideoSupplyTrace>();
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+    videoRepairTrace_=std::make_shared<VideoRepairTrace>();
+#endif
     worker_ = std::thread([this] { run(); });
 }
 Client::~Client() {
@@ -514,13 +563,43 @@ Snapshot Client::snapshot() {
     std::lock_guard lock(stateMutex_);
     return state_;
 }
+void Client::refreshSnapshot(Snapshot &snapshot) {
+    std::lock_guard lock(stateMutex_);
+    snapshot.updateFrom(state_);
+}
+bool Client::isStreaming() {
+    std::lock_guard lock(stateMutex_);
+    return state_.streaming;
+}
 void Client::setState(const std::string &stage, const std::string &detail) {
     diagnostic(stage.c_str());
+    if(connectionAttemptStartedAt_) {
+        const auto now=monotonicMs();
+        const auto remaining=deadline_?std::max<int64_t>(0,deadline_-now):0;
+        diagnostic(("connect-stage-"+stage+"-elapsed-ms-"+
+                    std::to_string(now-connectionAttemptStartedAt_)+
+                    "-deadline-remaining-ms-"+std::to_string(remaining)).c_str());
+    }
     std::lock_guard lock(stateMutex_);
     state_.stage = stage;
     state_.detail = detail;
     state_.streaming = stage == "connected";
     state_.authenticated = api_->authenticated();
+}
+void Client::logEventQueueSnapshot(const char *reason) {
+    size_t peerHighWater=0,dataHighWater=0;
+    uint64_t peerRejected=0,dataRejected=0;
+    {
+        std::lock_guard lock(inbox_->mutex);
+        peerHighWater=inbox_->peerCallbackHighWater;
+        dataHighWater=inbox_->dataChannelHighWater;
+        peerRejected=inbox_->peerCallbackRejected;
+        dataRejected=inbox_->dataChannelRejected;
+    }
+    diagnostic((std::string("event-queue-")+reason+"-peer-high-water-"+
+                std::to_string(peerHighWater)+"-peer-rejected-"+std::to_string(peerRejected)+
+                "-data-channel-high-water-"+std::to_string(dataHighWater)+
+                "-data-channel-rejected-"+std::to_string(dataRejected)).c_str());
 }
 void Client::post(std::string type, Json data, uint64_t generation) {
     std::lock_guard lock(inbox_->mutex);
@@ -531,17 +610,58 @@ void Client::command(const std::string &name, Json data) {
     if (name == "disconnect" || name == "logout" || name == "cancel" || name == "sms-open" || name == "login")
         cancel_ = true;
     if (isPeerInputCommand(name)) {
+        Event event{name, std::move(data), 0, monotonicMs()};
+        // These commands are constructed by the local UI. Classify the
+        // control state once, before acquiring the Inbox mutex.
+        if (name == "input" && event.data.value("action", std::string{}) == "gpd_update") {
+            event.motion = {event.data.at("index").get<int>(), event.data.at("buttons").get<uint64_t>(),
+                            event.data.at("left_trigger").get<int>(), event.data.at("right_trigger").get<int>()};
+        }
+#ifdef UU_INPUT_MOTION_COALESCE
+        constexpr bool coalesceMotion = true;
+#else
+        constexpr bool coalesceMotion = false;
+#endif
         if (tryEnqueuePeerInput(inbox_->mutex, inbox_->inputAdmission, inbox_->events,
-                                Event{name, std::move(data), 0}))
+                                std::move(event), coalesceMotion))
             inbox_->cv.notify_one();
         return;
     }
     post(name, std::move(data));
 }
 void Client::drainEvents() {
+    UU_CONTROL_SCOPE(Drain);
     drainEventBatch(inbox_->events,inbox_->mutex,[this]{return stop_.load();},[this](const Event &e){
         if(e.generation && e.generation!=generation_) return;
+#ifdef UU_CONTROL_STAGE_TIMING
+        const bool timed=e.type=="input" && e.queuedAtMs>0;
+        const auto started=std::chrono::steady_clock::now();
+        if(timed) {
+            const auto wait=uint64_t(std::max<int64_t>(0,monotonicMs()-e.queuedAtMs));
+            ++inputTiming_.samples;inputTiming_.waitTotalMs+=wait;
+            inputTiming_.waitMaxMs=std::max(inputTiming_.waitMaxMs,wait);
+        }
+        const auto eventSequence=++controlStages_.eventSeq;
+        if(e.type=="quality-settings") {
+            ++controlStages_.qualityChanges;controlStages_.lastQualityChangeUs=ControlStageTiming::nowUs();
+        }
+        if(timed) {
+            const auto end=uint64_t(monotonicMs())*1000;
+            const auto start=uint64_t(e.queuedAtMs)*1000;
+            controlStages_.record(ControlStageTiming::InputQueue,start,std::max(start,end),controlStages_.cycle,e.type.c_str(),eventSequence,generation_);
+        }
+        ControlStageTiming::Scope eventScope(controlStages_,e.type=="input"?
+            ControlStageTiming::InputHandle:ControlStageTiming::OtherHandle,e.type.c_str(),eventSequence,generation_);
+#endif
         handle(e);
+#ifdef UU_CONTROL_STAGE_TIMING
+        if(timed) {
+            const auto elapsed=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now()-started).count());
+            inputTiming_.handleTotalUs+=elapsed;
+            inputTiming_.handleMaxUs=std::max(inputTiming_.handleMaxUs,elapsed);
+        }
+#endif
     });
 }
 void Client::finishTextInput(int result,const char *notice) {
@@ -551,9 +671,42 @@ void Client::finishTextInput(int result,const char *notice) {
 }
 void Client::run() {
     while (!stop_) {
-        uu_cpu_mark(3);
         try {
+#ifdef UU_CONTROL_STAGE_TIMING
+        const auto stageNow=ControlStageTiming::nowUs();
+        if(!controlStages_.reportedAtUs)controlStages_.reportedAtUs=stageNow;
+        if(stageNow-controlStages_.reportedAtUs>=2000000) {
+            Json stages=Json::object();
+            for(int i=0;i<ControlStageTiming::Count;++i) {
+                const auto &v=controlStages_.samples[i];
+                if(!v.calls)continue;
+                auto &entry=stages[ControlStageTiming::names[i]];
+                entry={{"n",v.calls},{"total_us",v.totalUs},{"max_us",v.maxUs},
+                    {"ge16ms",v.over16ms},{"max_cycle",v.maxCycle},
+                    {"max_start_us",v.maxStartUs},{"max_end_us",v.maxEndUs}};
+                if(i==ControlStageTiming::Loop || i==ControlStageTiming::InputQueue ||
+                   i==ControlStageTiming::InputHandle || i==ControlStageTiming::OtherHandle)
+                    entry["hist"]=v.histogram;
+                if(v.maxEventSeq) {
+                    entry["max_event_seq"]=v.maxEventSeq;entry["max_event_generation"]=v.maxEventGeneration;
+                    entry["max_event_type"]=v.maxEventType.data();
+                }
+            }
+            diagnostic(("control-stages-"+Json({{"generation_at_report",generation_},
+                {"window_start_us",controlStages_.reportedAtUs},{"window_end_us",stageNow},
+                {"histogram_upper_us",ControlStageTiming::histogramBounds},
+                {"quality_changes",controlStages_.qualityChanges},
+                {"last_quality_change_us",controlStages_.lastQualityChangeUs},
+                {"stages",std::move(stages)}}).dump()).c_str());
+            controlStages_.samples={};controlStages_.qualityChanges=0;
+            controlStages_.reportedAtUs=ControlStageTiming::nowUs();
+        }
+        ++controlStages_.cycle;
+        UU_CONTROL_SCOPE(Loop);
+#endif
+        uu_cpu_mark(3);
             {
+                UU_CONTROL_SCOPE(Idle);
                 std::unique_lock lock(inbox_->mutex);
                 if (inbox_->events.empty())
                     inbox_->cv.wait_for(lock, std::chrono::milliseconds(4));
@@ -561,6 +714,7 @@ void Client::run() {
             drainEvents();
             if (stop_)
                 break;
+            flushPadMotion();
             if(reconnectAt_ && monotonicMs()>=reconnectAt_ && !cancel_) {
                 reconnectAt_=0;
                 if(reconnectArmed_ && api_->authenticated())
@@ -571,29 +725,71 @@ void Client::run() {
             }
             tickQuality();
             tickVideoScale();
-            if(pendingPrivacy_ && monotonicMs()>=pendingPrivacy_->deadline){
-                pendingPrivacy_.reset();
-                std::lock_guard lock(stateMutex_);state_.privacyPending=false;state_.privacyKnown=false;
-                state_.privacyNotice="电脑未确认屏幕保护模式，请检查主机版本和权限";
+            tickSafetyActions();
+            // Re-enable host cursor capture once the new session can actually
+            // show video. A manual request also satisfies this once-per-session step.
+            if(!autoCursorCaptureHandled_ && firstVideoFramePublishedLogged_ && !cancel_ &&
+               !(pendingPrivacy_ && pendingPrivacy_->deadline) && isStreaming()){
+                const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+                if(channel!=channels_.end() && channel->second->isOpen() && channel->second->bufferedAmount()<=65536){
+                    autoCursorCaptureHandled_=true;
+                    if(!pendingCursorCapture_){
+                        diagnostic("cursor-capture-auto-first-frame");
+                        handle({"cursor-capture",{{"deviceId",connectedDeviceId_}},generation_});
+                    }
+                }
+            }
+            if(pendingPrivacy_ && pendingPrivacy_->deadline && monotonicMs()>=pendingPrivacy_->deadline){
+                // Keep the latest request ID for a late reply in this session.
+                // A new request replaces it; disconnect clears it.
+                pendingPrivacy_->deadline=0;
+                std::lock_guard lock(stateMutex_);state_.privacyPending=false;
+                state_.privacyRequestedMode=PrivacyMode::Unknown;
+                if(!pendingPrivacy_->stateNotified){
+                    state_.privacyKnown=false;
+                    state_.privacyNotice="电脑未确认屏幕保护模式，请检查主机版本和权限";
+                }
                 diagnostic("privacy-screen-timeout");
+            }
+            if(pendingCursorCapture_ && monotonicMs()>=pendingCursorCapture_->deadline){
+                pendingCursorCapture_.reset();
+                std::lock_guard lock(stateMutex_);state_.cursorCapturePending=false;
+                state_.cursorCaptureNotice="电脑未确认请求，请查看指针是否恢复";
+                diagnostic("cursor-capture-timeout");
             }
             if(pendingText_ && monotonicMs()>=pendingText_->deadline)
                 finishTextInput(3,"电脑未确认文字同步，请重试；尚未粘贴");
+            {
+            UU_CONTROL_SCOPE(Receiver);
+#ifdef UU_CONTROL_STAGE_TIMING
+            const auto receiverTickStarted=std::chrono::steady_clock::now();
+#endif
             if (strictVideo_)
                 strictVideo_->tick();
+#ifdef UU_CONTROL_STAGE_TIMING
+            inputTiming_.receiverTickMaxUs=std::max(inputTiming_.receiverTickMaxUs,uint64_t(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-receiverTickStarted).count()));
+#endif
+            }
+            {
+            UU_CONTROL_SCOPE(Recovery);
             // Ask the sender for a new IDR frame when the decoder lost
             // references, when the picture stalled, or periodically as an
             // anti-corruption safety net on lossy Wi-Fi links.
-            if (video_ && snapshot().streaming) {
+            if (video_ && isStreaming()) {
                 const auto now = monotonicMs();
                 if (now - lastKeyframeRequest_ >= 700) {
                     const bool requested = media_->takeKeyframeRequest();
-                    if (requested && strictVideo_)
-                        strictVideo_->requestRecovery();
                     const bool stalled = media_->frameAgeMs() > 1500;
                     const bool periodic =
                         keyframeIntervalMs_ > 0 && now - lastKeyframeRequest_ >= keyframeIntervalMs_;
-                    if (requested || stalled || periodic) {
+                    if (requested && strictVideo_) {
+                        // The strict receiver owns this recovery PLI and its retry cadence.
+                        strictVideo_->requestRecovery();
+                        lastKeyframeRequest_ = now;
+                        diagnostic("rtc-keyframe-media-delegated");
+                    } else if (requested || stalled || periodic) {
                         video_->requestKeyframe();
                         lastKeyframeRequest_ = now;
                         ++keyframeRequests_;
@@ -608,11 +804,85 @@ void Client::run() {
                 lastKeyframeRecoveryMs_ = int(monotonicMs() - pendingKeyframeAt_);
                 pendingKeyframeAt_ = 0;
             }
+            }
+            {
+            UU_CONTROL_SCOPE(Feedback);
+#ifdef UU_CONTROL_STAGE_TIMING
+            const auto feedbackStarted=std::chrono::steady_clock::now();
+#endif
+#ifdef UU_TWCC_CLIENT_SEND
+            pollFeedbackSending(monotonicMs());
+#endif
+#ifdef UU_RBE_OBSERVE_CLIENT
+            if (receiveBandwidthObservation_) {
+                receiveBandwidthObservation_->poll();
+                const auto now = monotonicMs();
+#ifdef UU_RBE_CLIENT_SEND
+                pollReceiveBandwidthFeedback(now);
+#endif
+                if (now - receiveBandwidthLogAt_ >= 2000) {
+                    receiveBandwidthLogAt_ = now;
+                    const auto sample = receiveBandwidthObservation_->snapshot();
+                    diagnostic(("rbe-observe-packets-" + std::to_string(sample.input.packets) +
+                        "-ast-" + std::to_string(sample.input.usingAbsSendTime) +
+                        "-transport-skipped-" + std::to_string(sample.input.transportSequence) +
+                        "-missing-time-" + std::to_string(sample.input.missingArrival) +
+                        "-malformed-" + std::to_string(sample.input.malformed) +
+                        "-estimates-" + std::to_string(sample.estimates) +
+                        "-raw-bps-" + std::to_string(sample.estimateBps)).c_str());
+#ifdef UU_RBE_CLIENT_SEND
+                    const auto sent = receiveBandwidthObservation_->feedbackCounters();
+                    diagnostic(("rbe-send-submitted-" + std::to_string(sent.transport.submitted) +
+                        "-rtcp-bytes-" + std::to_string(sent.transport.submittedBytes) +
+                        "-failures-" + std::to_string(sent.transport.sendFailures) +
+                        "-replaced-" + std::to_string(sent.replaced) +
+                        "-last-bps-" + std::to_string(sent.lastSubmittedBps) +
+                        "-ssrcs-" + std::to_string(sent.lastSubmittedSsrcs) +
+                        "-stop-" + std::to_string(int(sent.transport.stopped))).c_str());
+#endif
+                }
+            }
+#endif
+#ifdef UU_CONTROL_STAGE_TIMING
+            inputTiming_.feedbackMaxUs=std::max(inputTiming_.feedbackMaxUs,uint64_t(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-feedbackStarted).count()));
+#endif
+            }
+#ifdef UU_CONTROL_STAGE_TIMING
+            if(inputTiming_.samples && monotonicMs()-inputTiming_.reportedAtMs>=2000) {
+                uint64_t coalesced=0;size_t queued=0,highWater=0;
+                {
+                    std::lock_guard lock(inbox_->mutex);
+                    coalesced=inbox_->inputAdmission.motionCoalesced;
+                    highWater=inbox_->inputAdmission.queueHighWater;queued=inbox_->events.size();
+                }
+                const auto control=channels_.find("CONTROL_DATA_CHANNEL");
+                const auto buffered=control==channels_.end()?0:control->second->bufferedAmount();
+                char summary[512];
+                std::snprintf(summary,sizeof summary,
+                    "input-latency-samples-%llu-wait-avg-ms-%.2f-wait-max-ms-%llu-handle-avg-us-%.2f-handle-max-us-%llu-tick-max-us-%llu-feedback-max-us-%llu-queued-%zu-high-%zu-coalesced-%llu-control-buffered-%zu-control-buffered-max-%llu",
+                    static_cast<unsigned long long>(inputTiming_.samples),
+                    double(inputTiming_.waitTotalMs)/inputTiming_.samples,
+                    static_cast<unsigned long long>(inputTiming_.waitMaxMs),
+                    double(inputTiming_.handleTotalUs)/inputTiming_.samples,
+                    static_cast<unsigned long long>(inputTiming_.handleMaxUs),
+                    static_cast<unsigned long long>(inputTiming_.receiverTickMaxUs),
+                    static_cast<unsigned long long>(inputTiming_.feedbackMaxUs),queued,highWater,
+                    static_cast<unsigned long long>(coalesced),size_t(buffered),
+                    static_cast<unsigned long long>(inputTiming_.controlBufferedMax));
+                diagnostic(summary);
+                inputTiming_={};inputTiming_.reportedAtMs=monotonicMs();
+            }
+#endif
             if (monotonicMs() - lastStatsUpdate_ >= 500)
                 refreshStats(monotonicMs());
             if (socket_) {
+                {
+                UU_CONTROL_SCOPE(Signal);
                 pumpSignaling(
                     [this](WsMessage &m) {
+                        UU_CONTROL_SCOPE(SignalRead);
                         const auto start = monotonicMs();
                         const bool received = socket_->receive(m);
                         const auto elapsed = monotonicMs() - start;
@@ -620,7 +890,7 @@ void Client::run() {
                             diagnostic(("signal-read-slow-ms-" + std::to_string(elapsed)).c_str());
                         return received;
                     },
-                    [this](const WsMessage &m) { packet(m); },
+                    [this](const WsMessage &m) { UU_CONTROL_SCOPE(SignalPacket);packet(m); },
                     [this] {
                         if (stop_ || cancel_)
                             return true;
@@ -628,6 +898,7 @@ void Client::run() {
                         return !inbox_->events.empty();
                     },
                     [] { return monotonicMs(); });
+                }
                 // Connected/failed callbacks may arrive while processing SDP/ICE.
                 // Apply them before the deadline, including callbacks queued at its boundary.
                 drainEvents();
@@ -635,12 +906,19 @@ void Client::run() {
                     throw std::runtime_error("信令心跳超时");
             }
             if (deadline_ && monotonicMs() > deadline_) {
+                diagnostic(("connect-deadline-elapsed-ms-"+
+                            std::to_string(monotonicMs()-connectionAttemptStartedAt_)+
+                            "-remaining-ms-0").c_str());
+                logEventQueueSnapshot("timeout");
                 if (peer_) {
                     diagnostic(("timeout-peer-state-" + std::to_string(int(peer_->state()))).c_str());
                     diagnostic(("timeout-ice-state-" + std::to_string(int(peer_->iceState()))).c_str());
                 }
                 diagnostic(("signal-timeout-soac-events-" + std::to_string(soacEvents_) +
                             "-rejected-" + std::to_string(soacRejected_)).c_str());
+                diagnostic(("signal-timeout-packets-"+std::to_string(signalPacketCount_)+
+                            "-binary-frames-"+std::to_string(signalBinaryFrameCount_)+
+                            "-pending-attachments-"+std::to_string(remainingAttachments_)).c_str());
                 if (!remoteDescriptionApplied_) {
                     diagnostic("signal-timeout-waiting-description");
                     throw std::runtime_error("连接超时：未取得有效的电脑协商应答，请检查电脑端和信令连接");
@@ -658,6 +936,10 @@ void Client::run() {
         } catch (const std::exception &error) {
             if (stop_)
                 break;
+            if(connectionAttemptStartedAt_)
+                diagnostic(("connect-failure-elapsed-ms-"+
+                            std::to_string(monotonicMs()-connectionAttemptStartedAt_)).c_str());
+            logEventQueueSnapshot("failure");
             const auto failure = connectionFailure(snapshot().stage, error.what());
             diagnosticException("client-exception", std::current_exception());
             const auto reason = rtcLogEvent(error.what());
@@ -682,7 +964,8 @@ void Client::run() {
                 const bool transient=reason=="failure-connect-timeout" || reason=="failure-signal-heartbeat" ||
                     reason=="failure-signal-read" || reason=="failure-signal-remote-close" ||
                     reason=="failure-signal-write-timeout" || reason=="failure-signal-write" ||
-                    reason=="failure-peer-disconnected" || reason=="failure-ice" || reason=="failure-dtls-or-sctp";
+                    reason=="failure-peer-disconnected" || reason=="failure-ice" || reason=="failure-dtls-or-sctp" ||
+                    reason=="failure-turn-bridge";
                 if(autoReconnect_ && reconnectArmed_ && api_->authenticated() && transient &&
                    reconnectAttempts_<reconnectLimit_ && !connectedDeviceId_.empty()) {
                     const int delay=std::min(16000,1000<<std::min(reconnectAttempts_,4));
@@ -693,6 +976,10 @@ void Client::run() {
                 } else {reconnectAt_=0;reconnectArmed_=false;setState("error",failure);} // Fatal or non-transient error, disable auto-reconnect
             }
         } catch (...) {
+            if(connectionAttemptStartedAt_)
+                diagnostic(("connect-failure-unknown-elapsed-ms-"+
+                            std::to_string(monotonicMs()-connectionAttemptStartedAt_)).c_str());
+            logEventQueueSnapshot("unknown-failure");
             diagnostic("client-unknown-exception");
             reconnectAt_=0;reconnectArmed_=false;
             disconnect();
@@ -701,7 +988,80 @@ void Client::run() {
         }
     }
     cancel_ = false;
+#ifdef UU_ASYNC_QUALITY_SAVE
+    qualityConfigWriter_->shutdown();
+    pollQualitySave();
+#endif
     disconnect();
+#if defined(__SWITCH__) && defined(UU_SWITCH_BATCH_RX)
+    // End-of-run process totals, independent of the expensive packet traces.
+    uint64_t calls, messages, multi, maxBatch, fallbacks;
+    int batchError;
+    uu_juice_batch_diagnostics(&calls, &messages, &multi, &maxBatch, &fallbacks, &batchError);
+    diagnostic(("udp-batch-calls-" + std::to_string(calls) + "-datagrams-" + std::to_string(messages) +
+                "-multi-" + std::to_string(multi) + "-max-" + std::to_string(maxBatch) +
+                "-fallbacks-" + std::to_string(fallbacks) + "-errno-" + std::to_string(batchError)).c_str());
+#ifdef UU_SWITCH_BATCH_REUSE
+    uint64_t allocations, frees, liveBytes;
+    uu_batch_rx_diagnostics(&allocations, &frees, &liveBytes);
+    diagnostic(("udp-batch-cache-reuse-1-allocs-" + std::to_string(allocations) +
+                "-frees-" + std::to_string(frees) + "-livebytes-" + std::to_string(liveBytes)).c_str());
+#else
+    diagnostic("udp-batch-cache-reuse-0");
+#endif
+#endif
+#ifdef UU_VIDEO_SUPPLY_TRACE
+    // Preserve the last usable capture after an idle launch or failed setup.
+    if (videoSupplyTrace_->stats().accessUnits == 0) {
+        diagnostic("video-traces-preserved-no-frames");
+        return;
+    }
+#ifdef __SWITCH__
+    mkdir("sdmc:/switch/UURemote-ns/diag",0777);
+    const char *supplyPath="sdmc:/switch/UURemote-ns/diag/video_supply.csv";
+#else
+    const char *supplyPath="video_supply.csv";
+#endif
+    diagnostic(videoSupplyTrace_->flush(supplyPath)?"video-supply-flushed":"video-supply-write-failed");
+#ifdef UU_UDP_RX_TRACE
+#ifdef __SWITCH__
+    const char *udpReceivePath="sdmc:/switch/UURemote-ns/diag/udp_receive.csv";
+    const char *udpIncidentPath="sdmc:/switch/UURemote-ns/diag/udp_incidents.csv";
+    const char *udpStagePath="sdmc:/switch/UURemote-ns/diag/udp_stages.csv";
+#else
+    const char *udpReceivePath="udp_receive.csv";
+    const char *udpIncidentPath="udp_incidents.csv";
+    const char *udpStagePath="udp_stages.csv";
+#endif
+    diagnostic(uu::flushUdpReceiveTrace(udpReceivePath)?"udp-receive-flushed":"udp-receive-write-failed");
+    diagnostic(uu::flushUdpReceiveIncidents(udpIncidentPath)?"udp-incidents-flushed":"udp-incidents-write-failed");
+    diagnostic(uu::flushUdpReceiveStages(udpStagePath)?"udp-stages-flushed":"udp-stages-write-failed");
+#if defined(__SWITCH__) && defined(UU_UDP_SEND_TIMING)
+    diagnostic(uu::flushUdpSendTrace("sdmc:/switch/UURemote-ns/diag/udp_send_slow.csv")?
+        "udp-send-slow-flushed":"udp-send-slow-write-failed");
+    diagnostic(uu::flushUdpSendLocks("sdmc:/switch/UURemote-ns/diag/udp_send_locks.csv")?
+        "udp-send-locks-flushed":"udp-send-locks-write-failed");
+#ifdef UU_BSD_SEND_TIMING
+    diagnostic(uu::flushBsdSendTrace("sdmc:/switch/UURemote-ns/diag/bsd_send_slow.csv")?
+        "bsd-send-slow-flushed":"bsd-send-slow-write-failed");
+#ifdef UU_PACKET_STAGE_TRACE
+    diagnostic(uu::flushBsdReceiveTrace("sdmc:/switch/UURemote-ns/diag/bsd_receive_slow.csv")?
+        "bsd-receive-slow-flushed":"bsd-receive-slow-write-failed");
+    diagnostic(uu::flushPacketStages("sdmc:/switch/UURemote-ns/diag/packet_stages.csv")?
+        "packet-stages-flushed":"packet-stages-write-failed");
+#endif
+#endif
+#endif
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+#ifdef __SWITCH__
+    const char *repairPath="sdmc:/switch/UURemote-ns/diag/video_repair.csv";
+#else
+    const char *repairPath="video_repair.csv";
+#endif
+    diagnostic(videoRepairTrace_->flush(repairPath)?"video-repair-flushed":"video-repair-write-failed");
+#endif
+#endif
 }
 void Client::handle(const Event &event) {
     const auto &e = event.type;
@@ -714,6 +1074,7 @@ void Client::handle(const Event &event) {
         if(screen!=activeScreenId_){
             activeScreenId_=screen;
             pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+    videoScaleStableSince_=videoScaleRetryAt_=0;videoScaleObservedWidth_=videoScaleObservedHeight_=0;videoScaleAttempts_=0;
             setVideoScaleNotice("屏幕信息已更新，等待核对视频尺寸");
             diagnostic(("quality-current-screen-"+std::to_string(screen)+"-count-"+std::to_string(data.at("count").get<unsigned>())).c_str());
             if(pendingQuality_ && pendingQuality_->screenId!=screen)
@@ -735,8 +1096,8 @@ void Client::handle(const Event &event) {
         const int targetQuality=pendingTarget?pendingTarget->quality:streamQuality_;
         const int targetWidth=pendingTarget?pendingTarget->width:streamWidth_;
         const int targetHeight=pendingTarget?pendingTarget->height:streamHeight_;
-        const int targetCap=pendingTarget?pendingTarget->cap:maxBitrateMbps_;
-        const QualityApplicationTarget target{targetWidth,targetHeight,targetFps,targetQuality,targetCap};
+        const int targetCap=effectiveBitrateMbps(pendingTarget?pendingTarget->cap:maxBitrateMbps_,bitrateRoute_);
+        const QualityApplicationTarget target{targetWidth,targetHeight,targetFps,targetQuality,targetCap,true};
         // Evidence is accumulated for the lifetime of the current request.
         // Split sync messages can therefore jointly prove a complete match.
         if(hasFps)qualityApply_.evidence.observeFps(syncFps);
@@ -744,6 +1105,12 @@ void Client::handle(const Event &event) {
         if(hasWidth)qualityApply_.evidence.observeWidth(syncWidth);
         if(hasHeight)qualityApply_.evidence.observeHeight(syncHeight);
         if(hasBitrate)qualityApply_.evidence.observeBitrate(syncMbps);
+        if(hasBitrate && hasQuality && syncQuality==streamQuality_ &&
+           syncMbps==effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_)){
+            std::lock_guard lock(stateMutex_);
+            state_.routeBitrateNotice=syncMbps>0 ? "电脑报告码率上限 "+std::to_string(syncMbps)+" Mbps"
+                : "直连：电脑报告码率上限已取消";
+        }
         if(qualityApply_.evidence.anyKnown())qualityApply_.accept();
         const bool awaitingConfirmation=bool(pendingQuality_ || pendingQualityApply_);
         const uint64_t pendingId=qualityApply_.pending?qualityApply_.pendingRequestId:0;
@@ -808,15 +1175,18 @@ void Client::handle(const Event &event) {
         const int maxBitrate=data.value("max_bitrate_mbps",maxBitrateMbps_);
         if(maxBitrate<0 || maxBitrate>100 || (quality==6 && maxBitrate==0)) throw std::runtime_error("自定义码率设置无效");
         const bool hevc=data.value("hevc",hevc_);
-        if(pendingQuality_){std::lock_guard lock(stateMutex_);state_.qualityNotice="正在更新画质，请稍候";return;}
+        if(pendingQuality_ || routeBitrateRequest_){std::lock_guard lock(stateMutex_);state_.qualityNotice="正在更新画质，请稍候";return;}
         const QualityValues target{width,height,fps,quality,maxBitrate,playoutDelay,vsync,hevc};
+        const auto currentQuality=snapshot();
+        const bool bitrateOnly=target.isBitrateOnlyChangeFrom({streamWidth_,streamHeight_,streamFps_,
+            streamQuality_,maxBitrateMbps_,currentQuality.playoutDelayMs,currentQuality.vsync,hevc_});
         const bool resolutionChanged=width!=streamWidth_ || height!=streamHeight_;
         const bool captureChanged=width!=streamWidth_ || height!=streamHeight_ || fps!=streamFps_ || quality!=streamQuality_ ||
             ((quality==6 || streamQuality_==6) && maxBitrate!=maxBitrateMbps_);
         const bool capChanged=maxBitrate!=maxBitrateMbps_;
         const bool streamChanged=captureChanged || capChanged || hevc!=hevc_;
-        if(!peer_ || (!snapshot().streaming && !streamChanged)){commitQuality(target,false,"设置已保存，连接时应用");return;}
-        if(!snapshot().streaming){reconnectQuality(target,"正在重新连接以应用设置…");return;}
+        if(!peer_ || (!isStreaming() && !streamChanged)){commitQuality(target,false,"设置已保存，连接时应用");return;}
+        if(!isStreaming()){reconnectQuality(target,"正在重新连接以应用设置…");return;}
         // Custom encoder limits are not a measurement of available bandwidth.
         // Rebuild the track when crossing modes so a prior stored REMB
         // cannot keep being repeated by the RTCP receiving session.
@@ -825,7 +1195,10 @@ void Client::handle(const Event &event) {
             reconnectQuality(target,"正在重新连接以应用编码或码率设置…");return;
         }
         if(!captureChanged){
-            try{commitQuality(target,capChanged,streamChanged?"码率反馈已在线更新":"显示设置已更新");}
+            try{
+                commitQuality(target,capChanged,streamChanged?"码率上限已保存，等待电脑确认":"显示设置已更新");
+                applyBitrateCap();
+            }
             catch(...){reconnectQuality(target,"在线更新未完成，正在重连应用…");}
             return;
         }
@@ -866,16 +1239,16 @@ void Client::handle(const Event &event) {
             bytes=videoQualitySettingRpc(id,quality);
             rpcMode="video-quality-setting";rpcKind=QualityRpcKind::VideoQuality;
         }else if(qualityOnly){
-            bytes=qualityUpdateRpc(id,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
+            bytes=qualityUpdateRpc(id,fps,quality,activeScreenId_,effectiveBitrateMbps(maxBitrate,bitrateRoute_));
             rpcMode="quality-only";rpcKind=QualityRpcKind::QualityOnly;
         }else{
-            bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_,quality==6?maxBitrate:0);
+            bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_,effectiveBitrateMbps(maxBitrate,bitrateRoute_));
             rpcMode="capture";rpcKind=QualityRpcKind::Capture;
         }
         diagnostic(("encoder-bitrate-request-online-id-"+std::to_string(id)+
-                    "-bps-"+std::to_string(quality==6?uint64_t(maxBitrate)*1000000u:0)+
+                    "-bps-"+std::to_string(uint64_t(effectiveBitrateMbps(maxBitrate,bitrateRoute_))*1000000u)+
                     "-quality-"+std::to_string(quality)).c_str());
-        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_,rpcKind,false};
+        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_,rpcKind,false,bitrateOnly};
         pendingQualityApply_.reset();
         qualityApply_.beginRequest();
         {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";
@@ -893,9 +1266,33 @@ void Client::handle(const Event &event) {
                 fallbackQuality("设置通道已关闭，正在重连应用…");return;
             }
             ++qualitySent_;
+            lastEncoderQuality_=quality;lastEncoderCap_=effectiveBitrateMbps(maxBitrate,bitrateRoute_);
+            routeBitrateUpdateFailed_=false;
             diagnostic((rpcMode+"-rpc-"+(sent?"sent-":"queued-")+std::to_string(id)).c_str());
         }catch(...){fallbackQuality("设置发送失败，正在重连应用…");}
     } else if(e=="quality-rpc-ack") {
+        if(pendingCursorCapture_ && data.at("id").get<uint64_t>()==pendingCursorCapture_->id){
+            pendingCursorCapture_.reset();
+            const bool rejected=data.value("errors",0u)!=0;
+            const bool accepted=data.value("capture",false) && !rejected && data.value("other",0u)==0;
+            std::lock_guard lock(stateMutex_);state_.cursorCapturePending=false;
+            state_.cursorCaptureNotice=rejected?"电脑拒绝光标请求，错误码 "+std::to_string(data.value("code",0)):
+                accepted?"电脑已接受请求，请查看指针是否恢复":"电脑已回复，但未确认光标请求";
+            diagnostic(accepted?"cursor-capture-accepted":rejected?"cursor-capture-rejected":"cursor-capture-unconfirmed");
+            return; // Diagnostic request must not trigger the quality ACK keyframe path.
+        }
+        if(routeBitrateRequest_ && data.at("id").get<uint64_t>()==routeBitrateRequest_->id){
+            const bool rejected=data.value("errors",0u) || data.value("other",0u);
+            const int cap=routeBitrateRequest_->cap;
+            if(!rejected){lastEncoderQuality_=routeBitrateRequest_->quality;lastEncoderCap_=routeBitrateRequest_->cap;}
+            routeBitrateRequest_.reset();routeBitrateUpdateFailed_=rejected;
+            {std::lock_guard lock(stateMutex_);
+             if(rejected)state_.routeBitrateNotice="电脑拒绝码率上限请求，请重新连接后检查";
+             else if(!state_.appliedBitrateKnown || state_.appliedBitrateMbps!=cap)
+                 state_.routeBitrateNotice="电脑已应答码率上限，等待实际参数确认";}
+            diagnostic(rejected?"route-bitrate-request-rejected":"route-bitrate-request-acknowledged");
+            return;
+        }
         if(pendingVideoScale_ && data.at("id").get<uint64_t>()==pendingVideoScale_->id){
             if(pendingVideoScale_->acknowledged)return;
             if(data.value("errors",0u) || data.value("other",0u)){
@@ -903,14 +1300,20 @@ void Client::handle(const Event &event) {
                 setVideoScaleNotice("电脑未接受视频缩放，桌面设置保持不变");
                 diagnostic("video-scale-not-accepted");return;
             }
-            const auto media=media_->stats();
             pendingVideoScale_->acknowledged=true;
             pendingVideoScale_->deadline=monotonicMs()+5000;
-            pendingVideoScale_->mediaEpoch=media.epoch;
-            pendingVideoScale_->publishedBefore=media.publishedTotal;
+            // Keep the send-time epoch/count: a correctly scaled frame may
+            // already have arrived before this ACK on the independent channel.
             nextVideoScaleCheck_=0;
             setVideoScaleNotice("电脑已应答，正在核对实际视频尺寸");
-            diagnostic("video-scale-acknowledged");return;
+            diagnostic("video-scale-acknowledged");
+            // Match non-bitrate quality changes: request a fresh frame after
+            // scale acceptance, but keep waiting for actual decoded dimensions.
+            // The acknowledged guard above makes duplicate ACKs a no-op.
+            const bool keyframeAccepted=video_ && video_->requestKeyframe();
+            diagnostic(keyframeAccepted?"video-scale-keyframe-handler-accepted":
+                                       "video-scale-keyframe-handler-unavailable");
+            return;
         }
         if(!pendingQuality_ || pendingQuality_->acknowledged || data.at("id").get<uint64_t>()!=pendingQuality_->id)return;
         const bool capture=data.value("capture",false);
@@ -955,7 +1358,7 @@ void Client::handle(const Event &event) {
                     Bytes retry;
                     try{
                         retry=qualityUpdateRpc(retryId,target.fps,target.quality,activeScreenId_,
-                                               target.quality==6?target.cap:0);
+                                               effectiveBitrateMbps(target.cap,bitrateRoute_));
                     }catch(...){reconnectQuality(target,"兼容设置构造失败，正在重连应用…");return;}
                     pendingQuality_=PendingQuality{target,retryId,monotonicMs()+5000,false,false,activeScreenId_,
                         QualityRpcKind::QualityOnly,true};
@@ -994,7 +1397,24 @@ void Client::handle(const Event &event) {
             state_.settingSource="ack";
         }
         diagnostic(("quality-rpc-acked-"+std::to_string(pendingQuality_->id)).c_str());
-        if(video_)video_->requestKeyframe();
+        if(video_) {
+            bool requestKeyframe=true;
+#ifdef UU_CAP_ONLY_ACK_NO_PLI
+            requestKeyframe=!pendingQuality_->bitrateOnly;
+#endif
+            const auto requestAtUs=ControlStageTiming::nowUs();
+            if(requestKeyframe) {
+                ++qualityAckKeyframeAttempted_;
+                diagnostic(("quality-ack-keyframe-request-id-"+std::to_string(pendingQuality_->id)+
+                            "-at-us-"+std::to_string(requestAtUs)).c_str());
+                UU_CONTROL_SCOPE(QualityAckKeyframe);
+                video_->requestKeyframe();
+            } else {
+                ++qualityAckKeyframeSkipped_;
+                diagnostic(("quality-ack-keyframe-skipped-cap-only-id-"+std::to_string(pendingQuality_->id)+
+                            "-at-us-"+std::to_string(requestAtUs)).c_str());
+            }
+        }
         finishQuality();
     } else if(e=="startup"){
         cancel_=false;
@@ -1056,7 +1476,7 @@ void Client::handle(const Event &event) {
         if(e=="disconnect"){
             if(data.value("restoreSound",false) && data.value("deviceId",std::string{})==connectedDeviceId_){
                 const auto channel=channels_.find(systemActionChannel);
-                if(snapshot().streaming && channel!=channels_.end() && channel->second->isOpen()){
+                if(isStreaming() && channel!=channels_.end() && channel->second->isOpen()){
                     const auto bytes=simpleActionMessage(nextQualityRpc_++,16,std::nullopt);
                     try {
                         const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
@@ -1085,10 +1505,17 @@ void Client::handle(const Event &event) {
         {
             std::lock_guard lock(stateMutex_);
             state_.devices = Json::array();
+            ++state_.devicesRevision;
             state_.nickname.clear();
         }
         setState("idle", "");
     } else if (e == "refresh") {
+        // The device-list request is synchronous on this same signaling worker.
+        // Do not stall negotiation or replace an active session's stage with idle.
+        if(socket_ || peer_ || reconnectAt_) {
+            diagnostic("device-refresh-skipped-active-session");
+            return;
+        }
         if (api_->authenticated()) {
             cancel_ = false;
             setState("loading", "正在同步设备…");
@@ -1100,6 +1527,13 @@ void Client::handle(const Event &event) {
         else if(!reconnectArmed_) return;
         connectedDeviceId_ = data.at("deviceId").get<std::string>();
         disconnect();
+        {
+            std::lock_guard lock(inbox_->mutex);
+            inbox_->peerCallbackHighWater=inbox_->events.size();
+            inbox_->dataChannelHighWater=inbox_->events.size();
+            inbox_->peerCallbackRejected=0;
+            inbox_->dataChannelRejected=0;
+        }
         {std::lock_guard lock(stateMutex_);state_.activeDeviceId=connectedDeviceId_;}
         cancel_ = false;
         setState("joining", "正在加入远控房间…");
@@ -1114,9 +1548,30 @@ void Client::handle(const Event &event) {
         setState("signaling", "正在连接 UU 信令服务器…");
         socket_->open(url, room.at("token").get<std::string>());
         lastPacket_ = monotonicMs();
-        deadline_ = monotonicMs() + 45000;
+        connectionAttemptStartedAt_=monotonicMs();
+        deadline_ = connectionAttemptStartedAt_ + 45000;
+    } else if(e=="cursor-capture") {
+        if(pendingCursorCapture_)return;
+        const auto s=snapshot();
+        if(data.at("deviceId").get<std::string>()!=connectedDeviceId_)return;
+        const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+        if(!s.streaming || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
+            std::lock_guard lock(stateMutex_);state_.cursorCaptureNotice="电脑设置通道尚未就绪";return;
+        }
+        const auto id=nextQualityRpc_++;
+        const auto bytes=cursorCaptureRpc(id);
+        try{
+            channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+        }catch(const std::exception &){
+            std::lock_guard lock(stateMutex_);state_.cursorCaptureNotice="光标请求发送失败";return;
+        }
+        pendingCursorCapture_=PendingCursorCapture{id,monotonicMs()+8000};
+        autoCursorCaptureHandled_=true;
+        std::lock_guard lock(stateMutex_);state_.cursorCapturePending=true;
+        state_.cursorCaptureNotice="已请求开启光标捕获，等待电脑确认";
+        diagnostic(("cursor-capture-request-id-"+std::to_string(id)).c_str());
     } else if(e=="privacy-screen") {
-        if(pendingPrivacy_)return;
+        if(pendingPrivacy_ && pendingPrivacy_->deadline)return;
         const auto state=snapshot();
         if(data.at("deviceId").get<std::string>()!=connectedDeviceId_)return;
         const auto channel=channels_.find("TEXT_DATA_CHANNEL");
@@ -1137,11 +1592,15 @@ void Client::handle(const Event &event) {
         diagnostic(("privacy-screen-request-mode-"+std::to_string(modeValue)).c_str());
     } else if(e=="privacy-screen-ack") {
         if(!pendingPrivacy_ || data.at("id").get<uint64_t>()!=pendingPrivacy_->id)return;
-        const auto requested=pendingPrivacy_->mode;pendingPrivacy_.reset();
+        const auto requested=pendingPrivacy_->mode;
+        const bool notified=pendingPrivacy_->stateNotified;pendingPrivacy_.reset();
         const int code=data.at("code").get<int>();
         const auto reported=static_cast<PrivacyMode>(data.at("current_mode").get<unsigned>());
         const auto echoed=static_cast<PrivacyMode>(data.at("requested_mode").get<unsigned>());
-        std::lock_guard lock(stateMutex_);state_.privacyPending=false;
+        std::lock_guard lock(stateMutex_);state_.privacyPending=false;state_.privacyRequestedMode=PrivacyMode::Unknown;
+        // A current-session state notification observed after this request is
+        // authoritative over the RPC's earlier execution result.
+        if(notified){diagnostic("privacy-screen-ack-state-notify-kept");return;}
         // The parser owns mode validation. Only the PC's current mode confirms state.
         if(reported!=PrivacyMode::Unknown){state_.privacyMode=reported;state_.privacyKnown=true;}
         else state_.privacyKnown=false;
@@ -1157,6 +1616,22 @@ void Client::handle(const Event &event) {
             reported==PrivacyMode::Normal?"电脑报告已开启隐私保护":"电脑报告显示屏已关闭，请确认实际效果";
         diagnostic(("privacy-screen-response-code-"+std::to_string(code)+"-requested-"+
                     std::to_string(unsigned(requested))+"-current-"+std::to_string(unsigned(reported))).c_str());
+    } else if(e=="privacy-screen-state") {
+        const auto current=static_cast<PrivacyMode>(data.at("current_mode").get<unsigned>());
+        const auto requested=static_cast<PrivacyMode>(data.at("requested_mode").get<unsigned>());
+        const int code=data.at("code").get<int>();
+        if(pendingPrivacy_)pendingPrivacy_->stateNotified=current!=PrivacyMode::Unknown;
+        std::lock_guard lock(stateMutex_);
+        state_.privacyKnown=current!=PrivacyMode::Unknown;
+        state_.privacyMode=current;
+        if(current==PrivacyMode::Unknown)state_.privacyNotice="电脑未报告实际屏幕保护模式";
+        else if(requested==PrivacyMode::ScreenOff && current==PrivacyMode::Normal)
+            state_.privacyNotice="电脑已从关闭显示屏回退到隐私保护";
+        else if(code!=0)state_.privacyNotice="电脑报告屏幕保护异常，错误码 "+std::to_string(code);
+        else state_.privacyNotice=current==PrivacyMode::Off?"电脑报告已关闭屏幕保护":
+            current==PrivacyMode::Normal?"电脑报告已开启隐私保护":"电脑报告显示屏已关闭";
+        diagnostic(("privacy-state-notify-code-"+std::to_string(code)+"-requested-"+
+                    std::to_string(unsigned(requested))+"-current-"+std::to_string(unsigned(current))).c_str());
     } else if(e=="text-channel-state") {
         std::lock_guard lock(stateMutex_);state_.textChannelReady=data.get<bool>();
     } else if(e=="control-channel-state") {
@@ -1166,7 +1641,7 @@ void Client::handle(const Event &event) {
     } else if(e=="text-input") {
         if(pendingText_)return;
         const auto ch=channels_.find("TEXT_DATA_CHANNEL");
-        if(!snapshot().streaming || ch==channels_.end() || !ch->second->isOpen() || ch->second->bufferedAmount()>65536){
+        if(!isStreaming() || ch==channels_.end() || !ch->second->isOpen() || ch->second->bufferedAmount()>65536){
             finishTextInput(3,"电脑输入通道尚未就绪，请稍后重试");return;
         }
         try{
@@ -1204,12 +1679,23 @@ void Client::handle(const Event &event) {
         if(data.contains("deviceId") && data.at("deviceId").get<std::string>()!=connectedDeviceId_){
             inform("连接电脑已变化，未应用上一台电脑的设置");return;
         }
-        const auto channel=channels_.find(systemActionChannel);
-        if(!snapshot().streaming || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
-            inform("电脑控制通道尚未就绪，未发送操作");return;
-        }
         const auto action=data.at("action").get<unsigned>();
         const auto enabled=data.contains("enabled")?std::optional<bool>(data.at("enabled").get<bool>()):std::nullopt;
+        if(data.value("retrySafety",false)){
+            const bool quiet=data.value("quiet",false);
+            const size_t slot=action==19?0:(action==14 || action==16)?1:2;
+            if(slot==1)safetyActions_[2].reset();
+            safetyActions_[slot]=PendingSafetyAction{action,enabled,monotonicMs()+5000,quiet};
+            if(!quiet){
+                std::lock_guard lock(stateMutex_);
+                state_.safetyNotice="正在提交安全设置";
+            }
+            return;
+        }
+        const auto channel=channels_.find(systemActionChannel);
+        if(!isStreaming() || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
+            inform("电脑控制通道尚未就绪，未发送操作");return;
+        }
         const auto bytes=simpleActionMessage(nextQualityRpc_++,action,enabled);
         try {
             const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
@@ -1217,27 +1703,30 @@ void Client::handle(const Event &event) {
             if(!data.value("quiet",false))inform(sent?"操作请求已发送，请确认电脑端结果":"操作请求已排队，等待电脑端处理");
         }catch(...){diagnostic("system-action-control-send-failed");inform("电脑控制操作发送失败");}
     } else if (e == "input") {
-        input(data);
+        input(data, event.motion, controlStages_.eventSeq);
     } else if (e == "release") {
         release();
     } else if (e == "local") {
         emit("soac",
              soac(remote_, data.at("type").get<std::string>(), {{"sdp", data.at("sdp")}}, ice_, control_));
         diagnostic(data.value("type", "") == "answer" ? "soac-answer-sent" : "soac-offer-sent");
-#ifdef UU_TWCC_OBSERVE_CLIENT
         // The local event contains exactly the SDP generated for transmission;
         // retain only its validated capability projection, never a new raw copy.
         try {
+#ifdef UU_TWCC_OBSERVE_CLIENT
             stopFeedbackObservation();
+#endif
+            invalidateFeedbackCapabilities();
             feedbackLocalCaps_ = twcc::NegotiationCapabilities::fromSdp(
                 data.at("sdp").get_ref<const std::string &>(),
                 rtc::Description::stringToType(data.at("type").get<std::string>()));
-            refreshFeedbackObservation();
+            if (!feedbackLocalCaps_) diagnostic("feedback-capabilities-local-invalid");
+            refreshFeedbackCapabilities();
         } catch (...) {
             feedbackLocalCaps_.reset();
-            diagnostic("twcc-observation-local-unavailable");
+            invalidateFeedbackCapabilities();
+            diagnostic("feedback-capabilities-local-unavailable");
         }
-#endif
     } else if (e == "candidate") {
         const auto sendStarted = monotonicMs();
         emit("soac", soac(remote_, "candidate", data, ice_, control_));
@@ -1247,21 +1736,22 @@ void Client::handle(const Event &event) {
     } else if (e == "ice-state" || e == "gathering-state" || e == "signaling-state") {
         const auto label = "rtc-" + e + "-" + std::to_string(data.get<int>());
         diagnostic(label.c_str());
-#ifdef UU_TWCC_OBSERVE_CLIENT
-        if (e == "signaling-state" && data == int(rtc::PeerConnection::SignalingState::Stable))
-            refreshFeedbackObservation();
-#endif
+        if (e == "signaling-state") refreshFeedbackCapabilities();
         if (e == "ice-state" && data != int(rtc::PeerConnection::IceState::Closed))
             iceState_ = static_cast<rtc::PeerConnection::IceState>(data.get<int>());
         if (e == "ice-state" &&
             (data == int(rtc::PeerConnection::IceState::Connected) ||
              data == int(rtc::PeerConnection::IceState::Completed)) &&
-            !snapshot().streaming)
+            !isStreaming())
             setState("connecting", "网络通道已就绪，正在协商加密和数据通道…");
     } else if (e == "peer-state") {
         auto s = data.get<int>();
         diagnostic(("rtc-peer-state-" + std::to_string(s)).c_str());
         if (s == int(rtc::PeerConnection::State::Connected)) {
+            logEventQueueSnapshot("peer-connected");
+            if(connectionAttemptStartedAt_)
+                diagnostic(("connect-peer-connected-elapsed-ms-"+
+                            std::to_string(monotonicMs()-connectionAttemptStartedAt_)).c_str());
             deadline_ = 0;
             connectedSince_=monotonicMs();reconnectAt_=0;
             applyBitrateCap();
@@ -1272,15 +1762,18 @@ void Client::handle(const Event &event) {
                 keyframeCountAtRequest_ = media_->keyframeCount();
                 diagnostic("rtc-keyframe-initial");
             }
-            setState("connected", "");
+#ifdef UU_UDP_RX_TRACE
+            uu::startUdpPlayback(VideoSupplyTrace::nowUs());
+#endif
             {
                 std::lock_guard lock(inbox_->mutex);
                 openInputAdmission(inbox_->inputAdmission, generation_);
             }
+            setState("connected", "");
         } else if (s == int(rtc::PeerConnection::State::Failed) ||
                    s == int(rtc::PeerConnection::State::Disconnected) ||
                    s == int(rtc::PeerConnection::State::Closed)) {
-            if (snapshot().streaming)
+            if (isStreaming())
                 throw std::runtime_error("音视频连接已中断，请重新连接");
             if (iceState_ == rtc::PeerConnection::IceState::Connected ||
                 iceState_ == rtc::PeerConnection::IceState::Completed)
@@ -1346,6 +1839,7 @@ void Client::refresh() {
     {
         std::lock_guard lock(stateMutex_);
         state_.devices = std::move(devices);
+        ++state_.devicesRevision;
     }
     setState("idle", empty ? "暂无电脑，请在原版 UU 电脑端登录同一账号" : "");
 }
@@ -1369,10 +1863,21 @@ void Client::emit(const std::string &name, const Json &data, const std::string &
 void Client::packet(const WsMessage &message) {
     lastPacket_ = monotonicMs();
     if (message.opcode == 2) {
+        ++signalBinaryFrameCount_;
         if (remainingAttachments_ <= 0)
             throw std::runtime_error("Unexpected signaling attachment");
-        if (--remainingAttachments_ == 0)
-            dispatch(pending_);
+        if(message.data.size()>maxSignalingAttachmentBytes-pendingAttachmentBytes_)
+            throw std::runtime_error("Signaling attachment size limit");
+        pendingAttachmentBytes_+=message.data.size();
+        pendingAttachments_.push_back(message.data);
+        if (--remainingAttachments_ == 0) {
+            restoreSocketIoAttachments(pending_.data,pendingAttachments_);
+            diagnostic(("socket-binary-attachments-complete-count-"+
+                        std::to_string(pendingAttachments_.size())).c_str());
+            auto complete=std::move(pending_);
+            pending_={};pendingAttachments_.clear();pendingAttachmentBytes_=0;
+            dispatch(complete);
+        }
         return;
     }
     std::string text(message.data.begin(), message.data.end());
@@ -1395,9 +1900,19 @@ void Client::packet(const WsMessage &message) {
     if (remainingAttachments_)
         throw std::runtime_error("Interleaved signaling attachment");
     auto p = parseSocketIo(text);
+    ++signalPacketCount_;
+    if(p.type==2 || p.type==5) {
+        const bool event=p.data.is_array() && !p.data.empty() && p.data[0].is_string();
+        const auto name=event?p.data[0].get<std::string>():std::string{};
+        const char *kind=name=="soac"?"soac":name=="forward_setting"?"forward-setting":
+            name=="released" || name=="left"?"release":"other";
+        diagnostic((std::string("socket-event-packet-")+kind+"-type-"+std::to_string(p.type)+
+                    "-attachments-"+std::to_string(p.attachments)).c_str());
+    }
     if (p.attachments) {
-        pending_ = p;
-        remainingAttachments_ = p.attachments;
+        pending_ = std::move(p);
+        pendingAttachments_.clear();pendingAttachmentBytes_=0;
+        remainingAttachments_ = pending_.attachments;
     } else
         dispatch(p);
 }
@@ -1426,9 +1941,14 @@ void Client::dispatch(const SioPacket &p) {
             if ((!remote_.is_string() && !remote_.is_number()) || remote_ == "")
                 throw std::runtime_error("房间内没有在线电脑");
             control_ = uuid();
-            auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_,streamQuality_==6?maxBitrateMbps_:0,hevc_);
+            lastEncoderQuality_=streamQuality_;
+            lastEncoderCap_=effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_);
+            {std::lock_guard lock(stateMutex_);
+             state_.effectiveBitrateMbps=lastEncoderCap_;
+             state_.routeBitrateNotice="已请求最高 "+std::to_string(lastEncoderCap_)+" Mbps，等待主机确认";}
+            auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_,effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_),hevc_);
             diagnostic(("encoder-bitrate-request-connect-bps-"+
-                        std::to_string(streamQuality_==6?uint64_t(maxBitrateMbps_)*1000000u:0)+
+                        std::to_string(uint64_t(effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_))*1000000u)+
                         "-quality-"+std::to_string(streamQuality_)).c_str());
             options.insert(options.begin(), 4);
             diagnostic(("stream-options-" + std::to_string(streamWidth_) + "x" +
@@ -1441,13 +1961,11 @@ void Client::dispatch(const SioPacket &p) {
             setState("negotiating", "正在申请远控权限…");
             // Preserve room ICE configuration if control does not repeat it.
             ice_ = value.value("iceServers", Json::array());
-            emit("control",
-                 {{"app_data", {{"_placeholder", true}, {"num", 0}}},
-                  {"streamer_data", clientCapabilityJson(streamWidth_,streamHeight_,streamFps_,streamQuality_)},
-                  {"app_control_id", control_}},
-                 "control", options);
+            const auto request=controlRequest(control_,streamWidth_,streamHeight_,streamFps_,streamQuality_);
+            emit("control",request,"control",options);
+            diagnostic("control-request-schema-v2-compatible");
             diagnostic(("client-capability-json-bytes-"+
-                        std::to_string(clientCapabilityJson(streamWidth_,streamHeight_,streamFps_,streamQuality_).size())).c_str());
+                        std::to_string(request.at("streamer_data").get_ref<const std::string &>().size())).c_str());
         } else if (event == "control")
             beginPeer(value);
     } else if (p.type == 2 || p.type == 5) {
@@ -1497,10 +2015,40 @@ void Client::dispatch(const SioPacket &p) {
     }
 }
 void Client::beginPeer(const Json &result) {
+    if(!result.is_object())throw std::runtime_error("Control acknowledgement invalid object");
+    const auto ackControl=result.find("app_control_id");
+    if(ackControl!=result.end() && (!ackControl->is_string() || ackControl->get_ref<const std::string &>()!=control_))
+        throw std::runtime_error("Control acknowledgement belongs to another session");
+    const auto ackIce=result.find("ice_id");
+    if(ackIce==result.end() ||
+       (!ackIce->is_string() && !ackIce->is_number_integer()) ||
+       (ackIce->is_string() && ackIce->get_ref<const std::string &>().empty()))
+        throw std::runtime_error("Control acknowledgement missing ICE session");
+    const auto ackRoute=result.find("client_id");
+    if(ackRoute!=result.end() &&
+       ((!ackRoute->is_string() && !ackRoute->is_number_integer()) ||
+        (ackRoute->is_string() && ackRoute->get_ref<const std::string &>().empty())))
+        throw std::runtime_error("Control acknowledgement invalid peer route");
+    diagnostic("control-ack-route-validated-server-ice-id");
 #ifdef UU_TWCC_OBSERVE_CLIENT
     stopFeedbackObservation();
-    feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
 #endif
+    invalidateFeedbackCapabilities();
+    feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
+    reportedTurnBridgeFailures_.clear();
+    // A/B gate visibility: log once per session before the first RTP packet.
+    // OFF builds skip the experimental REMB submission without changing the
+    // local RTCP identity, RR+SDES reporting, field 8, or quality settings.
+    if(!rembExperimentLogged_) {
+        rembExperimentLogged_=true;
+#if UU_REMB_FEEDBACK
+        diagnostic("remb-experiment-enabled");
+#else
+        diagnostic("remb-experiment-disabled");
+#endif
+    }
+    firstVideoRtpLogged_=firstAudioRtpLogged_=false;
+    firstVideoAccessUnitLogged_=firstVideoFramePublishedLogged_=false;
     lastSelectedPath_.clear();
     remoteRelayEndpoints_.clear();
     recordSelectedPath("state=awaiting_selected_pair\n");
@@ -1600,9 +2148,19 @@ void Client::beginPeer(const Json &result) {
     auto gen = generation_;
     auto post = [weak, gen](std::string type, Json data) {
         if (auto box = weak.lock()) {
-            std::lock_guard lock(box->mutex);
-            if (box->events.size() < 2048)
-                box->events.push_back({std::move(type), std::move(data), gen});
+            bool rejected=false;
+            {
+                std::lock_guard lock(box->mutex);
+                if (box->events.size() < 2048)
+                    box->events.push_back({std::move(type), std::move(data), gen});
+                else {
+                    ++box->peerCallbackRejected;
+                    rejected=true;
+                }
+                box->peerCallbackHighWater=std::max(box->peerCallbackHighWater,box->events.size());
+            }
+            if(rejected)
+                diagnostic(("rtc-peer-event-rejected-"+type).c_str());
             box->cv.notify_one();
         }
     };
@@ -1627,15 +2185,54 @@ void Client::beginPeer(const Json &result) {
     if(hevc_) v.addH265Codec(96,"profile-id=1;tier-flag=0;level-id=123;tx-mode=SRST;sprop-max-don-diff=0");
     else v.addH264Codec(96, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
     diagnostic(hevc_?"video-codec-offered-hevc-main":"video-codec-offered-h264");
+#ifdef UU_TWCC_ADVERTISE
+    // Capability probe; only the separate CLIENT_SEND experiment may start
+    // feedback after final negotiation and actual authenticated arrival checks.
+    if (auto *map = v.rtpMap(96))
+        map->addFeedback("transport-cc");
+    const rtc::Description::Media::ExtMap twccV1(3,
+        "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01");
+    v.addExtMap(twccV1);
+    diagnostic("twcc-sdp-advertised-extmap-3");
+#ifdef UU_TWCC_ADVERTISE_V2
+    v.addExtMap(rtc::Description::Video::ExtMap(6,
+        "http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-02"));
+    diagnostic("twcc-sdp-advertised-v2-extmap-6");
+#endif
+#endif
     if (rtxEnabled_) {
         v.addRtxCodec(97, 96, 90000);
         diagnostic("rtc-video-rtx");
     }
+    // Stable local RTCP identity for compound REMB feedback. The sender SSRC is
+    // generated once per connection and paired with one non-secret CNAME; it is
+    // never derived from the remote video SSRC or from a session credential.
+    // Under BUNDLE the RTCP transport is shared, but this identity is used only
+    // by the video REMB path. The audio session keeps its own remote RR/PLI
+    // identity and never sends REMB; NACK/PLI/RTX handling is unchanged.
+    const auto localRtcpBytes=randomBytes(4);
+    localRtcpSsrc_=uint32_t(localRtcpBytes[0])<<24 | uint32_t(localRtcpBytes[1])<<16 |
+        uint32_t(localRtcpBytes[2])<<8 | uint32_t(localRtcpBytes[3]);
+    if(!localRtcpSsrc_) localRtcpSsrc_=1;
+    localRtcpCname_=uuid();
+    rembGate_.reset();
+    rembNotNegotiatedLogged_=false;rembFirstRtpWaitLogged_=false;
+    diagnostic(("remb-identity-local-ssrc-"+std::to_string(localRtcpSsrc_)+
+                "-cname-bytes-"+std::to_string(localRtcpCname_.size())).c_str());
     // Let the confirmed UU quality tier drive sender rate control. The former
     // fixed SDP 5000 kbps declaration limited every tier with the same hint.
     video_ = peer_->addTrack(v);
-    auto videoStats = std::make_shared<RtpTrackStats>(90000, "video", false);
-    auto videoSession = std::make_shared<PrimaryVideoRtcpSession>();
+    const auto supply=videoSupplyTrace_;
+    const auto repair=videoRepairTrace_;
+    const auto supplyGeneration=generation_;
+#ifdef UU_VIDEO_SUPPLY_TRACE
+    supply->begin(supplyGeneration,VideoSupplyTrace::nowUs());
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+    repair->begin(supplyGeneration,VideoSupplyTrace::nowUs());
+#endif
+    auto videoStats = std::make_shared<RtpTrackStats>(90000, "video", false,supply,supplyGeneration,repair);
+    auto videoSession = std::make_shared<PrimaryVideoRtcpSession>(localRtcpSsrc_,localRtcpCname_,video_);
     videoSession->addToChain(videoStats);
     videoStats_ = videoStats;
     std::weak_ptr<Media> media = media_;
@@ -1643,17 +2240,48 @@ void Client::beginPeer(const Json &result) {
     const bool hevc=hevc_;
     const bool strict = configValue("receiver") != "legacy";
     if (strict) {
+        // Repair pacing is a receiver policy, independent of the host quality
+        // enum. Preset buttons and manual bitrate entry must use the same
+        // bounded recovery path, including when loading an old native preset.
+        constexpr bool repairPaced = true;
         strictVideo_ = std::make_shared<StrictVideoReceiver>(rtxEnabled_,
             configInt("receiver_deadline_ms", 600, 100, 1200),
-            [media, mediaGeneration, hevc](const uint8_t *data, size_t size, uint32_t timestamp) {
-                if (auto m = media.lock()) m->video(data, size, mediaGeneration, timestamp, hevc);
-            }, hevc, streamQuality_==6,
-            [media, mediaGeneration, hevc](const uint8_t *data, size_t size, uint32_t timestamp, bool idr) {
-                if (auto m = media.lock()) m->video(data, size, mediaGeneration, timestamp, hevc, idr);
+            [media, mediaGeneration, hevc,supply,supplyGeneration,repair](const uint8_t *data, size_t size, uint32_t timestamp) {
+                if (auto m = media.lock()) {
+#ifdef UU_VIDEO_SUPPLY_TRACE
+                    const auto ready=VideoSupplyTrace::nowUs();
+#endif
+                    m->video(data, size, mediaGeneration, timestamp, hevc);
+#ifdef UU_VIDEO_SUPPLY_TRACE
+                    supply->accessUnit(supplyGeneration,timestamp,ready,VideoSupplyTrace::nowUs());
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+                    repair->accessUnit(supplyGeneration,timestamp,ready,false);
+#endif
+                }
+            }, hevc, repairPaced,
+            [media, mediaGeneration, hevc,supply,supplyGeneration,repair](std::vector<uint8_t> data, uint32_t timestamp, bool idr) {
+                if (auto m = media.lock()) {
+#ifdef UU_VIDEO_SUPPLY_TRACE
+                    const auto ready=VideoSupplyTrace::nowUs();
+#endif
+                    m->video(std::move(data), mediaGeneration, timestamp, hevc, idr);
+#ifdef UU_VIDEO_SUPPLY_TRACE
+                    supply->accessUnit(supplyGeneration,timestamp,ready,VideoSupplyTrace::nowUs());
+#endif
+#ifdef UU_VIDEO_REPAIR_TRACE
+                    repair->accessUnit(supplyGeneration,timestamp,ready,idr);
+#endif
+                }
             });
         strictVideo_->addToChain(videoSession);
+#ifdef UU_VIDEO_REPAIR_TRACE
+        video_->setMediaHandler(std::make_shared<VideoRepairObserver>(strictVideo_,repair,supplyGeneration));
+#else
         video_->setMediaHandler(strictVideo_);
+#endif
         diagnostic("video-receiver-strict-v2");
+        diagnostic("video-repair-policy-bounded-independent-quality");
     } else {
         const int jitterMs = configInt("jitter_ms", 120, 0, 400);
         auto assembler = std::make_shared<VideoAssembler>(rtxEnabled_, jitterMs);
@@ -1662,13 +2290,25 @@ void Client::beginPeer(const Json &result) {
         videoAssembler_ = assembler;
         diagnostic("video-receiver-legacy");
     }
-    video_->onFrame([media, mediaGeneration, hevc](rtc::binary data, rtc::FrameInfo info) {
-        if (auto m = media.lock())
+    video_->onFrame([media, mediaGeneration, hevc,supply,supplyGeneration](rtc::binary data, rtc::FrameInfo info) {
+        if (auto m = media.lock()) {
+#ifdef UU_VIDEO_SUPPLY_TRACE
+            const auto ready=VideoSupplyTrace::nowUs();
+#endif
             m->video(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration, info.timestamp, hevc);
+#ifdef UU_VIDEO_SUPPLY_TRACE
+            supply->accessUnit(supplyGeneration,info.timestamp,ready,VideoSupplyTrace::nowUs());
+#endif
+        }
     });
     rtc::Description::Audio a("1", rtc::Description::Direction::RecvOnly);
     diagnostic("rtc-audio");
     a.addOpusCodec(111);
+#if defined(UU_TWCC_ADVERTISE) && !defined(UU_TWCC_ADVERTISE_V2)
+    // Bundled media must agree on the negotiated TWCC version and extension ID.
+    a.rtpMap(111)->addFeedback("transport-cc");
+    a.addExtMap(twccV1);
+#endif
     audio_ = peer_->addTrack(a);
     auto opus = std::make_shared<rtc::OpusRtpDepacketizer>();
     auto audioStats = std::make_shared<RtpTrackStats>(48000, "audio", false);
@@ -1691,7 +2331,9 @@ void Client::beginPeer(const Json &result) {
             auto stateChanged=[inbox,generation,eventName](bool ready){
                 if(auto queue=inbox.lock()){
                     std::lock_guard lock(queue->mutex);
-                    queue->events.push_back({eventName,ready,generation});queue->cv.notify_one();
+                    queue->events.push_back({eventName,ready,generation});
+                    queue->dataChannelHighWater=std::max(queue->dataChannelHighWater,queue->events.size());
+                    queue->cv.notify_one();
                 }
             };
             channel->onOpen([stateChanged]{stateChanged(true);});
@@ -1702,16 +2344,21 @@ void Client::beginPeer(const Json &result) {
             const bool streamerData=std::string(label)=="STREAMER_DATA_CHANNEL";
             const std::string labelText=label;
             const bool traceChannel=labelText!="TEXT_DATA_CHANNEL" && labelText!="FILE_DATA_CHANNEL";
+            const bool controlData=labelText=="CONTROL_DATA_CHANNEL";
             std::weak_ptr<Inbox> inbox=inbox_;const auto generation=generation_;
-            channel->onMessage([inbox,generation,acceptRpc,streamerData,labelText,traceChannel](rtc::message_variant message) {
+            channel->onMessage([inbox,generation,acceptRpc,streamerData,labelText,traceChannel,controlData](rtc::message_variant message) {
                 const uint8_t *bytes=nullptr;size_t size=0;
                 if(auto *binary=std::get_if<rtc::binary>(&message)){bytes=reinterpret_cast<const uint8_t *>(binary->data());size=binary->size();}
                 else if(auto *text=std::get_if<std::string>(&message)){bytes=reinterpret_cast<const uint8_t *>(text->data());size=text->size();}
+                // Rumble is latest-value state; it bypasses the bounded event queue.
+                if(controlData)
+                    if(const auto rumble=uu::vibration::parse(bytes,size)){uu::vibration::submit(*rumble);return;}
                 const auto screens=parseScreenSources(bytes,size);
                 const auto settingSync=parseCaptureSettingSync(bytes,size);
                 const auto ack=acceptRpc?parseCaptureRpcAck(bytes,size):std::optional<CaptureRpcAck>{};
                 const auto textAck=acceptRpc?parseTextRpcAck(bytes,size):std::optional<TextRpcAck>{};
                 const auto privacyAck=acceptRpc?parsePrivacyRpcAck(bytes,size):std::optional<PrivacyRpcAck>{};
+                const auto privacyState=parsePrivacyStateNotify(bytes,size);
                 std::string streamerShape,channelShape;
                 if(verboseDiagnostics() && streamerData)
                     streamerShape=streamerDataShape(bytes,size);
@@ -1721,30 +2368,43 @@ void Client::beginPeer(const Json &result) {
                     diagnostic(("streamer-data-"+streamerShape).c_str());
                 if(!channelShape.empty())
                     diagnostic(("channel-data-"+labelText+"-"+channelShape).c_str());
-                if(!screens && !ack && !textAck && !privacyAck && !settingSync)return;
+                if(!screens && !ack && !textAck && !privacyAck && !settingSync && !privacyState)return;
+                bool rejected=false;
+                const char *rejectedKind=screens?"screens":settingSync?"capture-sync":ack?"quality-ack":
+                    textAck?"text-ack":privacyState?"privacy-state":"privacy-ack";
                 if(auto queue=inbox.lock()){
-                    std::lock_guard lock(queue->mutex);
-                    if(queue->events.size()>124)return;
-                    if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
-                    if(settingSync)queue->events.push_back({"capture-setting-sync",
-                        {{"fields",settingSync->fields},
-                         {"fps",settingSync->fps},{"quality",settingSync->quality},
-                         {"chroma",settingSync->chroma},{"bitrate",settingSync->maxCustomBitrate},
-                         {"width",settingSync->width},{"height",settingSync->height},
-                         {"resolution_type",settingSync->resolutionType},
-                         {"dpi_scale",settingSync->dpiScale},
-                         {"pixel_width",settingSync->pixelWidth},
-                         {"pixel_height",settingSync->pixelHeight},
-                         {"orientation",settingSync->orientation}},generation});
-                    if(screens && verboseDiagnostics()){
-                        const auto summary=screenSourceWireSummary(bytes,size);
-                        if(!summary.empty())queue->events.push_back({"screen-wire",summary,generation});
+                    {
+                        std::lock_guard lock(queue->mutex);
+                        if(queue->events.size()>124) {
+                            ++queue->dataChannelRejected;
+                            rejected=true;
+                        } else {
+                            if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
+                            if(settingSync)queue->events.push_back({"capture-setting-sync",
+                                {{"fields",settingSync->fields},
+                                 {"fps",settingSync->fps},{"quality",settingSync->quality},
+                                 {"chroma",settingSync->chroma},{"bitrate",settingSync->maxCustomBitrate},
+                                 {"width",settingSync->width},{"height",settingSync->height},
+                                 {"resolution_type",settingSync->resolutionType},
+                                 {"dpi_scale",settingSync->dpiScale},
+                                 {"pixel_width",settingSync->pixelWidth},
+                                 {"pixel_height",settingSync->pixelHeight},
+                                 {"orientation",settingSync->orientation}},generation});
+                            if(screens && verboseDiagnostics()){
+                                const auto summary=screenSourceWireSummary(bytes,size);
+                                if(!summary.empty())queue->events.push_back({"screen-wire",summary,generation});
+                            }
+                            if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
+                            if(textAck)queue->events.push_back({"text-input-ack",{{"id",textAck->requestId},{"status",textAck->status}},generation});
+                            if(privacyAck)queue->events.push_back({"privacy-screen-ack",{{"id",privacyAck->requestId},{"code",privacyAck->errorCode},{"requested_mode",unsigned(privacyAck->requestedMode)},{"current_mode",unsigned(privacyAck->currentMode)}},generation});
+                            if(privacyState)queue->events.push_back({"privacy-screen-state",{{"code",privacyState->errorCode},{"requested_mode",unsigned(privacyState->requestedMode)},{"current_mode",unsigned(privacyState->currentMode)}},generation});
+                        }
+                        queue->dataChannelHighWater=std::max(queue->dataChannelHighWater,queue->events.size());
                     }
-                    if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
-                    if(textAck)queue->events.push_back({"text-input-ack",{{"id",textAck->requestId},{"status",textAck->status}},generation});
-                    if(privacyAck)queue->events.push_back({"privacy-screen-ack",{{"id",privacyAck->requestId},{"code",privacyAck->errorCode},{"requested_mode",unsigned(privacyAck->requestedMode)},{"current_mode",unsigned(privacyAck->currentMode)}},generation});
                     queue->cv.notify_one();
                 }
+                if(rejected)
+                    diagnostic(("rtc-data-channel-event-rejected-"+labelText+"-kind-"+rejectedKind).c_str());
             });
         }
     }
@@ -1756,7 +2416,8 @@ void Client::beginPeer(const Json &result) {
     earlySoac_.clear();
 }
 void Client::handleSoac(const Json &packet) {
-    const auto status = inspectSoac(packet, ice_);
+    SdpEncoding encoding=SdpEncoding::None;
+    const auto status = inspectSoac(packet, ice_,&encoding);
     if (status != SoacStatus::Accepted) {
         ++soacRejected_;
         if (status == SoacStatus::SessionMismatch || status == SoacStatus::UnknownType) {
@@ -1769,18 +2430,25 @@ void Client::handleSoac(const Json &packet) {
                                                          : "soac-rejected-invalid-payload");
         throw std::runtime_error("电脑协商消息格式不兼容，无法建立连接");
     }
-    const auto &d = packet.at("data");
+    auto d = packet.at("data");
+    if(encoding!=SdpEncoding::None) {
+        diagnostic(encoding==SdpEncoding::Plain?"soac-description-format-plain":
+            encoding==SdpEncoding::GzipBase64?"soac-description-format-gzip-base64":"soac-description-format-gzip-binary");
+        d["sdp"]=decodeSoacSdp(d.at(encoding==SdpEncoding::Plain?"sdp":"gzip_sdp"),encoding);
+        d.erase("gzip_sdp");
+    }
     const auto &type = d.at("type").get_ref<const std::string &>();
     // Record receipt before codec validation, without SDP or session identifiers.
     if (type == "answer") diagnostic("soac-answer-received");
     else if (type == "offer" || type == "restart_ice") diagnostic("soac-offer-received");
-#ifdef UU_TWCC_OBSERVE_CLIENT
     if (type == "offer" || type == "answer" || type == "restart_ice") {
+#ifdef UU_TWCC_OBSERVE_CLIENT
         stopFeedbackObservation();
+#endif
+        invalidateFeedbackCapabilities();
         feedbackRemoteCaps_.reset();
         if (type != "answer") feedbackLocalCaps_.reset();
     }
-#endif
     if(d.contains("sdp") && d["sdp"].is_string()) {
         // Reject incompatible HEVC parameters before transport can deliver RTP.
         // Only single-layer Main, SRST, no DONL is implemented in this version.
@@ -1812,14 +2480,6 @@ void Client::handleSoac(const Json &packet) {
             if(!matched) throw std::runtime_error("电脑未协商 H.265，请在 L3 改回 H.264");
             diagnostic("video-codec-negotiated-hevc-main");
         }
-        rembAvailable_=false;
-        std::istringstream feedbackLines(d["sdp"].get<std::string>());
-        std::string line;bool video=false;
-        while(std::getline(feedbackLines,line)) {
-            if(!line.empty() && line.back()=='\r') line.pop_back();
-            if(line.rfind("m=",0)==0) video=line.rfind("m=video ",0)==0;
-            if(video && (line=="a=rtcp-fb:96 goog-remb" || line=="a=rtcp-fb:* goog-remb")) rembAvailable_=true;
-        }
     }
     if (strictVideo_ && d.contains("sdp") && d["sdp"].is_string()) {
         // Bind RTX to the negotiated FID pair when the sender supplies it.
@@ -1846,20 +2506,20 @@ void Client::handleSoac(const Json &packet) {
     }
     if(result==RemoteSignal::Description) {
         remoteDescriptionApplied_ = true;
-        if (!snapshot().streaming && iceState_ != rtc::PeerConnection::IceState::Connected &&
+        if (!isStreaming() && iceState_ != rtc::PeerConnection::IceState::Connected &&
             iceState_ != rtc::PeerConnection::IceState::Completed)
             setState("connecting", "电脑已应答，正在检测可用网络路径…");
-#ifdef UU_TWCC_OBSERVE_CLIENT
         try {
             feedbackRemoteCaps_ = twcc::NegotiationCapabilities::fromSdp(
                 d.at("sdp").get_ref<const std::string &>(),
                 type == "answer" ? rtc::Description::Type::Answer : rtc::Description::Type::Offer);
-            refreshFeedbackObservation();
+            if (!feedbackRemoteCaps_) diagnostic("feedback-capabilities-remote-invalid");
+            refreshFeedbackCapabilities();
         } catch (...) {
             feedbackRemoteCaps_.reset();
-            diagnostic("twcc-observation-remote-unavailable");
+            invalidateFeedbackCapabilities();
+            diagnostic("feedback-capabilities-remote-unavailable");
         }
-#endif
         if(auto description=peer_->remoteDescription())
             for(const auto &candidate:description->candidates()) recordIceCandidate("remote","description",candidate);
     }
@@ -1898,37 +2558,142 @@ void Client::handleSoac(const Json &packet) {
         }
     }
 }
-void Client::input(const Json &data) {
+void Client::tickSafetyActions() {
+    if(std::none_of(safetyActions_.begin(),safetyActions_.end(),[](const auto &action){return action.has_value();}))
+        return;
+    const auto now=monotonicMs();
+    if(now<nextSafetyAttempt_)return;
+    nextSafetyAttempt_=now+250;
+    const auto channel=channels_.find(systemActionChannel);
+    bool expired=false,submitted=false;
+    for(size_t slot=0;slot<safetyActions_.size();++slot){
+        auto &pending=safetyActions_[slot];
+        if(!pending)continue;
+        if(now>=pending->deadline){
+            diagnostic(("safety-action-timeout-"+std::to_string(pending->action)).c_str());
+            pending.reset();
+            if(slot==1)safetyActions_[2].reset(); // No restore policy without its mute request.
+            expired=true;
+            continue;
+        }
+        if((slot==2 && safetyActions_[1]) || channel==channels_.end() ||
+           !channel->second->isOpen() || channel->second->bufferedAmount()>65536)continue;
+        const auto bytes=simpleActionMessage(nextQualityRpc_++,pending->action,pending->enabled);
+        try {
+            const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+            // An open channel can accept the packet into its own queue.
+            if(!sent && !channel->second->isOpen())continue;
+            diagnostic(("system-action-control-"+std::to_string(pending->action)+(sent?"-sent":"-queued")).c_str());
+            submitted|=!pending->quiet;
+            pending.reset();
+        }catch(const std::exception &){
+            diagnostic("safety-action-send-retry");
+        }
+    }
+    if(expired || submitted){
+        std::lock_guard lock(stateMutex_);
+        if(expired)state_.safetyNotice="部分安全设置未发送，请检查控制通道后重试";
+        else if(state_.safetyNotice=="正在提交安全设置" &&
+                std::none_of(safetyActions_.begin(),safetyActions_.end(),[](const auto &action){return action && !action->quiet;}))
+            state_.safetyNotice="安全设置已提交至控制通道，请以电脑端为准";
+    }
+}
+bool Client::sendControlInput(rtc::DataChannel &channel, const std::byte *data, size_t size,
+                              const std::string &action, uint64_t sequence, size_t buffered) {
+#ifdef UU_CONTROL_STAGE_TIMING
+    if (sequence) {
+#if defined(__SWITCH__) && defined(UU_UDP_RX_TRACE) && defined(UU_UDP_SEND_TIMING)
+        constexpr auto nowUs = uu_udp_now_us;
+#else
+        constexpr auto nowUs = ControlStageTiming::nowUs;
+#endif
+        const auto start = nowUs();
+        const bool immediate = channel.send(data, size);
+        const auto end = nowUs();
+        if (end - start >= 16000) {
+            Json timing{{"generation",generation_},{"event_seq",sequence},
+                {"action",action},{"start_us",start},{"end_us",end},{"immediate",immediate},
+                {"buffered_before",buffered}};
+#if defined(__SWITCH__) && defined(UU_UDP_RX_TRACE) && defined(UU_UDP_SEND_TIMING)
+            timing["thread_id"] = uu_udp_trace_thread_id();
+#endif
+            diagnostic(("input-send-slow " + timing.dump()).c_str());
+        }
+        return immediate;
+    }
+#else
+    (void)action;
+    (void)sequence;
+    (void)buffered;
+#endif
+    return channel.send(data, size);
+}
+
+void Client::input(const Json &data, InputMotionKey motion, uint64_t sequence) {
     auto it = channels_.find("CONTROL_DATA_CHANNEL");
     const auto action = data.value("action", std::string{});
     if (it == channels_.end() || !it->second->isOpen()){
         if(action=="touch_native")++touchFailures_;
-        gamepadConnected_=false;
+        gamepadConnected_.fill(false);
+        pendingPadMotion_ = {};
+        submittedPadMotion_ = {};
+        return;
+    }
+    if(action=="kbd_chord"){
+        std::vector<int> pressed;
+        for(const auto &value:data.at("keys")){
+            const int key=value.get<int>();
+            if(heldKeys_.count(key))continue;
+            input({{"action","kbd_press"},{"key",key}});
+            if(!heldKeys_.count(key))break;
+            pressed.push_back(key);
+        }
+        for(auto key=pressed.rbegin();key!=pressed.rend();++key)
+            input({{"action","kbd_release"},{"key",*key}});
         return;
     }
     if(action=="touch_native"){
         int type=data.at("type").get<int>();const auto &points=data.at("points");
         if((type==3 || type==4) && !nativeTouchActive_)return;
         if(type==2 && !nativeTouchActive_)type=1;
-        if(type==2 && it->second->bufferedAmount()>65536){++touchFailures_;return;}
+        const auto buffered=it->second->bufferedAmount();
+        if(type==2 && buffered>65536){++touchFailures_;return;}
         const auto bytes=nativeTouchMessage(nextQualityRpc_++,type,points);
         try{
             // libdatachannel false may mean queued, not rejected. Preserve lifecycle.
-            const bool immediate=it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+            const bool immediate=sendControlInput(*it->second,reinterpret_cast<const std::byte *>(bytes.data()),bytes.size(),action,sequence,buffered);
             if(!immediate && type!=2)diagnostic("native-touch-queued");
         }catch(...){++touchFailures_;return;}
         nativeTouchActive_=type<=2;touchPoints_=points.size();++touchPackets_;
         if(type!=2)diagnostic(type==1?"native-touch-start":type==3?"native-touch-end":"native-touch-cancel");
         return;
     }
-    if (it->second->bufferedAmount() > 64 * 1024 &&
+    const auto controlBuffered=it->second->bufferedAmount();
+#ifdef UU_CONTROL_STAGE_TIMING
+    inputTiming_.controlBufferedMax=std::max(inputTiming_.controlBufferedMax,uint64_t(controlBuffered));
+#endif
+    if (controlBuffered > 64 * 1024 &&
         (action == "mouse_move_absolute" || action == "mouse_scroll"))
         return;
     // The UI may request a pad before SCTP opens. Retry on the worker when
     // an actual update can be submitted; never send updates before setup.
-    if(action=="gpd_update" && !gamepadConnected_){
-        input({{"action","gpd_connect"},{"index",data.value("index",0)}});
-        if(!gamepadConnected_)return;
+    const bool padAction=action=="gpd_update" || action=="gpd_connect" || action=="gpd_disconnect";
+    const int padIndex=padAction?data.at("index").get<int>():0;
+    if(padAction && (padIndex<0 || padIndex>=int(gamepadConnected_.size())))return;
+    if (padAction) {
+        auto &pending = pendingPadMotion_[padIndex];
+        if (motion.player >= 0 && controlBuffered > 64 * 1024 && motion == submittedPadMotion_[padIndex]) {
+            ++padMotionDeferred_;
+            if (pending) ++padMotionReplaced_;
+            pending = PendingPadMotion{data, motion, sequence};
+            return;
+        }
+        // A transition or newer directly submitted update supersedes old stick motion.
+        pending.reset();
+    }
+    if(action=="gpd_update" && !gamepadConnected_[padIndex]){
+        input({{"action","gpd_connect"},{"index",padIndex}}, {}, sequence);
+        if(!gamepadConnected_[padIndex])return;
     }
     const bool mouseButton=action=="mouse_press" || action=="mouse_release";
     const std::string owner=data.value("source",std::string("controls"));
@@ -1950,12 +2715,13 @@ void Client::input(const Json &data) {
     auto wire=data;wire.erase("source"); // Input ownership is local, not part of the remote protocol.
     auto s = wire.dump();
     try {
-        it->second->send(reinterpret_cast<const std::byte *>(s.data()), s.size());
+        sendControlInput(*it->second,reinterpret_cast<const std::byte *>(s.data()),s.size(),action,sequence,controlBuffered);
     } catch (...) {
         return;
     }
-    if(action=="gpd_connect")gamepadConnected_=true;
-    else if(action=="gpd_disconnect")gamepadConnected_=false;
+    if (padAction) submittedPadMotion_[padIndex] = motion;
+    if(action=="gpd_connect")gamepadConnected_[padIndex]=true;
+    else if(action=="gpd_disconnect")gamepadConnected_[padIndex]=false;
     if (action == "kbd_press")
         heldKeys_.insert(data.at("key").get<int>());
     else if (action == "kbd_release")
@@ -1966,9 +2732,27 @@ void Client::input(const Json &data) {
         heldButtons_.erase(button);mouseOwners_.erase(button);
     }
 }
+void Client::flushPadMotion() {
+    for (auto &pending : pendingPadMotion_) {
+        if (!pending) continue;
+        const auto channel = channels_.find("CONTROL_DATA_CHANNEL");
+        if (channel == channels_.end() || !channel->second->isOpen()) {
+            pendingPadMotion_ = {};
+            submittedPadMotion_ = {};
+            return;
+        }
+        if (channel->second->bufferedAmount() > 64 * 1024) return;
+        auto latest = std::move(*pending);
+        pending.reset();
+        input(latest.data, latest.key, latest.sequence);
+    }
+}
+
 void Client::release() {
+    pendingPadMotion_ = {};
+    submittedPadMotion_ = {};
     if(nativeTouchActive_)input({{"action","touch_native"},{"type",4},{"points",Json::array()}});
-    if(gamepadConnected_)input({{"action","gpd_update"},{"index",0},{"buttons",0},{"left_trigger",0},{"right_trigger",0},{"left_thumb_x",0},{"left_thumb_y",0},{"right_thumb_x",0},{"right_thumb_y",0}});
+    for(int index=0;index<int(gamepadConnected_.size());++index)if(gamepadConnected_[index])input({{"action","gpd_update"},{"index",index},{"buttons",0},{"left_trigger",0},{"right_trigger",0},{"left_thumb_x",0},{"left_thumb_y",0},{"right_thumb_x",0},{"right_thumb_y",0}});
     auto keys = heldKeys_;
     const auto owners=mouseOwners_;
     for (int k : keys)
@@ -1979,14 +2763,165 @@ void Client::release() {
     heldButtons_.clear();
     mouseOwners_.clear();
 }
+void Client::invalidateFeedbackCapabilities() {
+#ifdef UU_RBE_OBSERVE_CLIENT
+    stopReceiveBandwidthObservation();
+#endif
+    feedbackCapabilities_.reset();
+    rembAvailable_ = false;
+    rembGate_.invalidate();
+    rembNotNegotiatedLogged_ = rembFirstRtpWaitLogged_ = false;
+    // A boolean alone does not revoke the target repeated on later SRs.
+    // Zero clears that local state without sending a zero-bandwidth REMB.
+    if (video_) video_->requestBitrate(0);
+}
+void Client::refreshFeedbackCapabilities() {
+    if (!peer_ || !feedbackLocalCaps_ || !feedbackRemoteCaps_ ||
+        peer_->signalingState() != rtc::PeerConnection::SignalingState::Stable) {
+        if (rembAvailable_ || feedbackCapabilities_) invalidateFeedbackCapabilities();
+        return;
+    }
+    const auto local = peer_->localDescription(), remote = peer_->remoteDescription();
+    if (!local || !remote || !feedbackLocalCaps_->matchesInstalledDescription(*local) ||
+        !feedbackRemoteCaps_->matchesInstalledDescription(*remote)) {
+        invalidateFeedbackCapabilities();
+        diagnostic("feedback-capabilities-installed-mismatch");
+        return;
+    }
+    if (!feedbackCapabilities_) {
+        feedbackCapabilities_ = twcc::inspectMediaFeedbackCapabilities(*feedbackLocalCaps_, *feedbackRemoteCaps_);
+        rembAvailable_ = video_ && feedbackCapabilities_->allowsRemb(video_->mid(), 96);
+        diagnostic(rembAvailable_ ? "remb-admission-common-video-feedback" : "remb-admission-not-negotiated");
+        diagnostic(("feedback-capabilities-status-" + std::to_string(int(feedbackCapabilities_->status)) +
+                    "-offerer-" + std::to_string(feedbackCapabilities_->localIsOfferer) +
+                    "-media-" + std::to_string(feedbackCapabilities_->media.size())).c_str());
+        for (const auto &media : feedbackCapabilities_->media) {
+            const auto contains = [&media](const char *name) {
+                return std::find(media.feedback.begin(), media.feedback.end(), name) != media.feedback.end();
+            };
+            diagnostic(("feedback-capabilities-pt-" + std::to_string(media.payloadType) +
+                "-remb-" + std::to_string(contains("goog-remb")) +
+                "-transport-cc-" + std::to_string(contains("transport-cc")) +
+                "-rtx-" + std::to_string(media.rtxPayloadTypes.size()) +
+                "-extensions-" + std::to_string(media.transportExtensions.size())).c_str());
+            for (const auto &extension : media.transportExtensions)
+                diagnostic(("feedback-extension-version-" + std::to_string(int(extension.version) + 1) +
+                    "-local-id-" + std::to_string(extension.localId) +
+                    "-remote-id-" + std::to_string(extension.remoteId) +
+                    "-attributes-supported-" + std::to_string(extension.attributesSupported)).c_str());
+        }
+    }
+#ifdef UU_TWCC_OBSERVE_CLIENT
+    refreshFeedbackObservation();
+#endif
+#ifdef UU_RBE_OBSERVE_CLIENT
+    refreshReceiveBandwidthObservation();
+#endif
+}
+#ifdef UU_RBE_OBSERVE_CLIENT
+void Client::stopReceiveBandwidthObservation() {
+#ifdef UU_RBE_CLIENT_SEND
+    receiveBandwidthSendAttempted_ = false;
+    receiveBandwidthSuppressLegacy_ = false;
+#endif
+    auto observation = std::move(receiveBandwidthObservation_);
+    if (!observation) return;
+    observation->close();
+#ifdef UU_RBE_CLIENT_SEND
+    const auto sent = observation->feedbackCounters();
+    diagnostic(("rbe-send-final-submitted-" + std::to_string(sent.transport.submitted) +
+        "-rtcp-bytes-" + std::to_string(sent.transport.submittedBytes) +
+        "-failures-" + std::to_string(sent.transport.sendFailures) +
+        "-stop-" + std::to_string(int(sent.transport.stopped))).c_str());
+#endif
+    if (peer_ && peer_->getMediaHandler() == observation) peer_->setMediaHandler(nullptr);
+    receiveBandwidthLogAt_ = 0;
+    diagnostic("rbe-observation-closed");
+}
+void Client::refreshReceiveBandwidthObservation() {
+    if (receiveBandwidthObservation_ || !peer_ || !video_ || !feedbackCapabilities_ || !rembAvailable_) return;
+    // TWCC's existing attachment has precedence. Do not mutate a live handler
+    // chain, replace another observer, or feed the same transport twice.
+    if (peer_->getMediaHandler()) {
+        diagnostic("rbe-observation-global-handler-occupied");
+        return;
+    }
+    const auto config = rbe::inputConfig(*feedbackCapabilities_, video_->mid(), 96);
+    if (!config) {
+        diagnostic("rbe-observation-input-unavailable");
+        return;
+    }
+    auto observation = std::make_shared<rbe::ReceiveBandwidthObserver>(*config);
+    peer_->setMediaHandler(observation);
+    receiveBandwidthObservation_ = std::move(observation);
+    receiveBandwidthLogAt_ = 0;
+    diagnostic("rbe-observation-attached-send-disabled");
+}
+#ifdef UU_RBE_CLIENT_SEND
+void Client::pollReceiveBandwidthFeedback(int64_t now) {
+    if (!receiveBandwidthObservation_ || !peer_ || !video_ || !videoStats_ || !video_->isOpen() ||
+        !rembAvailable_ || peer_->state() != rtc::PeerConnection::State::Connected ||
+        peer_->signalingState() != rtc::PeerConnection::SignalingState::Stable) return;
+#ifdef UU_TWCC_CLIENT_SEND
+    if (feedbackSuppressRemb_) return;
+#endif
+    if (receiveBandwidthSendAttempted_ && !receiveBandwidthSuppressLegacy_) return;
+    if (!receiveBandwidthSendAttempted_) {
+        const auto observed = receiveBandwidthObservation_->snapshot();
+        const auto media = videoStats_->snapshot();
+        // TWCC-eligible packets alone cannot establish a classic estimate.
+        // Keep the compatibility path until an actual estimate exists.
+        if (!observed.input.packets || !observed.estimates || !observed.estimateBps || !media.packets || !media.ssrc) return;
+        receiveBandwidthSendAttempted_ = true;
+        const auto nowUs = now * 1000;
+        auto budget = std::make_shared<twcc::SharedRtcpBudget>(16000, 4800, 4800, 1200, nowUs);
+        const twcc::FeedbackSendPolicy policy{20000, 200000, 1000000, 3, 256, localRtcpCname_};
+        const bool cleared = video_->requestBitrate(0);
+        if (cleared) rembGate_.invalidate(); // The old accepted target is no longer stored.
+        if (!cleared || !receiveBandwidthObservation_->startFeedback(std::move(budget), policy, localRtcpSsrc_)) {
+            diagnostic("rbe-send-start-rejected-fallback-compatibility");
+            applyBitrateCap();
+            return;
+        }
+        receiveBandwidthSuppressLegacy_ = true;
+        rembGate_.invalidate();
+        diagnostic("rbe-send-started-compatibility-target-cleared");
+        diagnostic("rbe-reference-default-cap-unlimited-media-rtt-unavailable");
+    }
+    const auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (receiveBandwidthObservation_->pollFeedback(nowUs, uint32_t(effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_))*1000000u) == twcc::FeedbackPollResult::Stopped) {
+        receiveBandwidthSuppressLegacy_ = false;
+        rembGate_.invalidate();
+        diagnostic("rbe-send-stopped-fallback-compatibility");
+        applyBitrateCap();
+    }
+}
+#endif
+#endif
 #ifdef UU_TWCC_OBSERVE_CLIENT
 void Client::stopFeedbackObservation() {
+#ifdef UU_TWCC_CLIENT_SEND
+    feedbackSendAttempted_ = false;
+    feedbackSuppressRemb_ = false;
+    feedbackSendLogAt_ = 0;
+    rembGate_.invalidate();
+#endif
     auto observation = std::move(feedbackObservation_);
     if (!observation) return;
     try {
         observation->stop();
         if (peer_ && peer_->getMediaHandler() == observation) peer_->setMediaHandler(nullptr);
         const auto counts = observation->observationCounters();
+#ifdef UU_TWCC_CLIENT_SEND
+        const auto sent = observation->sendCounters();
+        diagnostic(("twcc-send-final-submitted-" + std::to_string(sent.submitted) +
+            "-rtcp-bytes-" + std::to_string(sent.submittedBytes) +
+            "-attempted-rtcp-bytes-" + std::to_string(sent.attemptedBytes) +
+            "-failures-" + std::to_string(sent.sendFailures) +
+            "-budget-deferred-" + std::to_string(sent.budgetDeferred) +
+            "-stop-reason-" + std::to_string(int(sent.stopped))).c_str());
+#endif
         diagnostic(("twcc-observation-accepted-" + std::to_string(counts.accepted) +
             "-missing-extension-" + std::to_string(counts.missingExtension) +
             "-malformed-" + std::to_string(counts.malformed) +
@@ -2000,39 +2935,134 @@ void Client::refreshFeedbackObservation() {
     if (feedbackObservation_ || !peer_ || !feedbackLocalCaps_ || !feedbackRemoteCaps_ ||
         peer_->signalingState() != rtc::PeerConnection::SignalingState::Stable) return;
     try {
-        // Reject stale queued signaling events. Compare only canonical allowed
-        // capabilities against the CURRENT peer, never log/store its raw SDP.
-        const auto local = peer_->localDescription(), remote = peer_->remoteDescription();
-        if (!local || !remote) return;
-        const auto currentLocal = twcc::NegotiationCapabilities::fromSdp(std::string(*local), local->type());
-        const auto currentRemote = twcc::NegotiationCapabilities::fromSdp(std::string(*remote), remote->type());
-        if (!currentLocal || !currentRemote || !(*currentLocal == *feedbackLocalCaps_) ||
-            !(*currentRemote == *feedbackRemoteCaps_)) {
-            diagnostic("twcc-observation-stale-capabilities"); return;
-        }
+        // Admission is based on the ORIGINAL wire descriptions. The SDK adds
+        // BUNDLE/rtcp-mux during serialization; that is not peer consent and
+        // must be classified as unsupported, not a stale-snapshot failure.
         const auto result = twcc::inspectNegotiationCapabilities(*feedbackLocalCaps_, *feedbackRemoteCaps_);
         if (result.status != twcc::NegotiationStatus::Ready) {
             diagnostic(("twcc-observation-negotiation-status-" + std::to_string(int(result.status))).c_str());
             return;
         }
+        // Reject stale queued signaling events. Compare only canonical allowed
+        // capabilities against the CURRENT peer, never log/store its raw SDP.
+        const auto local = peer_->localDescription(), remote = peer_->remoteDescription();
+        if (!local || !remote) return;
+        const bool localMatches = feedbackLocalCaps_->matchesInstalledDescription(*local);
+        const bool remoteMatches = feedbackRemoteCaps_->matchesInstalledDescription(*remote);
+        if (!localMatches || !remoteMatches) {
+            diagnostic(!localMatches
+                ? "twcc-observation-local-capabilities-changed"
+                : "twcc-observation-remote-capabilities-changed");
+            diagnostic("twcc-observation-stale-capabilities"); return;
+        }
         if (peer_->getMediaHandler()) {
             diagnostic("twcc-observation-global-handler-occupied"); return;
         }
-        // This mode does not advertise any capability, call startSending or
-        // poll/commit reports. Timing fields are inert observer prerequisites.
+        // Attachment starts read-only. The separate CLIENT_SEND gate may
+        // activate it later, after the first authenticated arrival is observed.
         auto observation = std::make_shared<twcc::FeedbackAttachment>(result,
-            twcc::FeedbackTiming{100000, 0, 2048});
+            twcc::FeedbackTiming{50000, 0, 2048});
         peer_->setMediaHandler(observation);
         feedbackObservation_ = std::move(observation);
+        diagnostic(("twcc-observation-version-" +
+            std::to_string(result.version == twcc::TransportSequenceVersion::V2 ? 2 : 1) +
+            "-extension-id-" + std::to_string(result.extensionId)).c_str());
+        diagnostic(("twcc-observation-legacy-extension-id-" + std::to_string(result.legacyExtensionId)).c_str());
         diagnostic("twcc-observation-attached-send-disabled");
     } catch (...) {
         stopFeedbackObservation();
         diagnostic("twcc-observation-unavailable");
     }
 }
+#ifdef UU_TWCC_CLIENT_SEND
+void Client::pollFeedbackSending(int64_t now) {
+    if (!feedbackObservation_ || !peer_ || !video_ || !videoStats_ || !video_->isOpen() ||
+        peer_->state() != rtc::PeerConnection::State::Connected ||
+        peer_->signalingState() != rtc::PeerConnection::SignalingState::Stable) return;
+    if (feedbackSendAttempted_ && !feedbackSuppressRemb_) return; // One attempt per attachment.
+    bool failed = false;
+    if (!feedbackSendAttempted_) {
+        if (!feedbackObservation_->observationCounters().accepted) {
+            // Poll before sender creation as well: otherwise a negotiated but
+            // absent extension keeps this handler installed forever and RBE
+            // can never acquire the transport's observation endpoint.
+            failed = feedbackObservation_->poll(now * 1000) == twcc::FeedbackPollResult::Stopped;
+            if (!failed) return;
+            diagnostic("twcc-send-extension-unobserved-fallback");
+        }
+    }
+    if (!feedbackSendAttempted_ && !failed) {
+        const auto media = videoStats_->snapshot();
+        if (!media.packets || !media.ssrc) return;
+        feedbackSendAttempted_ = true;
+        // Stop both active REMB requests and the SR-triggered stored target.
+        // A zero target clears the session; it sends no zero-bandwidth packet.
+        if (!video_->requestBitrate(0)) {
+            diagnostic("twcc-send-remb-clear-rejected");
+            failed = true;
+        } else {
+            feedbackSuppressRemb_ = true;
+            rembGate_.invalidate();
+            const auto nowUs = now * 1000;
+            // Experimental TWCC-only allowance, NOT a total RTCP/BWE budget.
+            // Leave legacy RR/NACK/PLI untouched; reserve cannot throttle them.
+            auto budget = std::make_shared<twcc::SharedRtcpBudget>(16000, 4800, 4800, 1200, nowUs);
+            const twcc::FeedbackSendPolicy policy{20000, 200000, 1000000, 3, 256, localRtcpCname_};
+            // This PC receiver filters TWCC by its registered media SSRC
+            // before invoking the transport feedback observer. Zero is not
+            // a wildcard there; anchor the common transport report to video.
+            if (!feedbackObservation_->startSending(budget, policy, localRtcpSsrc_, media.ssrc)) {
+                diagnostic("twcc-send-start-rejected");
+                failed = true;
+            } else {
+                feedbackSendLogAt_ = now;
+                diagnostic("twcc-send-started-remb-suppressed");
+                diagnostic(("twcc-send-media-ssrc-" + std::to_string(media.ssrc) +
+                    "-sender-ssrc-" + std::to_string(localRtcpSsrc_)).c_str());
+            }
+        }
+    }
+    if (!failed) {
+        const auto result = feedbackObservation_->poll(now * 1000);
+        failed = result == twcc::FeedbackPollResult::Stopped;
+#ifdef UU_LEAN_STATS
+        if (failed) {
+#else
+        if (now - feedbackSendLogAt_ >= 2000 || failed) {
+#endif
+            const auto sent = feedbackObservation_->sendCounters();
+            feedbackSendLogAt_ = now;
+            const auto observed = feedbackObservation_->observationCounters();
+            diagnostic(("twcc-send-submitted-" + std::to_string(sent.submitted) +
+                "-rtcp-bytes-" + std::to_string(sent.submittedBytes) +
+                "-attempted-rtcp-bytes-" + std::to_string(sent.attemptedBytes) +
+                "-failures-" + std::to_string(sent.sendFailures) +
+                "-budget-deferred-" + std::to_string(sent.budgetDeferred) +
+                "-attachment-state-" + std::to_string(int(feedbackObservation_->state())) +
+                "-requests-" + std::to_string(observed.requestsQueued) +
+                "-request-unretained-prefix-" + std::to_string(observed.requestsWithUnretainedPrefix) +
+                "-request-history-unavailable-" + std::to_string(observed.requestHistoryUnavailable) +
+                "-request-queue-full-" + std::to_string(observed.requestQueueFull) +
+                "-stop-reason-" + std::to_string(int(sent.stopped))).c_str());
+        }
+    }
+    if (failed) {
+        stopFeedbackObservation(); // Stop/detach before allowing compatibility REMB.
+        feedbackSendAttempted_ = true;
+        diagnostic("twcc-send-fallback-legacy-feedback");
+#ifdef UU_RBE_OBSERVE_CLIENT
+        refreshReceiveBandwidthObservation();
+#endif
+        applyBitrateCap();
+    }
+}
+#endif
 #endif
 void Client::disconnect() {
     const auto disconnectStarted=monotonicMs();
+#ifdef UU_UDP_RX_TRACE
+    uu::stopUdpPlayback(VideoSupplyTrace::nowUs());
+#endif
     diagnostic("disconnect");
 
     // Close admission before the direct release below. Old input events already
@@ -2049,25 +3079,39 @@ void Client::disconnect() {
     reconnectAt_ = 0;
 
     if(pendingText_)finishTextInput(3,"连接已断开，已取消等待中的粘贴");
+    safetyActions_={};
+    nextSafetyAttempt_=0;
 #ifdef UU_TWCC_OBSERVE_CLIENT
     stopFeedbackObservation();
-    feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
 #endif
+    invalidateFeedbackCapabilities();
+    feedbackLocalCaps_.reset(); feedbackRemoteCaps_.reset();
     pendingQuality_.reset();
     pendingQualityApply_.reset();
+    routeBitrateRequest_.reset();bitrateRoute_=BitrateRoute::Unknown;
+    lastEncoderQuality_=0;lastEncoderCap_=-1;routeBitrateUpdateFailed_=false;
     qualityApply_.beginRequest();
     pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+    videoScaleStableSince_=videoScaleRetryAt_=0;videoScaleObservedWidth_=videoScaleObservedHeight_=0;videoScaleAttempts_=0;
     setVideoScaleNotice("");
     pendingPrivacy_.reset();
+    pendingCursorCapture_.reset();
+    autoCursorCaptureHandled_=false;
     {std::lock_guard lock(stateMutex_);state_.qualityPending=false;state_.settingApplyPending=false;
+        state_.cursorCapturePending=false;state_.cursorCaptureNotice.clear();
         state_.privacyPending=false;state_.privacyKnown=false;state_.privacyMode=PrivacyMode::Off;state_.privacyRequestedMode=PrivacyMode::Unknown;state_.privacyNotice.clear();}
     connectedSince_=0;
-    if (strictVideo_)
-        strictVideo_->shutdown();
+    connectionAttemptStartedAt_=0;
     release();
     diagnostic(("disconnect-stage-release-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
-    if(gamepadConnected_)input({{"action","gpd_disconnect"},{"index",0}});
-    gamepadConnected_=false;nativeTouchActive_=false;touchPoints_=0;
+    for(int index=0;index<int(gamepadConnected_.size());++index)if(gamepadConnected_[index])input({{"action","gpd_disconnect"},{"index",index}});
+    gamepadConnected_.fill(false);nativeTouchActive_=false;touchPoints_=0;
+    if (strictVideo_)
+        strictVideo_->shutdown();
+    if (padMotionDeferred_)
+        diagnostic(("pad-motion-backpressure deferred=" + std::to_string(padMotionDeferred_) +
+                    " replaced=" + std::to_string(padMotionReplaced_)).c_str());
+    padMotionDeferred_=padMotionReplaced_=0;
     ++generation_;
     activeScreenId_=-1;
     iceState_ = rtc::PeerConnection::IceState::New;
@@ -2080,19 +3124,38 @@ void Client::disconnect() {
     pendingCandidates_.clear();
     acks_.clear();
     remainingAttachments_ = 0;
+    pending_={};pendingAttachments_.clear();pendingAttachmentBytes_=0;
+    signalPacketCount_=signalBinaryFrameCount_=0;
     nextAck_ = 1;
     for (auto &[name, ch] : channels_)
         ch->close();
     channels_.clear();
     if (peer_) {
         peer_->resetCallbacks();
+        const bool drainRelay=!turnBridges_.empty() &&
+            peer_->state()==rtc::PeerConnection::State::Connected;
         peer_->close();
+        if(drainRelay) {
+            // SCTP close is asynchronous. Keep the bridge alive for queued
+            // releases and shutdown; never wait indefinitely for a broken peer.
+            const auto drainUntil=monotonicMs()+750;
+            while(peer_->state()==rtc::PeerConnection::State::Connected &&
+                  monotonicMs()<drainUntil &&
+                  std::any_of(turnBridges_.begin(),turnBridges_.end(),
+                      [](const auto &bridge){return bridge && !bridge->failed();}))
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            diagnostic(peer_->state()==rtc::PeerConnection::State::Closed?
+                "disconnect-relay-close-completed":"disconnect-relay-close-bounded-stop");
+        }
         peer_.reset();
     }
     diagnostic(("disconnect-stage-peer-close-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
     video_.reset();
-    rembAvailable_=false;bitrateFeedbackSent_=false;rembTargetBps_=0;lastBitrateAttempt_=0;
+    rembAvailable_=false;rembGate_.reset();localRtcpSsrc_=0;localRtcpCname_.clear();
+    rembNotNegotiatedLogged_=false;rembFirstRtpWaitLogged_=false;
+    rembExperimentLogged_=false;
     turnBridges_.clear();
+    reportedTurnBridgeFailures_.clear();
     strictVideo_.reset();
     videoAssembler_.reset();
     audio_.reset();
@@ -2114,8 +3177,11 @@ void Client::disconnect() {
         state_.qrUrl.clear();
         state_.streaming = false;
         state_.activeDeviceId.clear();
+        state_.routeBitrateNotice.clear();
+        state_.effectiveBitrateMbps=effectiveBitrateMbps(maxBitrateMbps_,BitrateRoute::Unknown);
         state_.textChannelReady=false;
         state_.controlChannelReady=false;
+        state_.safetyNotice.clear();
         state_.settingAccepted=false;state_.settingApplied=false;state_.settingRejected=false;
         state_.settingApplyPending=false;
         state_.settingErrorCode=0;state_.settingSource="none";
@@ -2130,30 +3196,40 @@ void Client::disconnect() {
     diagnostic(("disconnect-total-ms-"+std::to_string(monotonicMs()-disconnectStarted)).c_str());
 }
 void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
-    if(hotCap && q.quality!=6 && (!video_ || !rembAvailable_ || q.cap<=0 || !video_->requestBitrate(unsigned(q.cap)*1000000u)))
-        throw std::runtime_error("码率反馈更新失败");
-    saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+    UU_CONTROL_SCOPE(QualityCommit);
+    (void)hotCap;
+    // This method only updates and persists the target. applyBitrateCap() is
+    // the single active entry that submits compound REMB feedback, so a change
+    // to an unrelated setting cannot create a second feedback path.
+    const bool modeChanged=(q.quality==6)!=(streamQuality_==6);
+    const bool capChanged=q.cap!=maxBitrateMbps_;
+    {
+#ifdef UU_ASYNC_QUALITY_SAVE
+        UU_CONTROL_SCOPE(QualityConfigEnqueue);
+        const auto order=qualitySaveOrder_+1;
+        if(!qualityConfigWriter_->submit(order,q))throw std::runtime_error("画质设置保存任务未接受，请重试");
+        qualitySaveOrder_=order;
+        {std::lock_guard lock(stateMutex_);state_.qualitySavePending=true;state_.qualitySaveError.clear();}
+        diagnostic(("quality-save-queued-"+std::to_string(order)).c_str());
+#else
+        UU_CONTROL_SCOPE(QualityConfigSave);
+        saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+#endif
+    }
     media_->setPlayoutDelay(q.delay);
     const bool sizeChanged=q.width!=streamWidth_ || q.height!=streamHeight_;
     streamWidth_=q.width;streamHeight_=q.height;streamFps_=q.fps;streamQuality_=q.quality;
     maxBitrateMbps_=q.cap;hevc_=q.hevc;
+    routeBitrateUpdateFailed_=false;
     if(sizeChanged){
         pendingVideoScale_.reset();videoScaleAttempted_=false;videoScaleVerified_=false;nextVideoScaleCheck_=0;
+    videoScaleStableSince_=videoScaleRetryAt_=0;videoScaleObservedWidth_=videoScaleObservedHeight_=0;videoScaleAttempts_=0;
         setVideoScaleNotice("视频尺寸设置已变化，等待重新缩放");
     }
-    if(hotCap && q.quality!=6) {bitrateFeedbackSent_=true;diagnostic("quality-remb-hot-updated");}
-    // Custom mode publishes the same ceiling as a fixed REMB. The receiving
-    // session repeats that stored value on later sender reports. Field 8 is
-    // already carried by the capture request; this updates the feedback with it.
-    if(q.quality==6 && q.cap>0 && video_ && video_->isOpen() && rembAvailable_) {
-        try {
-            const unsigned target=unsigned(q.cap)*1000000u;
-            if(video_->requestBitrate(target)) {
-                bitrateFeedbackSent_=true;
-                rembTargetBps_=target;
-                diagnostic(("bitrate-cap-feedback-custom-bps-"+std::to_string(target)).c_str());
-            } else diagnostic("bitrate-cap-feedback-unavailable");
-        } catch(...) { diagnostic("bitrate-cap-feedback-send-failed"); }
+    if(modeChanged || capChanged) {
+        if(video_ && rembGate_.accepted())video_->requestBitrate(0);
+        rembGate_.invalidate();
+        rembNotNegotiatedLogged_=false;rembFirstRtpWaitLogged_=false;
     }
     {std::lock_guard lock(stateMutex_);
         state_.width=q.width;state_.height=q.height;state_.fps=q.fps;state_.quality=q.quality;
@@ -2177,9 +3253,10 @@ void Client::finishQuality() {
             ? "电脑已接收，等待实际状态"
             : "电脑已接受设置，等待实际参数确认";
         const auto requestId=pendingQuality_->id;
-        const QualityApplicationTarget target{q.width,q.height,q.fps,q.quality,q.cap};
+        const QualityApplicationTarget target{q.width,q.height,q.fps,q.quality,effectiveBitrateMbps(q.cap,bitrateRoute_),true};
         const bool alreadyConfirmed=qualityApply_.evaluate(target);
         commitQuality(q,q.quality!=6 && q.cap!=maxBitrateMbps_,notice);
+        applyBitrateCap();
         if(alreadyConfirmed){
             pendingQualityApply_.reset();
             {
@@ -2213,6 +3290,10 @@ void Client::fallbackQuality(const char *notice) {
     diagnostic("quality-rpc-fallback-reconnect");reconnectQuality(q,notice);
 }
 void Client::tickQuality() {
+    UU_CONTROL_SCOPE(Quality);
+#ifdef UU_ASYNC_QUALITY_SAVE
+    pollQualitySave();
+#endif
     const auto now=monotonicMs();
     if(pendingQuality_){
         finishQuality();
@@ -2242,7 +3323,20 @@ void Client::setVideoScaleNotice(const std::string &notice) {
     if (state_.videoScaleNotice == notice) return;
     state_.videoScaleNotice=notice;
 }
+void Client::pollQualitySave() {
+    const auto result=qualityConfigWriter_->snapshot();
+    // Persistence belongs to the client settings, not the RTC generation.
+    // An older completion must not clear a newer target's pending status.
+    if(result.order!=qualitySaveOrder_ || result.order==qualitySaveObserved_)return;
+    qualitySaveObserved_=result.order;
+    {std::lock_guard lock(stateMutex_);
+     state_.qualitySavePending=false;
+     state_.qualitySaveError=result.error?"画质保存失败，本次设置仍生效；重启后可能恢复旧设置，请重试":"";}
+    diagnostic((std::string(result.error?"quality-save-failed-":"quality-save-completed-")+
+        std::to_string(result.order)+"-us-"+std::to_string(result.elapsedUs)).c_str());
+}
 void Client::tickVideoScale() {
+    UU_CONTROL_SCOPE(VideoScale);
     const auto now=monotonicMs();
     if(now<nextVideoScaleCheck_)return;
     nextVideoScaleCheck_=now+250;
@@ -2257,18 +3351,30 @@ void Client::tickVideoScale() {
             setVideoScaleNotice("尚未收到可显示画面；可返回并手动重连");
         return;
     }
-    if((media.width>1920 || media.height>1080) && state.videoScaleNotice.empty())
-        setVideoScaleNotice("电脑画面超出1080p，正在等待缩放；可返回并手动重连");
-    if(!pendingVideoScale_ && media.width<=streamWidth_ && media.height<=streamHeight_ &&
-       !state.videoScaleNotice.empty())
-        setVideoScaleNotice("");
+    const bool within=media.width<=streamWidth_ && media.height<=streamHeight_;
+    if(media.width!=videoScaleObservedWidth_ || media.height!=videoScaleObservedHeight_) {
+        videoScaleObservedWidth_=media.width;videoScaleObservedHeight_=media.height;
+        videoScaleStableSince_=now;videoScaleAttempts_=0;videoScaleRetryAt_=0;
+        if(!pendingVideoScale_)videoScaleAttempted_=false;
+        if(!within) {
+            videoScaleVerified_=false;
+            setVideoScaleNotice("实际视频 "+std::to_string(media.width)+"×"+std::to_string(media.height)+
+                "，尚未达到所选 "+std::to_string(streamWidth_)+"×"+std::to_string(streamHeight_)+"；等待尺寸稳定后缩放");
+            diagnostic(("video-scale-output-exceeded-"+std::to_string(media.width)+"x"+std::to_string(media.height)).c_str());
+        }
+    }
+    if(!pendingVideoScale_ && within) {
+        if(!videoScaleVerified_)diagnostic(("video-scale-output-within-"+std::to_string(media.width)+"x"+std::to_string(media.height)).c_str());
+        videoScaleAttempted_=true;videoScaleVerified_=true;videoScaleAttempts_=0;videoScaleRetryAt_=0;
+        setVideoScaleNotice("");return;
+    }
     const auto channel=channels_.find("TEXT_DATA_CHANNEL");
     if(channel==channels_.end() || !channel->second->isOpen())return;
     if(activeScreenId_<0)return;
 
     if(pendingVideoScale_){
         const auto &request=*pendingVideoScale_;
-        if(request.acknowledged && media.epoch==request.mediaEpoch &&
+        if(media.epoch==request.mediaEpoch &&
            media.publishedTotal>request.publishedBefore && media.width>0 && media.height>0 &&
            media.width<=request.targetWidth && media.height<=request.targetHeight){
             videoScaleVerified_=true;pendingVideoScale_.reset();
@@ -2278,7 +3384,10 @@ void Client::tickVideoScale() {
         }else if(now>=request.deadline){
             const bool acknowledged=request.acknowledged;
             pendingVideoScale_.reset();
-            setVideoScaleNotice(acknowledged?"电脑已应答但视频尺寸未变化":"电脑未确认视频缩放，未自动重试");
+            videoScaleAttempted_=videoScaleAttempts_>=3;
+            videoScaleRetryAt_=now+2000;
+            setVideoScaleNotice("实际视频仍为 "+std::to_string(media.width)+"×"+std::to_string(media.height)+
+                (videoScaleAttempted_?"；缩放未生效，请手动重连":"；缩放未生效，稍后重试"));
             if(acknowledged)
                 diagnostic(("video-scale-size-unconfirmed-actual-"+std::to_string(media.width)+"x"+
                             std::to_string(media.height)).c_str());
@@ -2287,36 +3396,16 @@ void Client::tickVideoScale() {
         }
         return;
     }
-    if(videoScaleAttempted_){
-        if(videoScaleVerified_){
-            if(media.width>0 && media.height>0 &&
-               (media.width>streamWidth_ || media.height>streamHeight_)){
-                videoScaleVerified_=false;
-                videoScaleAttempted_=false;
-                nextVideoScaleCheck_=0;
-                setVideoScaleNotice("实际视频已超出所选尺寸；正在重新请求缩放");
-                diagnostic(("video-scale-output-exceeded-"+std::to_string(media.width)+"x"+
-                            std::to_string(media.height)).c_str());
-            }
-        }
-        return;
-    }
-    if(media.width<=streamWidth_ && media.height<=streamHeight_){
-        videoScaleAttempted_=true;videoScaleVerified_=true;
-        setVideoScaleNotice("");
-        diagnostic(("video-scale-already-within-"+std::to_string(media.width)+"x"+
-                    std::to_string(media.height)).c_str());
-        return;
-    }
+    if(videoScaleAttempted_ || now-videoScaleStableSince_<1000 || now<videoScaleRetryAt_)return;
     if(channel->second->bufferedAmount()>65536)return;
-    videoScaleAttempted_=true;videoScaleVerified_=false;
+    videoScaleAttempted_=true;videoScaleVerified_=false;++videoScaleAttempts_;
     const auto id=nextQualityRpc_++;
     try {
         const auto bytes=videoScaleRpc(id,media.width,media.height,streamWidth_,streamHeight_,
                                        streamFps_,streamQuality_,activeScreenId_,
-                                       streamQuality_==6?maxBitrateMbps_:0);
+                                       effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_));
         pendingVideoScale_=PendingVideoScale{id,now+8000,media.width,media.height,
-                                             streamWidth_,streamHeight_};
+                                             streamWidth_,streamHeight_,false,media.epoch,media.publishedTotal};
         setVideoScaleNotice("正在请求把视频缩放到 "+std::to_string(streamWidth_)+"×"+
                             std::to_string(streamHeight_)+"，保留电脑桌面");
         const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
@@ -2329,47 +3418,202 @@ void Client::tickVideoScale() {
         diagnostic("video-scale-send-failed");
     }
 }
-void Client::applyBitrateCap() {
-    // Native presets keep a one-shot REMB and normally pass a zero cap, so
-    // they do not enter. Custom quality uses field 8 as the ceiling and
-    // announces that same ceiling as REMB. The session repeats the stored
-    // value on later sender reports. A later custom ceiling replaces it.
-    if(!video_ || !video_->isOpen() || maxBitrateMbps_<=0) return;
-    const unsigned target=unsigned(maxBitrateMbps_)*1000000u;
-    if(streamQuality_!=6 && bitrateFeedbackSent_) return;
-    if(streamQuality_==6 && bitrateFeedbackSent_ && rembTargetBps_==target) return;
+void Client::refreshRouteBitrate() {
+    const int cap=effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_);
     const auto now=monotonicMs();
-    if(lastBitrateAttempt_ && now-lastBitrateAttempt_<1000) return;
-    if(!rembAvailable_) {
-        if(!lastBitrateAttempt_)
-            diagnostic(streamQuality_==6?"bitrate-cap-custom-not-negotiated":"bitrate-cap-not-negotiated");
-        lastBitrateAttempt_=now;return;
+    {
+        std::lock_guard lock(stateMutex_);
+        state_.effectiveBitrateMbps=cap;
+        if(routeBitrateRequest_ && now>=routeBitrateRequest_->deadline){
+            routeBitrateRequest_.reset();routeBitrateUpdateFailed_=true;
+            state_.routeBitrateNotice="电脑未确认码率上限，请重新连接后检查";
+            diagnostic("route-bitrate-request-timeout");
+        }
     }
-    lastBitrateAttempt_=now;
+    if(!peer_ || peer_->state()!=rtc::PeerConnection::State::Connected ||
+       peer_->signalingState()!=rtc::PeerConnection::SignalingState::Stable ||
+       pendingQuality_ || pendingQualityApply_ || routeBitrateRequest_ || routeBitrateUpdateFailed_ ||
+       activeScreenId_<0 || (lastEncoderQuality_==streamQuality_ && lastEncoderCap_==cap)) return;
+    const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+    if(channel==channels_.end() || !channel->second->isOpen()) return;
+    const auto id=nextQualityRpc_++;
+    const auto bytes=qualityUpdateRpc(id,streamFps_,streamQuality_,activeScreenId_,cap);
+    const bool sent=channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+    if(!sent && !channel->second->isOpen()) return;
+    routeBitrateRequest_=RouteBitrateRequest{id,streamQuality_,cap,now+5000};
+    {
+        std::lock_guard lock(stateMutex_);
+        state_.appliedBitrateKnown=false;
+        state_.routeBitrateNotice=bitrateRoute_==BitrateRoute::Direct
+            ? "直连：正在恢复画质设置中的码率上限"
+            : "中继保护：正在请求最高 "+std::to_string(cap)+" Mbps";
+    }
+    diagnostic(("route-bitrate-request-id-"+std::to_string(id)+"-quality-"+
+        std::to_string(streamQuality_)+"-cap-mbps-"+std::to_string(cap)+
+        (sent?"-sent":"-queued")).c_str());
+}
+void Client::applyBitrateCap(const NetworkStats *sample) {
+    UU_CONTROL_SCOPE(BitrateApply);
+#ifdef UU_RBE_CLIENT_SEND
+    if (receiveBandwidthSuppressLegacy_) return;
+#endif
+#ifdef UU_TWCC_CLIENT_SEND
+    if (feedbackSuppressRemb_) return;
+#endif
+#if !UU_REMB_FEEDBACK
+    // A/B gate: no Client-initiated REMB submission in this build. Local RTCP
+    // identity, RR+SDES reporting, field 8, quality settings and persistence
+    // stay unchanged; only the active requestBitrate entry is suppressed.
+    (void)sample;
+    return;
+#else
+    if (!peer_ || peer_->signalingState() != rtc::PeerConnection::SignalingState::Stable) {
+        if (rembAvailable_) invalidateFeedbackCapabilities();
+        return;
+    }
+    // Compatibility-only REMB respects the independent user/route ceiling.
+    // TWCC/RBE suppress this stored target while their dynamic producer owns
+    // feedback. Acceptance is local submission, not host application proof.
+    const int effectiveCap=effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_);
+    if(!video_ || !video_->isOpen() || effectiveCap<=0) return;
+    NetworkStats local;
+    if(!sample && videoStats_) {
+        local=videoStats_->snapshot();
+        sample=&local;
+    }
+    const bool firstRtp=sample && sample->packets>0;
+    const uint32_t mediaSsrc=sample?sample->ssrc:0;
+    const unsigned target=unsigned(effectiveCap)*1000000u;
+    const auto action=rembGate_.prepare(monotonicMs(),target,mediaSsrc,rembAvailable_,firstRtp);
+    if(action==RembFeedbackGate::Action::NotNegotiated) {
+        if(!rembNotNegotiatedLogged_) {
+            rembNotNegotiatedLogged_=true;
+            diagnostic(streamQuality_==6?"bitrate-cap-custom-not-negotiated":"bitrate-cap-not-negotiated");
+        }
+        return;
+    }
+    if(action==RembFeedbackGate::Action::FirstRtpMissing) {
+        if(!rembFirstRtpWaitLogged_) {
+            rembFirstRtpWaitLogged_=true;
+            diagnostic("remb-local-deferred-first-rtp-missing");
+        }
+        return;
+    }
+    if(action==RembFeedbackGate::Action::Duplicate ||
+       action==RembFeedbackGate::Action::RetryLater) return;
     try {
         if(!video_->requestBitrate(target)) {
-            diagnostic("bitrate-cap-feedback-unavailable");
+            rembGate_.failed(monotonicMs());
+            diagnostic(("remb-local-deferred-target-bps-"+std::to_string(target)+
+                        "-sender-ssrc-"+std::to_string(localRtcpSsrc_)+
+                        "-media-ssrc-"+std::to_string(mediaSsrc)+
+                        (firstRtp?"-reason-handler-rejected":"-reason-first-rtp-missing")).c_str());
             return;
         }
-        bitrateFeedbackSent_=true;
-        rembTargetBps_=target;
-        if(streamQuality_==6)
-            diagnostic(("bitrate-cap-feedback-custom-bps-"+std::to_string(target)).c_str());
-        else
-            diagnostic("bitrate-cap-feedback-configured");
-    } catch(...) {diagnostic("bitrate-cap-feedback-send-failed");}
+        rembGate_.accepted(target,mediaSsrc);
+        diagnostic(("remb-local-accepted-target-bps-"+std::to_string(target)+
+                    "-sender-ssrc-"+std::to_string(localRtcpSsrc_)+
+                    "-media-ssrc-"+std::to_string(mediaSsrc)).c_str());
+    } catch(...) {
+        rembGate_.failed(monotonicMs());
+        diagnostic("remb-local-send-failed");
+    }
+#endif
 }
 void Client::refreshStats(int64_t now) {
-    applyBitrateCap();
+    UU_CONTROL_SCOPE(Stats);
+    NetworkStats videoStats;
+    if (videoStats_)
+        videoStats = videoStats_->snapshot();
     lastStatsUpdate_ = now;
     StreamStatsSnapshot stats;
+    for(size_t index=0;index<turnBridges_.size();++index) {
+        const auto &bridge=turnBridges_[index];
+        if(bridge && bridge->failed() && reportedTurnBridgeFailures_.insert(bridge.get()).second) {
+            const int peerState=peer_?int(peer_->state()):-1;
+            const int iceState=peer_?int(peer_->iceState()):-1;
+            diagnostic(("turn-bridge-failed-attempt-"+std::to_string(generation_)+
+                        "-server-index-"+std::to_string(index)+
+                        "-peer-state-"+std::to_string(peerState)+
+                        "-ice-state-"+std::to_string(iceState)).c_str());
+        }
+    }
+#ifdef UU_ASYNC_SELECTED_PATH
+    PathQueryResult path;
+    if(peer_) {
+        if(!pathQueryWorker_) {
+            pathQueryState_=std::make_shared<PathQueryState>();
+            pathQueryWorker_=std::make_unique<runtime::LatestSnapshotWorker<PathQueryJob>>(
+                2*sizeof(PathQueryJob),[state=pathQueryState_](const PathQueryJob &job) {
+                    PathQueryResult result;result.generation=job.generation;
+                    const auto started=ControlStageTiming::nowUs();
+                    result.selected=job.peer->getSelectedCandidatePair(&result.local,&result.remote);
+                    result.queryUs=ControlStageTiming::nowUs()-started;
+                    result.completedMs=monotonicMs();
+                    std::lock_guard lock(state->mutex);state->result=std::move(result);
+                });
+        }
+        {std::lock_guard lock(pathQueryState_->mutex);path=pathQueryState_->result;}
+        const auto failures=pathQueryWorker_->stats().failures;
+        if(failures!=pathQueryFailures_) {
+            pathQueryFailures_=failures;
+            throw std::runtime_error("Selected path background query failed");
+        }
+        pathQueryWorker_->submit({++pathQueryOrder_,generation_,peer_});
+    }
+    const bool pathReady=peer_ && path.completedMs && path.generation==generation_;
+    // Reused by normal route tracking and TURN failure validation; copying only.
+    auto selectedPair=[&](rtc::Candidate *local,rtc::Candidate *remote) {
+        if(!pathReady || !path.selected)return false;
+        *local=path.local;*remote=path.remote;return true;
+    };
+#else
+    auto selectedPair=[&](rtc::Candidate *local,rtc::Candidate *remote) {
+        UU_CONTROL_SCOPE(CandidatePair);return peer_->getSelectedCandidatePair(local,remote);
+    };
+#endif
+    if(!turnBridges_.empty() && peer_ && peer_->state()==rtc::PeerConnection::State::Connected) {
+        rtc::Candidate local,remote;
+        if(selectedPair(&local,&remote) && local.type()==rtc::Candidate::Type::Relayed) {
+            const auto address=local.address();const auto port=local.port();
+            size_t matches=0;bool selectedFailed=false;
+            if(address && port)for(const auto &bridge:turnBridges_) {
+                if(bridge && bridge->matchesRelay(*address,*port)) {
+                    ++matches;selectedFailed=bridge->failed();
+                }
+            }
+            // An unused bridge may be healthy or failed. Only a unique match
+            // to this generation's selected relay can invalidate the path.
+            if(matches==1 && selectedFailed) {
+                // The normal path query is asynchronous. Recheck only this
+                // failure case so an old cached pair cannot kill a new route.
+                rtc::Candidate currentLocal,currentRemote;
+                if(peer_->getSelectedCandidatePair(&currentLocal,&currentRemote) &&
+                   currentLocal.type()==rtc::Candidate::Type::Relayed &&
+                   currentLocal.address()==address && currentLocal.port()==port) {
+                    diagnostic(("turn-relay-path-invalidated-attempt-"+std::to_string(generation_)).c_str());
+                    throw std::runtime_error("TURN stream bridge failed on selected relay path");
+                }
+            }
+        }
+    }
+    BitrateRoute observedRoute=BitrateRoute::Unknown;
+#ifdef UU_ASYNC_SELECTED_PATH
+    if(peer_ && !pathReady)observedRoute=bitrateRoute_;
+#endif
     if (peer_) {
-        if (auto rtt = peer_->rtt())
-            stats.rttMs = int(rtt->count());
+        {
+            UU_CONTROL_SCOPE(Rtt);
+            if (auto rtt = peer_->rtt())stats.rttMs = int(rtt->count());
+        }
         rtc::Candidate local, remote;
-        if (peer_->getSelectedCandidatePair(&local, &remote)) {
+        bool selected=false;
+        {selected=selectedPair(&local,&remote);}
+        if (selected) {
             const auto identity=candidateIdentity(remote);
             const bool matchedRemoteRelay=!identity.empty() && remoteRelayEndpoints_.count(identity)>0;
+            observedRoute=(local.type()==rtc::Candidate::Type::Relayed ||
+                remote.type()==rtc::Candidate::Type::Relayed || matchedRemoteRelay) ? BitrateRoute::Relay : BitrateRoute::Direct;
             stats.transport = selectedPath(local, remote,matchedRemoteRelay);
             if(local.type()==rtc::Candidate::Type::Relayed && !turnBridges_.empty())
                 stats.transport+=" · TURN上行 "+turnUplinkMode_;
@@ -2394,11 +3638,37 @@ void Client::refreshStats(int64_t now) {
             }
         }
     }
-    if (videoStats_)
-        stats.video = videoStats_->snapshot();
+#ifdef UU_ASYNC_SELECTED_PATH
+    if(peer_ && !pathReady) {
+        std::lock_guard lock(statsMutex_);
+        stats.transport=statsCache_.transport;stats.localEndpoint=statsCache_.localEndpoint;
+        stats.remoteEndpoint=statsCache_.remoteEndpoint;
+    }
+#endif
+    if(observedRoute!=bitrateRoute_){
+        if(video_ && rembGate_.accepted())video_->requestBitrate(0);
+        bitrateRoute_=observedRoute;routeBitrateUpdateFailed_=false;rembGate_.invalidate();
+        diagnostic(("route-bitrate-path-"+std::to_string(int(bitrateRoute_))+"-limit-mbps-"+
+            std::to_string(effectiveBitrateMbps(maxBitrateMbps_,bitrateRoute_))).c_str());
+    }
+    refreshRouteBitrate();
+    applyBitrateCap(&videoStats);
+    stats.video = videoStats;
     if (audioStats_)
         stats.audio = audioStats_->snapshot();
+    if(!firstVideoRtpLogged_ && stats.video.packets) {
+        firstVideoRtpLogged_=true;
+        diagnostic("media-first-video-rtp");
+    }
+    if(!firstAudioRtpLogged_ && stats.audio.packets) {
+        firstAudioRtpLogged_=true;
+        diagnostic("media-first-audio-rtp");
+    }
     const auto media = media_->stats();
+    if(!firstVideoFramePublishedLogged_ && media.publishedTotal) {
+        firstVideoFramePublishedLogged_=true;
+        diagnostic("media-first-video-frame-published");
+    }
     stats.sampledMs=now;stats.decodedTotal=media.decodedTotal;stats.publishedTotal=media.publishedTotal;
     stats.mediaEpoch=media.epoch;stats.inputQueued=media.inputQueued;stats.hardwareFrame=media.hardwareFrame;
     stats.skipDue=media.skipDue;stats.skipBound=media.skipBound;stats.selectedLateMs=media.selectedLateMs;
@@ -2410,7 +3680,22 @@ void Client::refreshStats(int64_t now) {
     stats.height = media.height;
     stats.decodeFps = media.fps;
     stats.requestedFps = streamFps_;
-    stats.maxBitrateMbps=maxBitrateMbps_;stats.bitrateFeedbackSent=bitrateFeedbackSent_;
+    stats.maxBitrateMbps=maxBitrateMbps_;
+    stats.bitrateFeedbackSent=rembGate_.accepted();
+    stats.rembTargetBps=rembGate_.targetBps();
+    stats.rembSenderSsrc=localRtcpSsrc_;
+    stats.rembMediaSsrc=videoStats.ssrc;
+    stats.rembAcceptedCount=rembGate_.acceptedCount();
+    stats.rembDeferredCount=rembGate_.deferredCount();
+#ifdef UU_RBE_CLIENT_SEND
+    if (receiveBandwidthObservation_ && receiveBandwidthSuppressLegacy_) {
+        const auto sent = receiveBandwidthObservation_->feedbackCounters();
+        stats.bitrateFeedbackSent = sent.transport.submitted != 0;
+        stats.rembTargetBps = sent.lastSubmittedBps;
+        stats.rembAcceptedCount = sent.transport.submitted;
+        stats.rembDeferredCount = sent.transport.sendFailures + sent.transport.budgetDeferred;
+    }
+#endif
     stats.touchPackets=touchPackets_;stats.touchFailures=touchFailures_;stats.touchPoints=touchPoints_;
     stats.qualitySent=qualitySent_;stats.qualityAcked=qualityAcked_;stats.qualityFailed=qualityFailed_;
     stats.qualityPending=bool(pendingQuality_);
@@ -2440,6 +3725,10 @@ void Client::refreshStats(int64_t now) {
     if (strictVideo_) {
         strictVideo_->setRtt(stats.rttMs);
         const auto receiver = strictVideo_->snapshot();
+        if(!firstVideoAccessUnitLogged_ && receiver.accepted) {
+            firstVideoAccessUnitLogged_=true;
+            diagnostic("media-first-video-access-unit-accepted");
+        }
         stats.strictReceiver = true;
         stats.nackSent = receiver.nackMessages;
         stats.rtxRecovered = receiver.rtxRecovered;
@@ -2464,6 +3753,90 @@ void Client::refreshStats(int64_t now) {
         stats.repairPaced=receiver.repairPaced;stats.nackSequences=receiver.nackSequences;
         stats.nackBudgetDeferrals=receiver.budgetDeferrals;stats.nackExpiredScans=receiver.expiredRepairScans;
     }
+    if(!strictVideo_ && videoAssembler_ && !firstVideoAccessUnitLogged_ && videoAssembler_->frameCount()) {
+        firstVideoAccessUnitLogged_=true;
+        diagnostic("media-first-video-access-unit-emitted-legacy");
+    }
+#ifndef UU_LEAN_STATS
+    if(stats.mediaEpoch && now-pipelineLogAt_>=2000) {
+        pipelineLogAt_=now;
+        const auto tls=dtlsRxDiagnostics();
+        const auto stages=LiveTelemetry::decodeStages();
+        Json timing={{"peer",generation_},{"epoch",stats.mediaEpoch},{"ms",now},
+            {"w",stats.width},{"h",stats.height},{"pkts",stats.video.packets},
+            {"rx_au",stats.receiverAccepted},{"rx_drop",stats.receiverDropped},
+            {"rx_wait_max_ms",stats.receiverMaxWaitMs},{"rx_block_ms",stats.receiverBlockedMs},
+            {"rx_in_max_us",stats.rxIncomingMaxUs},{"q",stats.inputQueued},
+            {"q_wait_max_ms",stats.queueWaitMaxMs},{"q_oldest_ms",stats.oldestQueueWaitMs},
+            {"dec",stats.decodedTotal},{"dec_max_ms",stats.decodeMaxMs},{"dec_gt33",stats.decodeGt33},
+            {"dec_age_ms",stats.lastDecodedAgeMs},{"ready",stats.readyFrames},
+            {"send_ema_us",stages.sendUs},{"recv_ema_us",stages.receiveUs},{"pub_ema_us",stages.publishUs},
+            {"tls_bounded",tls.bounded},{"tls_timing",tls.timingEnabled}};
+        if(tls.timingEnabled)timing.update(Json{{"tls_reads",tls.reads},{"tls_yields",tls.yields},
+            {"tls_read_total_us",tls.readTotalUs},{"tls_read_max_us",tls.readMaxUs},
+            {"tls_sends",tls.sends},{"tls_send_wait_total_us",tls.sendWaitTotalUs},
+            {"tls_send_wait_max_us",tls.sendWaitMaxUs},{"tls_send_total_us",tls.sendTotalUs},
+            {"tls_send_max_us",tls.sendMaxUs},{"tls_input_age_samples",tls.inputAgeSamples},
+            {"tls_input_age_max_us",tls.inputAgeMaxUs}});
+#ifdef UU_MEDIA_DISPATCH
+        MediaDispatchQueue::Stats dispatch;
+        const bool available=latestMediaDispatchStats(dispatch);
+        timing.update(Json{{"md_latest",available},{"md_stopped",dispatch.stopped},
+            {"md_q",dispatch.queued},{"md_wait_max_us",dispatch.maxWaitUs},
+            {"md_in",dispatch.accepted},{"md_out",dispatch.delivered}});
+#endif
+#ifdef UU_UDP_SEND_TIMING
+        uu_udp_stage_sample udp[UU_UDP_STAGE_COUNT];uu_udp_snapshot(udp);
+        constexpr const char *udpNames[]={"poll_lock","poll_dscp","poll_udp_call","udp_address","udp_sendto"};
+        for(int i=0;i<UU_UDP_STAGE_COUNT;++i)timing[udpNames[i]]={
+            {"n",udp[i].calls},{"total_us",udp[i].total_us},{"max_us",udp[i].max_us},{"ge16ms",udp[i].ge16ms}};
+#ifdef UU_POLL_FIXED_DSCP
+        timing["poll_fixed_ds"]=10 << 2;
+#endif
+#endif
+#ifdef UU_ASYNC_QUALITY_SAVE
+        const auto saved=qualityConfigWriter_->snapshot();
+        const auto saves=qualityConfigWriter_->stats();
+        timing["quality_save"]={{"requested",qualitySaveOrder_},{"result_order",saved.order},
+            {"completed",saved.completed},{"failures",saved.failures},{"last_us",saved.elapsedUs},
+            {"max_us",saved.maxUs},{"replaced",saves.replaced},{"retained_bytes",saves.retainedBytes}};
+#endif
+        timing["quality_ack_keyframe"]={{"attempted",qualityAckKeyframeAttempted_},
+                                      {"skipped_cap_only",qualityAckKeyframeSkipped_}};
+#ifdef UU_VIDEO_REPAIR_TRACE
+        const auto repair=videoRepairTrace_->stats();
+        timing["video_repair"]={{"events",repair.events},{"overwritten",repair.overwritten},
+            {"gaps",repair.gaps},{"nack_packets",repair.nackPackets},{"nack_sequences",repair.nackSequences},
+            {"rtx_observed",repair.rtx},{"unmatched_rtx",repair.unmatchedRtx},{"late_primary",repair.latePrimary},
+            {"malformed",repair.malformed},{"evicted_unresolved",repair.evictedUnresolved},
+            {"untracked_gap_sequences",repair.untrackedGapSequences},{"send_max_us",repair.maxSendUs}};
+#endif
+#ifdef UU_VIDEO_SUPPLY_TRACE
+        const auto supply=videoSupplyTrace_->stats();
+        timing["video_supply"]={{"generation",supply.generation},{"sessions",supply.sessions},
+            {"primary",supply.primary},{"rtx",supply.rtx},{"au",supply.accessUnits},
+            {"events",supply.events},{"overwritten",supply.overwritten},{"missing_arrival",supply.missingArrival},
+            {"unmatched",supply.unmatched},{"queue_age_max_us",supply.maxQueueAgeUs},
+            {"ingress_gap_max_us",supply.maxIngressGapUs},{"handler_gap_max_us",supply.maxHandlerGapUs},
+            {"residence_max_us",supply.maxFrameResidenceUs},{"handoff_max_us",supply.maxHandoffUs}};
+#endif
+#ifdef UU_ASYNC_SELECTED_PATH
+        timing["path_async"]=true;timing["path_ready"]=pathReady;
+        if(pathReady) {timing["path_query_us"]=path.queryUs;timing["path_age_ms"]=now-path.completedMs;}
+        if(pathQueryWorker_) {
+            const auto worker=pathQueryWorker_->stats();
+            timing["path_query_failures"]=worker.failures;timing["path_query_replaced"]=worker.replaced;
+        }
+#endif
+        if(socket_) {
+            const auto io=socket_->ioStats();
+            timing["signal_worker"]=io.enabled;timing["signal_worker_reads"]=io.reads;
+            timing["signal_worker_read_max_us"]=io.readMaxUs;timing["signal_worker_write_max_us"]=io.writeMaxUs;
+            timing["signal_worker_outgoing"]=io.outgoing;timing["signal_worker_incoming"]=io.incoming;
+        }
+        diagnostic(("video-pipeline "+timing.dump()).c_str());
+    }
+#endif
     std::lock_guard lock(statsMutex_);
     statsCache_ = std::move(stats);
 }

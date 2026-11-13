@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <rtc/rtc.hpp>
+#include "frame_trace.hpp"
 
 namespace uu {
 // Read-only bytes borrowed from Packet::owner, or a vector for immediate parsing.
@@ -45,7 +46,7 @@ class StrictVideoReceiver final : public rtc::MediaHandler {
         uint64_t nackSequences = 0, budgetDeferrals = 0, expiredRepairScans = 0;
     };
     using Output = std::function<void(const uint8_t *, size_t, uint32_t)>;
-    using ValidatedOutput = std::function<void(const uint8_t *, size_t, uint32_t, bool)>;
+    using ValidatedOutput = std::function<void(std::vector<uint8_t>, uint32_t, bool)>;
     StrictVideoReceiver(bool rtx, int deadlineMs, Output output, bool hevc = false, bool repairPaced = false,
                         ValidatedOutput validatedOutput = {});
     ~StrictVideoReceiver() override;
@@ -120,7 +121,7 @@ class StrictVideoReceiver final : public rtc::MediaHandler {
     uint64_t waiting_ = 0, recoveries_ = 0;
     uint64_t fastForwards_ = 0, waitTotalMs_ = 0;
     int recentWaitMs_ = 0, maxWaitMs_ = 0;
-    std::deque<std::string> trace_;
+    std::deque<ReceiverTraceRow> trace_;
     int64_t startedAtMs_ = 0;
     std::deque<std::string> events_;
     uint64_t eventsDropped_ = 0;
@@ -132,7 +133,7 @@ class StrictVideoReceiver final : public rtc::MediaHandler {
     uint64_t memoryBoundRetires_ = 0, maxFrameBytes_ = 0;
     uint64_t recoveryDiscarded_ = 0, recoverySkippedRepairScans_ = 0;
     bool sessionMarkerWritten_ = false;
-    // Custom-mode experiment: bound requested RTX bursts without changing
+    // Receiver policy: bound requested RTX bursts without changing
     // frame validity, decode order or the existing frame deadline.
     int64_t repairRefillAt_ = 0, repairWindowAt_ = 0, repairScanAt_ = 0;
     double repairTokens_ = 32.0, repairRatePps_ = 128.0;

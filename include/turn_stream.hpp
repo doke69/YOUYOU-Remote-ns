@@ -14,5 +14,6 @@ class TurnStreamBridge {
     TurnStreamBridge(const TurnStreamBridge &)=delete;
     uint16_t localPort() const;
     bool failed() const;
+    bool matchesRelay(const std::string &address,uint16_t port) const;
 };
 }

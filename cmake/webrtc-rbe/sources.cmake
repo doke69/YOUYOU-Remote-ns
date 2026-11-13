@@ -1,0 +1,34 @@
+set(UU_RBE_UPSTREAM_SOURCES
+  modules/remote_bitrate_estimator/remote_bitrate_estimator_abs_send_time.cc
+  modules/remote_bitrate_estimator/remote_bitrate_estimator_single_stream.cc
+  modules/remote_bitrate_estimator/aimd_rate_control.cc
+  modules/remote_bitrate_estimator/inter_arrival.cc
+  modules/remote_bitrate_estimator/overuse_estimator.cc
+  modules/remote_bitrate_estimator/overuse_detector.cc
+  modules/remote_bitrate_estimator/bwe_defines.cc
+  modules/congestion_controller/goog_cc/link_capacity_estimator.cc
+  modules/congestion_controller/remb_throttler.cc
+  api/transport/field_trial_based_config.cc
+  api/transport/network_types.cc
+  api/units/data_rate.cc
+  api/units/data_size.cc
+  api/units/time_delta.cc
+  api/units/timestamp.cc
+  api/rtp_headers.cc
+  api/video/color_space.cc
+  rtc_base/rate_statistics.cc
+  rtc_base/race_checker.cc
+  rtc_base/experiments/field_trial_parser.cc
+  rtc_base/checks.cc
+  rtc_base/logging.cc
+  rtc_base/time_utils.cc
+  rtc_base/string_encode.cc
+  rtc_base/string_utils.cc
+  rtc_base/strings/string_builder.cc
+  system_wrappers/source/clock.cc
+  system_wrappers/source/field_trial.cc
+  system_wrappers/source/metrics.cc
+  rtc_base/system_time.cc
+  rtc_base/experiments/field_trial_units.cc
+  api/field_trials_registry.cc
+)

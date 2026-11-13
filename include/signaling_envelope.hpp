@@ -1,11 +1,12 @@
 #pragma once
-#include "protocol.hpp"
+#include "signaling_payload.hpp"
 
 namespace uu {
 // The network boundary accepts only the established UU envelope. Never guess
 // alternate nesting or accept a different session to make a connection succeed.
 enum class SoacStatus { Accepted, InvalidEnvelope, SessionMismatch, UnknownType, InvalidPayload };
-inline SoacStatus inspectSoac(const Json &packet, const Json &session) {
+inline SoacStatus inspectSoac(const Json &packet, const Json &session,SdpEncoding *encoding=nullptr) {
+    if(encoding)*encoding=SdpEncoding::None;
     if (!packet.is_object()) return SoacStatus::InvalidEnvelope;
     const auto payload = packet.find("data");
     if (payload == packet.end() || !payload->is_object()) return SoacStatus::InvalidEnvelope;
@@ -21,8 +22,20 @@ inline SoacStatus inspectSoac(const Json &packet, const Json &session) {
     const auto &name = type->get_ref<const std::string &>();
     if (name == "answer" || name == "offer" || name == "restart_ice") {
         const auto sdp = payload->find("sdp");
-        return sdp != payload->end() && sdp->is_string() && !sdp->get_ref<const std::string &>().empty()
-            ? SoacStatus::Accepted : SoacStatus::InvalidPayload;
+        if(sdp != payload->end() && sdp->is_string() && !sdp->get_ref<const std::string &>().empty()) {
+            if(encoding)*encoding=SdpEncoding::Plain;
+            return SoacStatus::Accepted;
+        }
+        const auto gzip=payload->find("gzip_sdp");
+        if(gzip!=payload->end() && gzip->is_string() && !gzip->get_ref<const std::string &>().empty()) {
+            if(encoding)*encoding=SdpEncoding::GzipBase64;
+            return SoacStatus::Accepted;
+        }
+        if(gzip!=payload->end() && gzip->is_binary() && !gzip->get_binary().empty()) {
+            if(encoding)*encoding=SdpEncoding::GzipBinary;
+            return SoacStatus::Accepted;
+        }
+        return SoacStatus::InvalidPayload;
     }
     if (name == "candidate") {
         const auto candidate = payload->find("candidate");

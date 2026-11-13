@@ -17,6 +17,8 @@ Application code is licensed under GPL-3.0-or-later; see LICENSE. Linked depende
 | plog | https://github.com/SergiusTheBest/plog | MIT |
 | nlohmann/json | https://github.com/nlohmann/json | MIT |
 | QR Code generator | https://github.com/nayuki/QR-Code-generator | MIT |
+| Experimental WebRTC receive bitrate estimator subset | https://webrtc.googlesource.com/src/+/218b56e516386cd57c7513197528c3124bcd7ef3 | BSD-3-Clause; PATENTS and AUTHORS retained |
+| Abseil for the estimator subset | https://chromium.googlesource.com/chromium/src/third_party/+/fc733299410a7104a0848539baab0131b8a616b8/abseil-cpp/ | Apache-2.0 |
 | Opus | https://opus-codec.org | BSD-3-Clause |
 | libcurl | https://curl.se | curl license |
 | FreeType / HarfBuzz | https://freetype.org / https://harfbuzz.github.io | FTL or GPL / MIT |
@@ -25,6 +27,10 @@ Application code is licensed under GPL-3.0-or-later; see LICENSE. Linked depende
 
 The native client protocol is ported from the user-provided local UURemote-web reference. No original UU binaries, APK, extracted UI textures, or signing constant are committed to this repository. Local builds still embed locally supplied signing material; this is not a claim of binary redistribution authorization. UU names, services, and protocol belong to their respective owners. This is an unofficial client.
 
+The optional receive estimator is a pinned compatibility reference, not an identified exact UU TV WebRTC revision. The algorithms remain upstream; the platform thread-ID bridge and build integration are local adaptations. See `cmake/webrtc-rbe/upstream.lock.json`, `scripts/fetch_rbe_sources.py`, and `docs/tv-adaptation-r3-candidate-2026-11-08.md`. Matching notices are under `licenses/webrtc-*` and `licenses/abseil-Apache-2.0.txt`, and are packed into RBE-enabled local NROs. Disabling the RBE option does not introduce the estimator dependency.
+
+
+The optional batch-receive scratch adapter in `source/switch_batch_rx.c` is adapted from libnx v4.12.0 `nx/source/runtime/devices/socket.c` (SHA256 `090e8e40f843e2cfd6f9614229a946774ddb713a0b79456ffeb584ab60cbf1ae`). It retains libnx's ISC notice in the source and in `licenses/libnx-ISC.txt`, also packed into the local NRO. The installed SDK and its other socket functions are not replaced.
 
 ## v52 additions
 - deko3d/dekotools/uam: devkitPro upstream; use their licenses when distributing linked builds. See docs/archive/v52/build-v52.md for historical pinned source references.

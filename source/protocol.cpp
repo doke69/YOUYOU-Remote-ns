@@ -142,7 +142,7 @@ Bytes connectOptions(int w, int h, int fps, int quality, int customMbps, bool he
     if (!supportedResolution)
         throw std::invalid_argument("Unsupported capture resolution");
     if (quality < 1 || quality > 6 || customMbps < 0 || customMbps > 100 ||
-        (quality == 6 && customMbps == 0) || (quality != 6 && customMbps != 0))
+        (quality == 6 && customMbps == 0))
         throw std::invalid_argument("Invalid custom capture bitrate");
     Bytes resolution, capture, decoder, out;
     integer(resolution, 1, w);
@@ -150,22 +150,16 @@ Bytes connectOptions(int w, int h, int fps, int quality, int customMbps, bool he
     integer(capture, 1, fps == 30 ? 1 : 2);
     integer(capture, 2, quality);
     integer(capture, 3, 1);
-    // Start in FOLLOW_REMOTE so the initial desktop is not switched to 720.
-    // The first decoded frame then gives the real source size for the
-    // mobile-shaped scale request. Keep local_resolution as capability data;
-    // do not send choose_resolution, which asks the host to select 720.
-    // Choose the output size through the protocol's explicit resolution path
-    // from the first capture. FOLLOW_REMOTE leaves the host free to start at
-    // the desktop size and only apply scaling after videoScale, which creates
-    // an avoidable oversized first keyframe.
-    integer(capture, 4, 4); // ChooseType_RESOLUTION
-    message(capture, 5, resolution); // local display capability
-    message(capture, 6, resolution); // requested capture/output resolution
+    // Preserve the computer's current desktop. Session codec capabilities and
+    // DecoderCap still bound the requested stream workload independently.
+    integer(capture, 4, 3); // ChooseType_FOLLOW_REMOTE
+    message(capture, 5, resolution); // client display capability
+    // No choose_resolution: it requests a host desktop resolution selection.
     // Keep the host from entering automatic frame-quality mode, and pin the
     // frame counter to the requested cadence from the first capture.
     integer(capture, 10, 0);
     integer(capture, 11, fps);
-    if (quality == 6) integer(capture, 8, uint64_t(customMbps) * 1000000u);
+    if (customMbps > 0) integer(capture, 8, uint64_t(customMbps) * 1000000u);
     integer(decoder, 1, fps);
     // ConnectOptions field4 is a repeated DecoderCap, not a codec-neutral size.
     // Mobile CodecType: H264=1, H265=2. Keep this capability consistent with
@@ -178,6 +172,11 @@ Bytes connectOptions(int w, int h, int fps, int quality, int customMbps, bool he
     message(out, 3, capture);
     message(out, 4, decoder);
     integer(out, 8, 2);
+    // ConnectOptions11 -> FeatureFlag4: enhanced privacy support.
+    // Hosts otherwise downgrade saved ScreenOff to Normal during reconnect.
+    Bytes features;
+    integer(features, 4, 2);
+    message(out, 11, features);
     return out;
 }
 Bytes launchApp(uint64_t seq, const Json &app) {

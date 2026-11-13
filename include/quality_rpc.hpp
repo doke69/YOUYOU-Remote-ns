@@ -18,6 +18,10 @@ enum class PrivacyMode : unsigned { Unknown=0, Off=1, Normal=2, ScreenOff=3 };
 struct PrivacyRpcAck {uint64_t requestId=0;int errorCode=0;PrivacyMode requestedMode=PrivacyMode::Unknown,currentMode=PrivacyMode::Unknown;};
 Bytes privacyScreenRpc(uint64_t requestId,PrivacyMode mode);
 std::optional<PrivacyRpcAck> parsePrivacyRpcAck(const uint8_t *data,size_t size) noexcept;
+// Main15 -> SystemStateChange5. Notifications have no RPC request ID.
+std::optional<PrivacyRpcAck> parsePrivacyStateNotify(const uint8_t *data,size_t size) noexcept;
+// Main21 -> RpcRequest5 -> CursorSettingReqeust1=true. No capture/codec fields.
+Bytes cursorCaptureRpc(uint64_t requestId);
 Bytes clipboardTextRpc(uint64_t requestId,const std::string &text);
 std::optional<TextRpcAck> parseTextRpcAck(const uint8_t *data,size_t size) noexcept;
 std::optional<ScreenSourceInfo> parseScreenSources(const uint8_t *data,size_t size) noexcept;

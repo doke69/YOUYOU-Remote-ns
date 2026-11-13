@@ -34,5 +34,6 @@ public:
         recent_=id;return true;
     }
     const std::string &recent()const { return recent_; }
+    const std::string &selected()const { return selected_; }
 };
 } // namespace uu

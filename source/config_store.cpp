@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #ifdef __SWITCH__
 #include <sys/stat.h>
 #include <dirent.h>
@@ -32,12 +33,12 @@ constexpr const char *kFallbackTemplate =
     "width=1280\n"
     "height=720\n"
     "fps=60\n"
-    "quality=3\n"
-    "vsync=1\n"
+    "quality=6\n"
+    "vsync=0\n"
     "frame_pacing=1\n"
     "software_pacing=1\n"
-    "playout_delay_ms=8\n"
-    "max_bitrate_mbps=0\n"
+    "playout_delay_ms=0\n"
+    "max_bitrate_mbps=12\n"
     "video_codec=hevc\n"
     "native_display=1\n";
 
@@ -78,9 +79,7 @@ bool oldDefault(unsigned version,const std::string &key, const std::string &valu
     // Values from the pre-template code defaults. Only these are safe to
     // upgrade automatically; a player's non-default choice is preserved.
     if(version<1) {
-        if (key == "quality" && value == "3") return true;
         if (key == "playout_delay_ms" && value == "8") return true;
-        if (key == "max_bitrate_mbps" && value == "0") return true;
     }
     // v0.2.7 template default was 16ms; v0.3.6 moves it to 8ms. A v1 value of
     // 16 is the old default, not necessarily a player's choice.
@@ -185,9 +184,13 @@ void ensureDefaultConfig() noexcept {
             migrated = true;
         }
     }
-    for (const auto &entry : templateEntries()) {
+    // A partially saved quality setting keeps its original missing-value defaults.
+    const bool hasSavedQuality = positions.count("quality") || positions.count("max_bitrate_mbps");
+    for (auto entry : templateEntries()) {
         const auto found = positions.find(entry.key);
         if (found == positions.end()) {
+            if (hasSavedQuality && entry.key == "quality") entry.value = "3";
+            if (hasSavedQuality && entry.key == "max_bitrate_mbps") entry.value = "0";
             lines.push_back(entry.key + "=" + entry.value);
             positions[entry.key] = lines.size() - 1;
             changed = true;
@@ -344,5 +347,27 @@ void saveQualityConfig(int width, int height, int fps, int quality, bool vsync,
     }
 #endif
     ConfigStore::instance().reload();
+}
+QualityConfigWriter::QualityConfigWriter():QualityConfigWriter([](const QualityConfigValues &q){
+    saveQualityConfig(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+}) {}
+QualityConfigWriter::QualityConfigWriter(Save save)
+    :worker_(2*sizeof(Job),[this,save=std::move(save)](const Job &job){
+        const auto start=std::chrono::steady_clock::now();
+        std::exception_ptr error;
+        // Disk errors must cross the worker boundary without stopping later saves.
+        try {save(job.values);} catch(...) {error=std::current_exception();}
+        const auto elapsed=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now()-start).count());
+        std::lock_guard lock(resultMutex_);
+        result_.order=job.order;result_.elapsedUs=elapsed;
+        result_.maxUs=std::max(result_.maxUs,elapsed);
+        ++result_.completed;result_.failures+=bool(error);result_.error=error;
+    }) {}
+bool QualityConfigWriter::submit(uint64_t order,const QualityConfigValues &values) {
+    return worker_.submit({order,values});
+}
+QualityConfigWriter::Result QualityConfigWriter::snapshot() const {
+    std::lock_guard lock(resultMutex_);return result_;
 }
 } // namespace uu

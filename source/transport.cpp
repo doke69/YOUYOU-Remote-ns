@@ -181,6 +181,13 @@ SignalSocket::~SignalSocket() {
     close();
 }
 void SignalSocket::close() {
+    ioStop_=true;ioReady_.notify_all();
+    if(ioWorker_.joinable())ioWorker_.join();
+    {
+        std::lock_guard lock(ioMutex_);
+        outgoing_.clear();incoming_.clear();outgoingBytes_=incomingBytes_=0;
+        ioError_=nullptr;ioStats_={};
+    }
     if (curl_) {
         curl_easy_cleanup(curl_);
         curl_ = nullptr;
@@ -192,7 +199,7 @@ void SignalSocket::write(const Bytes &data) {
     size_t p = 0;
     auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (p < data.size()) {
-        if (cancel_)
+        if (cancel_ || ioStop_)
             throw std::runtime_error("Canceled");
         if (std::chrono::steady_clock::now() >= end)
             throw std::runtime_error("Signaling write timeout");
@@ -208,7 +215,7 @@ void SignalSocket::write(const Bytes &data) {
     }
 }
 void SignalSocket::open(const std::string &url, const std::string &token) {
-    close();
+    close();ioStop_=false;
     if (token.find_first_of("\r\n") != std::string::npos)
         throw std::runtime_error("Invalid room token");
     curl_ = curl_easy_init();
@@ -278,19 +285,88 @@ void SignalSocket::open(const std::string &url, const std::string &token) {
         for (auto &m : parser_.feed(reinterpret_cast<const uint8_t *>(response.data() + split),
                                     response.size() - split))
             received_.push_back(std::move(m));
+#ifdef UU_SIGNAL_IO_WORKER
+    ioStats_.enabled=true;
+    ioWorker_=std::thread([this]{runIo();});
+#endif
 }
 void SignalSocket::send(const std::string &text) {
     Bytes b(text.begin(), text.end());
     auto mask = randomBytes(4);
-    write(wsFrame(1, b, {mask[0], mask[1], mask[2], mask[3]}));
+    enqueue(wsFrame(1, b, {mask[0], mask[1], mask[2], mask[3]}));
 }
 void SignalSocket::sendBinary(const Bytes &bytes) {
     if (bytes.empty())
         return;
     auto mask = randomBytes(4);
-    write(wsFrame(2, bytes, {mask[0], mask[1], mask[2], mask[3]}));
+    enqueue(wsFrame(2, bytes, {mask[0], mask[1], mask[2], mask[3]}));
+}
+void SignalSocket::enqueue(Bytes data) {
+    if(!ioWorker_.joinable()) {write(data);return;}
+    {
+        std::lock_guard lock(ioMutex_);
+        if(ioError_)std::rethrow_exception(ioError_);
+        if(ioStop_ || cancel_)throw std::runtime_error("Signaling closed");
+        if(outgoing_.size()>=256 || outgoingBytes_+data.size()>4*1024*1024)
+            throw std::runtime_error("Signaling outgoing queue full");
+        outgoingBytes_+=data.size();outgoing_.push_back(std::move(data));
+    }
+    ioReady_.notify_one();
 }
 bool SignalSocket::receive(WsMessage &message) {
+    if(!ioWorker_.joinable())return receiveNow(message);
+    std::unique_lock lock(ioMutex_);
+    if(!incoming_.empty()) {
+        incomingBytes_-=incoming_.front().data.size();
+        message=std::move(incoming_.front());incoming_.pop_front();
+        lock.unlock();ioReady_.notify_one();return true;
+    }
+    if(ioError_)std::rethrow_exception(ioError_);
+    return false;
+}
+SignalSocket::IoStats SignalSocket::ioStats() {
+    std::lock_guard lock(ioMutex_);
+    auto result=ioStats_;result.outgoing=outgoing_.size();result.incoming=incoming_.size();return result;
+}
+void SignalSocket::runIo() {
+    // After handshake, this thread alone touches curl, parser and raw frames.
+    try {
+        while(!ioStop_ && !cancel_) {
+            Bytes outgoing;bool canRead=false;
+            {
+                std::lock_guard lock(ioMutex_);
+                if(!outgoing_.empty()) {
+                    outgoingBytes_-=outgoing_.front().size();
+                    outgoing=std::move(outgoing_.front());outgoing_.pop_front();
+                }
+                canRead=incoming_.size()<128 && incomingBytes_<=2*1024*1024;
+            }
+            bool progressed=false;
+            if(!outgoing.empty()) {
+                const auto start=std::chrono::steady_clock::now();write(outgoing);
+                const auto us=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count());
+                std::lock_guard lock(ioMutex_);++ioStats_.writes;ioStats_.writeMaxUs=std::max(ioStats_.writeMaxUs,us);
+                progressed=true;
+            }
+            if(canRead) {
+                WsMessage message;const auto start=std::chrono::steady_clock::now();
+                const bool received=receiveNow(message);
+                const auto us=uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count());
+                std::lock_guard lock(ioMutex_);++ioStats_.reads;ioStats_.readMaxUs=std::max(ioStats_.readMaxUs,us);
+                if(received) {
+                    incomingBytes_+=message.data.size();incoming_.push_back(std::move(message));progressed=true;
+                }
+            }
+            if(!progressed) {
+                std::unique_lock lock(ioMutex_);
+                ioReady_.wait_for(lock,std::chrono::milliseconds(4),[this]{return ioStop_ || !outgoing_.empty();});
+            }
+        }
+    } catch(...) {
+        std::lock_guard lock(ioMutex_);ioError_=std::current_exception();
+    }
+}
+bool SignalSocket::receiveNow(WsMessage &message) {
     if (received_.empty()) {
         uint8_t buf[16384];
         size_t n = 0;

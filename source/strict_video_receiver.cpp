@@ -1,4 +1,5 @@
 #include "strict_video_receiver.hpp"
+#include "background.hpp"
 #include "diagnostics.hpp"
 #include <algorithm>
 #include <chrono>
@@ -16,10 +17,12 @@ int64_t clockMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#ifndef UU_LEAN_STATS
 int64_t clockUs() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+#endif
 uint16_t be16(const uint8_t *p) { return uint16_t(p[0] << 8 | p[1]); }
 uint32_t be32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 void nal(std::vector<uint8_t> &out, RtpPayloadView data) {
@@ -175,7 +178,9 @@ StrictVideoReceiver::Stats StrictVideoReceiver::snapshot() {
 }
 
 void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::message_callback &send) {
+#ifndef UU_LEAN_STATS
     const auto processingStarted=clockUs();
+#endif
     std::lock_guard lock(mutex_);
     ++incomingCalls_;
     ++inputBatches_;
@@ -191,8 +196,11 @@ void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::mes
     rtc::message_vector packets;
     packets.swap(messages);
     if (stopped_) {
+#ifndef UU_LEAN_STATS
         const auto wall=uint64_t(std::max<int64_t>(0,clockUs()-processingStarted));
-        incomingTotalUs_+=wall;incomingMaxUs_=std::max(incomingMaxUs_,wall);return;
+        incomingTotalUs_+=wall;incomingMaxUs_=std::max(incomingMaxUs_,wall);
+#endif
+        return;
     }
     send_ = send;
     const auto now = clockMs();
@@ -303,8 +311,10 @@ void StrictVideoReceiver::incoming(rtc::message_vector &messages, const rtc::mes
         else if(repairPaced_) ++repairPrimaryPackets_;
     }
     process(now);
+#ifndef UU_LEAN_STATS
     const auto wall=uint64_t(std::max<int64_t>(0,clockUs()-processingStarted));
     incomingTotalUs_+=wall;incomingMaxUs_=std::max(incomingMaxUs_,wall);
+#endif
 }
 
 bool StrictVideoReceiver::assemble(const Frame &f, int64_t first, std::vector<uint8_t> &out,
@@ -312,7 +322,8 @@ bool StrictVideoReceiver::assemble(const Frame &f, int64_t first, std::vector<ui
     if(hevc_) return assembleHevc(f,first,out,idr,sps,pps,vps);
     // Match receiver's adaptive 4MB frame limit for 1080p high bitrate support
     constexpr size_t maxFrameSize = 4 * 1024 * 1024;
-    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size()));
+    // Leave room for the FFmpeg input tail without moving the finished AU.
+    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size())+64);
     std::vector<uint8_t> fragment;
     bool fragmentOpen = false;
     uint8_t fragmentHeader = 0;
@@ -370,7 +381,8 @@ bool StrictVideoReceiver::assembleHevc(const Frame &f, int64_t first, std::vecto
                                       std::vector<uint8_t> &pps, std::vector<uint8_t> &vps) const {
     // Match receiver's adaptive 4MB frame limit for 1080p high bitrate support
     constexpr size_t maxFrameSize = 4 * 1024 * 1024;
-    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size()));
+    // Leave room for the FFmpeg input tail without moving the finished AU.
+    out.reserve(std::min<size_t>(maxFrameSize,f.bytes+4*f.packets.size())+64);
     // RFC7798 section4.4: SRST, no decoding-order-number field, layer0.
     // Bound output as well as input: aggregation adds Annex-B start codes.
     auto validHeader=[](RtpPayloadView n) {
@@ -390,7 +402,7 @@ bool StrictVideoReceiver::assembleHevc(const Frame &f, int64_t first, std::vecto
     };
     if(first>f.marker || f.marker-first>=4096) return false;
     bool open=false;
-    std::vector<uint8_t> fragment;
+    size_t fragmentStart=0;
     uint8_t header0=0,header1=0;
     auto packet=f.packets.lower_bound(first);
     for(int64_t seq=first;seq<=f.marker;++seq) {
@@ -406,13 +418,21 @@ bool StrictVideoReceiver::assembleHevc(const Frame &f, int64_t first, std::vecto
             if(unit>=48 || (start && end)) return false;
             if(start) {
                 if(open) return false;
-                fragment={h0,h1};header0=h0;header1=h1;open=true;
+                if(out.size()+6>maxFrameSize) return false;
+                fragmentStart=out.size();
+                out.insert(out.end(),{0,0,0,1,h0,h1});
+                header0=h0;header1=h1;open=true;
             } else if(!open || h0!=header0 || h1!=header1) return false;
-            if(fragment.size()+p.size()-3>maxFrameSize) return false;
-            fragment.insert(fragment.end(),p.begin()+3,p.end());
+            if(out.size()+p.size()-3>maxFrameSize) return false;
+            out.insert(out.end(),p.begin()+3,p.end());
             if(end) {
-                if(!append(fragment)) return false;
-                open=false;fragment.clear();
+                const RtpPayloadView n(out.data()+fragmentStart+4,out.size()-fragmentStart-4);
+                if(!validHeader(n)) return false;
+                if(unit>=16 && unit<=20) idr=true;
+                if(unit==32) vps.assign(n.begin(),n.end());
+                if(unit==33) sps.assign(n.begin(),n.end());
+                if(unit==34) pps.assign(n.begin(),n.end());
+                open=false;
             }
         } else if(type==48) {
             if(open) return false;
@@ -436,8 +456,7 @@ void StrictVideoReceiver::retire(std::map<int64_t, Frame>::iterator it, const ch
         noteEvent(reason, clockMs());
     auto &f = it->second;
     if (trace_.size() >= 1500) trace_.pop_front();
-    trace_.push_back(std::to_string(f.timestamp) + "," + std::to_string(f.packets.size()) + "," +
-                         std::to_string(f.bytes) + "," + std::to_string(clockMs() - f.created) + "," + reason);
+    trace_.push_back({f.timestamp,f.packets.size(),f.bytes,clockMs()-f.created,reason});
     // If a future frame is forcibly evicted, don't invalidate earlier queued frames.
     // Normal retirement is always in timestamp order; pressure clears all queued work.
     if (it != frames_.begin()) {
@@ -532,6 +551,9 @@ void StrictVideoReceiver::process(int64_t now) {
             if (waitingIdr_) {
                 if (!idr || sps_.empty() || pps_.empty() || (hevc_ && vps_.empty())) { ++waiting_; retire(it, "wait_idr"); continue; }
                 std::vector<uint8_t> recovery;
+                const size_t prefix=(hevc_ && vps.empty()?4+vps_.size():0)+
+                    (sps.empty()?4+sps_.size():0)+(pps.empty()?4+pps_.size():0);
+                recovery.reserve(prefix+out.size()+64);
                 if (hevc_ && vps.empty()) nal(recovery,vps_);
                 if (sps.empty()) nal(recovery, sps_);
                 if (pps.empty()) nal(recovery, pps_);
@@ -539,7 +561,7 @@ void StrictVideoReceiver::process(int64_t now) {
                 out.swap(recovery);
                 waitingIdr_ = false; ++recoveries_;
             }
-            if (validatedOutput_) validatedOutput_(out.data(), out.size(), f.timestamp, idr);
+            if (validatedOutput_) validatedOutput_(std::move(out), f.timestamp, idr);
             else output_(out.data(), out.size(), f.timestamp);
             ++delivered;
             recentWaitMs_ = int(now - f.created);
@@ -552,7 +574,36 @@ void StrictVideoReceiver::process(int64_t now) {
         if (skipToReadyIdr(now)) continue;
         // Ask for a recovery point before the old deadline expires, while
         // still allowing RTX to complete this frame in parallel.
-        if (now - f.created >= 120 && (f.marker >= 0 || frames_.size() > 1)) pli(now, "pre_deadline_pli");
+        const auto age = now - f.created;
+        if (age >= 120 && (f.marker >= 0 || frames_.size() > 1)) {
+            pli(now, "pre_deadline_pli");
+        } else if (repairPaced_ && !waitingIdr_ && haveBoundary_ && age >= 35 &&
+                   !f.packets.empty() && frames_.size() > 1) {
+            const auto &next = std::next(it)->second;
+            // Use the known marker or the next frame's first observed sequence,
+            // matching the repair scan's bounds for a missing marker.
+            const auto end = f.marker >= 0 ? f.marker :
+                (next.packets.empty() ? -1 : next.packets.begin()->first - 1);
+            const bool headBurst = end >= f.packets.rbegin()->first && end - first < 4096 &&
+                end - first + 1 >= int64_t(f.packets.size()) + 32;
+            bool followingBurst = false;
+            if (!headBurst && !next.packets.empty()) {
+                // A missing head marker cannot hide the following gap. Start at the
+                // first observed packet to count only a lower bound in that case.
+                const auto later = std::next(it, 2);
+                const auto nextFirst = f.marker >= first ? f.marker + 1 : next.packets.begin()->first;
+                const auto nextEnd = next.marker >= 0 ? next.marker :
+                    (later != frames_.end() && !later->second.packets.empty() ?
+                        later->second.packets.begin()->first - 1 : -1);
+                followingBurst = next.packets.begin()->first >= nextFirst &&
+                    nextEnd >= next.packets.rbegin()->first && nextEnd - nextFirst < 4096 &&
+                    nextEnd - nextFirst + 1 >= int64_t(next.packets.size()) + 64;
+            }
+            if (headBurst || followingBurst) {
+                // Keep RTX and the frame deadline active while awaiting an IDR.
+                pli(now, headBurst ? "early_burst_pli" : "early_following_burst_pli");
+            }
+        }
         if (now - f.created >= deadline) { retire(it, anchored ? "missing_packets" : "unproven_start"); continue; }
         break;
     }
@@ -604,7 +655,7 @@ void StrictVideoReceiver::refillRepairBudget(int64_t now) {
 }
 void StrictVideoReceiver::feedback(int64_t now) {
     if (!rtx_ || !send_ || !primary_ || frames_.empty() || now - lastNack_ < 10) return;
-    // One scan per 10 ms in every mode. In preset (non-paced) mode the old
+    // One scan per 10 ms in every mode. In legacy non-paced mode the old
     // code had no scan gate and could walk every buffered frame on every
     // incoming packet; that work is never useful more than 100 times/s.
     if (now - repairScanAt_ < 10) return;
@@ -670,12 +721,16 @@ void StrictVideoReceiver::feedback(int64_t now) {
     send_(packet); ++nacks_; lastNack_ = now;
 }
 void StrictVideoReceiver::tick() {
+#ifndef UU_LEAN_STATS
     const auto processingStarted=clockUs();
+#endif
     std::lock_guard lock(mutex_);
     ++tickCalls_;
     if (!stopped_) process(clockMs());
+#ifndef UU_LEAN_STATS
     const auto wall=uint64_t(std::max<int64_t>(0,clockUs()-processingStarted));
     tickTotalUs_+=wall;tickMaxUs_=std::max(tickMaxUs_,wall);
+#endif
 }
 void StrictVideoReceiver::flush() {
     std::ostringstream info,trace,events;
@@ -717,16 +772,31 @@ void StrictVideoReceiver::flush() {
     for (const auto &line : trace_) trace << line << '\n';
     frames_.clear();requested_.clear();buffered_=retained_=0;
     }
+    // One writer for the shared filenames. A blocked SD write must not grow
+    // a queue of snapshots or delay disconnecting the next session.
+    static std::mutex writerMutex;
+    static std::shared_future<void> writer;
+    std::lock_guard lock(writerMutex);
+    if(writer.valid() && writer.wait_for(std::chrono::seconds(0))!=std::future_status::ready){
+        diagnostic("receiver-diagnostics-writer-busy");
+        return;
+    }
+    try {
+        writer=backgroundTask([info=info.str(),trace=trace.str(),events=events.str()]{
 #ifdef _WIN32
-    _mkdir(directory());
+            _mkdir(directory());
 #else
-    mkdir(directory(), 0777);
+            mkdir(directory(), 0777);
 #endif
-    std::ofstream infoFile(std::string(directory()) + "/receiver_v2.txt");
-    std::ofstream traceFile(std::string(directory()) + "/receiver_v2_frames.csv");
-    std::ofstream eventsFile(std::string(directory()) + "/receiver_events.csv");
-    infoFile<<info.str();traceFile<<trace.str();eventsFile<<events.str();
-    infoFile.flush();traceFile.flush();eventsFile.flush();
-    if(!infoFile || !traceFile || !eventsFile) diagnostic("receiver-diagnostics-write-failed");
+            std::ofstream infoFile(std::string(directory()) + "/receiver_v2.txt");
+            std::ofstream traceFile(std::string(directory()) + "/receiver_v2_frames.csv");
+            std::ofstream eventsFile(std::string(directory()) + "/receiver_events.csv");
+            infoFile<<info;traceFile<<trace;eventsFile<<events;
+            infoFile.close();traceFile.close();eventsFile.close();
+            if(!infoFile || !traceFile || !eventsFile) diagnostic("receiver-diagnostics-write-failed");
+        });
+    }catch(const std::exception &){
+        diagnostic("receiver-diagnostics-schedule-failed");
+    }
 }
 } // namespace uu

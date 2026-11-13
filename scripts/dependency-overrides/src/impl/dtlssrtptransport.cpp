@@ -10,6 +10,9 @@ extern "C" void uu_cpu_mark(unsigned role) noexcept;
  */
 
 #include "dtlssrtptransport.hpp"
+#ifdef UU_PACKET_STAGE_TRACE
+#include "packet_stage_trace.h"
+#endif
 #include "logcounter.hpp"
 #include "rtp.hpp"
 #include "tls.hpp"
@@ -175,9 +178,16 @@ void DtlsSrtpTransport::recvMedia(message_ptr message) {
 	PLOG_VERBOSE << "Demultiplexing SRTCP and SRTP with RTP payload type, value="
 	             << unsigned(value2);
 
+#ifdef UU_PACKET_STAGE_TRACE
+    const auto packetHeader = uu_packet_read(message->data(), message->size());
+#endif
 	if (IsRtcp(*message)) { // Demultiplex RTCP and RTP using payload type
 		PLOG_VERBOSE << "Incoming SRTCP packet, size=" << size;
-		if (srtp_err_status_t err = srtp_unprotect_rtcp(mSrtpIn, message->data(), &size)) {
+        const auto err = srtp_unprotect_rtcp(mSrtpIn, message->data(), &size);
+#ifdef UU_PACKET_STAGE_TRACE
+        uu_packet_stage_record(UU_PACKET_SRTP, packetHeader, int(err));
+#endif
+        if (err) {
 			if (err == srtp_err_status_replay_fail) {
 				PLOG_VERBOSE << "Incoming SRTCP packet is a replay";
 				COUNTER_SRTCP_REPLAY++;
@@ -197,7 +207,11 @@ void DtlsSrtpTransport::recvMedia(message_ptr message) {
 
 	} else {
 		PLOG_VERBOSE << "Incoming SRTP packet, size=" << size;
-		if (srtp_err_status_t err = srtp_unprotect(mSrtpIn, message->data(), &size)) {
+        const auto err = srtp_unprotect(mSrtpIn, message->data(), &size);
+#ifdef UU_PACKET_STAGE_TRACE
+        uu_packet_stage_record(UU_PACKET_SRTP, packetHeader, int(err));
+#endif
+        if (err) {
 			if (err == srtp_err_status_replay_fail) {
 				PLOG_VERBOSE << "Incoming SRTP packet is a replay";
 				COUNTER_SRTP_REPLAY++;

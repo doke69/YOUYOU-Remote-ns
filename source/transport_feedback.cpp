@@ -14,7 +14,8 @@ void dword(std::vector<uint8_t> &out, uint32_t n) {
 }
 } // namespace
 
-TransportSequence readTransportSequence(const uint8_t *rtp, size_t size, uint8_t id) {
+TransportSequence readTransportSequence(const uint8_t *rtp, size_t size, uint8_t id,
+                                        TransportSequenceVersion version) {
     const auto malformed = TransportSequence{ExtensionStatus::Malformed, 0};
     if (!rtp || !id || size < 12 || rtp[0] >> 6 != 2) return malformed;
     const size_t fixed = 12 + 4 * size_t(rtp[0] & 15);
@@ -52,9 +53,14 @@ TransportSequence readTransportSequence(const uint8_t *rtp, size_t size, uint8_t
         }
         if (bytes > end - pos) return malformed;
         if (current == id) {
-            // Do not guess v2 request bytes or accept ambiguous duplicates.
-            if (bytes != 2 || result.status == ExtensionStatus::Found) return malformed;
+            if ((bytes != 2 && !(version == TransportSequenceVersion::V2 && bytes == 4)) ||
+                result.status == ExtensionStatus::Found) return malformed;
             result = {ExtensionStatus::Found, be16(rtp + pos)};
+            if (bytes == 4) {
+                const auto bits = be16(rtp + pos + 2);
+                const auto count = uint16_t(bits & 0x7fff);
+                if (count) result.request = FeedbackRequest{bool(bits & 0x8000), count};
+            }
         }
         pos += bytes;
     }
@@ -64,7 +70,7 @@ TransportSequence readTransportSequence(const uint8_t *rtp, size_t size, uint8_t
 EncodedFeedback encodeFeedback(uint32_t senderSsrc, uint32_t mediaSsrc,
     uint16_t baseSequence, uint8_t feedbackCount,
     const std::vector<std::optional<int64_t>> &arrivals, size_t mtu,
-    std::optional<int64_t> emptyReferenceUs) {
+    std::optional<int64_t> emptyReferenceUs, bool includeTimestamps) {
     EncodedFeedback result;
     if (arrivals.empty() || arrivals.size() > 512 || mtu < 24 || mtu > 1200) return result;
     // Restrict the supported time domain so all subtraction/rounding is safe.
@@ -84,6 +90,9 @@ EncodedFeedback encodeFeedback(uint32_t senderSsrc, uint32_t mediaSsrc,
     deltas.reserve(2 * arrivals.size());
     for (size_t i = 0; i < arrivals.size(); ++i) {
         if (!arrivals[i]) continue;
+        // TV 799ddc..799e80: T=0 bypasses delta calculation and uses zero
+        // delta/small-received for each received sequence, with no delta bytes.
+        if (!includeTimestamps) { symbols[i] = 1; continue; }
         const int64_t delta = *arrivals[i] - reconstructed;
         // Carry reconstructed time forward, so quantization error cannot drift
         // once per packet. Negative deltas preserve sequence-order reordering.
@@ -138,9 +147,11 @@ EncodedFeedback encodeFeedback(uint32_t senderSsrc, uint32_t mediaSsrc,
     return result;
 }
 
-RecordedArrival ArrivalWindow::record(uint16_t sequence, int64_t arrivalUs) {
+RecordedArrival ArrivalWindow::record(uint16_t sequence, int64_t arrivalUs,
+    bool evictOldest, std::optional<int64_t> protectedFirst) {
     if (arrivalUs < 0 || arrivalUs > (int64_t(1) << 55)) return {ArrivalStatus::InvalidTime, 0};
     int64_t extended = sequence;
+    int64_t evictBefore = first_;
     if (initialized_) {
         const auto delta = uint16_t(sequence - uint16_t(highest_));
         if (delta == 32768) return {ArrivalStatus::AmbiguousSequence, 0};
@@ -156,10 +167,14 @@ RecordedArrival ArrivalWindow::record(uint16_t sequence, int64_t arrivalUs) {
             // Startup reordering can extend the first window before anything
             // has been committed; do not guess a reset after later retirement.
         } else if (extended - first_ >= int64_t(Capacity)) {
-            return {ArrivalStatus::WindowFull, extended};
+            if (!evictOldest) return {ArrivalStatus::WindowFull, extended};
+            evictBefore = extended - int64_t(Capacity) + 1;
+            if (protectedFirst && evictBefore > *protectedFirst)
+                return {ArrivalStatus::WindowFull, extended};
         }
         const auto &slot = slots_[index(extended)];
         if (slot.sequence == extended) return {ArrivalStatus::Duplicate, extended};
+        if (evictBefore > first_) { first_ = evictBefore; retired_ = true; }
     }
     if (!initialized_) {
         first_ = highest_ = extended;
@@ -217,7 +232,8 @@ std::optional<int64_t> ArrivalWindow::arrivalAt(int64_t sequence) const {
     return slot.arrivalUs;
 }
 
-FeedbackCoordinator::FeedbackCoordinator(FeedbackTiming timing) : timing_(timing) {
+FeedbackCoordinator::FeedbackCoordinator(FeedbackTiming timing, FeedbackMode mode)
+    : timing_(timing), mode_(mode) {
     if (timing.intervalUs <= 0 || timing.intervalUs > 1000000 ||
         timing.reorderHoldUs < 0 || timing.reorderHoldUs > 1000000 ||
         timing.lookbackPackets > ArrivalWindow::Capacity / 2)
@@ -228,56 +244,103 @@ bool FeedbackCoordinator::reported(int64_t sequence) const {
     return reported_[size_t(uint64_t(sequence) & (ArrivalWindow::Capacity - 1))] == sequence;
 }
 RecordedArrival FeedbackCoordinator::record(uint16_t sequence, int64_t arrivalUs) {
-    return history_.record(sequence, arrivalUs);
+    std::optional<int64_t> protectedFirst;
+    if (mode_ == FeedbackMode::Requested) {
+        for (size_t i = 0; i < requestCount_; ++i) {
+            const auto next = requests_[(requestHead_ + i) % RequestCapacity].next;
+            protectedFirst = protectedFirst ? std::min(*protectedFirst, next) : next;
+        }
+    }
+    return history_.record(sequence, arrivalUs, mode_ == FeedbackMode::Requested, protectedFirst);
+}
+RequestStatus FeedbackCoordinator::request(int64_t sequence, FeedbackRequest request) {
+    if (mode_ != FeedbackMode::Requested) return RequestStatus::WrongMode;
+    if (!request.sequenceCount) return RequestStatus::NoRequest;
+    if (request.sequenceCount > 32767 || sequence == std::numeric_limits<int64_t>::max() ||
+        sequence < std::numeric_limits<int64_t>::min() + request.sequenceCount - 1)
+        return RequestStatus::InvalidRange;
+    const auto first = sequence - request.sequenceCount + 1;
+    const auto retained = history_.firstSequence();
+    const auto anchor = history_.arrivalAt(sequence);
+    if (!retained || !anchor)
+        return RequestStatus::HistoryUnavailable;
+    if (requestCount_ == RequestCapacity) return RequestStatus::QueueFull;
+    // TV clips the history iterator but keeps the original request base.
+    // An unretained prefix is not acknowledged, not proven network loss.
+    int64_t referenceUs = *anchor;
+    for (auto seq = std::max(first, *retained); seq < sequence; ++seq) {
+        if (const auto time = history_.arrivalAt(seq)) { referenceUs = *time; break; }
+    }
+    requests_[(requestHead_ + requestCount_) % RequestCapacity] = {first, sequence, request.includeTimestamps, referenceUs};
+    ++requestCount_;
+    return first < *retained ? RequestStatus::QueuedWithUnretainedPrefix : RequestStatus::Queued;
 }
 
 const PreparedFeedback *FeedbackCoordinator::prepare(int64_t nowUs, uint32_t senderSsrc,
     uint32_t mediaSsrc, size_t mtu) {
     if (nowUs < 0 || nowUs > (int64_t(1) << 55)) return nullptr;
     if (pending_) return &pending_->report;
-    if (lastSentAtUs_ && (nowUs < *lastSentAtUs_ || nowUs - *lastSentAtUs_ < timing_.intervalUs))
+    if (mode_ == FeedbackMode::Periodic && lastSentAtUs_ &&
+        (nowUs < *lastSentAtUs_ || nowUs - *lastSentAtUs_ < timing_.intervalUs))
         return nullptr;
     const auto first = history_.firstSequence(), highest = history_.lastSequence();
-    if (!first || !highest || !nextTicket_ ||
-        *highest > std::numeric_limits<int64_t>::max() - 512 ||
-        *first < std::numeric_limits<int64_t>::min() + 512) return nullptr;
+    if (!first || !highest || !nextTicket_) return nullptr;
+    if (mode_ == FeedbackMode::Periodic &&
+        (*highest > std::numeric_limits<int64_t>::max() - 512 ||
+         *first < std::numeric_limits<int64_t>::min() + 512)) return nullptr;
     const int64_t cursor = cursor_.value_or(*first);
-    int64_t begin = cursor, end = cursor - 1;
+    int64_t begin = cursor, end = cursor;
     bool overlap = false;
-    // Report genuinely late, not-previously-reported arrivals first. Already
-    // reported arrivals in an overlapping range get no second delta.
-    for (auto seq = *first; seq < cursor && seq <= *highest; ++seq) {
-        const auto arrival = history_.arrivalAt(seq);
-        if (arrival && !reported(seq) && *arrival <= nowUs) {
-            begin = seq;
-            end = std::min(cursor - 1, begin + 511);
-            overlap = true;
-            break;
-        }
-    }
-    if (!overlap) {
-        if (begin > *highest) return nullptr;
-        // A mature observed packet proves a safe right edge; unknown trailing
-        // packets are never manufactured beyond the highest observed sequence.
-        // Look past the first 512 positions: a long all-missing prefix must
-        // still make progress toward a later mature packet within the window.
-        for (auto seq = begin; seq <= *highest; ++seq) {
+    bool includeTimestamps = true;
+    int64_t emptyReferenceUs = nowUs;
+    if (mode_ == FeedbackMode::Requested) {
+        if (!requestCount_) return nullptr;
+        const auto &request = requests_[requestHead_];
+        begin = request.next;
+        end = begin + std::min<int64_t>(511, request.last - begin);
+        includeTimestamps = request.includeTimestamps;
+        emptyReferenceUs = request.referenceUs;
+        if (emptyReferenceUs > nowUs) return nullptr;
+    } else {
+        end = cursor - 1;
+        // Report genuinely late, not-previously-reported arrivals first. Already
+        // reported arrivals in an overlapping range get no second delta.
+        for (auto seq = *first; seq < cursor && seq <= *highest; ++seq) {
             const auto arrival = history_.arrivalAt(seq);
-            if (arrival && *arrival <= nowUs && nowUs - *arrival >= timing_.reorderHoldUs) end = seq;
+            if (arrival && !reported(seq) && *arrival <= nowUs) {
+                begin = seq;
+                end = std::min(cursor - 1, begin + 511);
+                overlap = true;
+                break;
+            }
         }
-        if (end < begin) return nullptr;
-        end = std::min(end, begin + 511);
+        if (!overlap) {
+            if (begin > *highest) return nullptr;
+            // A mature observed packet proves a safe right edge; unknown trailing
+            // packets are never manufactured beyond the highest observed sequence.
+            // Look past the first 512 positions: a long all-missing prefix must
+            // still make progress toward a later mature packet within the window.
+            for (auto seq = begin; seq <= *highest; ++seq) {
+                const auto arrival = history_.arrivalAt(seq);
+                if (arrival && *arrival <= nowUs && nowUs - *arrival >= timing_.reorderHoldUs) end = seq;
+            }
+            if (end < begin) return nullptr;
+            end = std::min(end, begin + 511);
+        }
     }
-    auto slice = history_.snapshot(begin, size_t(end - begin + 1));
+    auto slice = mode_ == FeedbackMode::Periodic ? history_.snapshot(begin, size_t(end - begin + 1)) :
+        std::optional<ArrivalSlice>(ArrivalSlice{begin, std::vector<std::optional<int64_t>>(size_t(end - begin + 1))});
     if (!slice) return nullptr;
     for (size_t i = 0; i < slice->timesUs.size(); ++i) {
-        if (reported(begin + int64_t(i))) slice->timesUs[i].reset();
+        if (mode_ == FeedbackMode::Requested) slice->timesUs[i] = history_.arrivalAt(begin + int64_t(i));
+        if (mode_ == FeedbackMode::Periodic && reported(begin + int64_t(i))) slice->timesUs[i].reset();
         // Clock anomalies must not be reported as fabricated missing packets.
         if (slice->timesUs[i] && *slice->timesUs[i] > nowUs) return nullptr;
     }
     EncodedFeedback encoded;
     for (;;) {
-        encoded = encodeFeedback(senderSsrc, mediaSsrc, uint16_t(begin), feedbackCount_, slice->timesUs, mtu, nowUs);
+        encoded = encodeFeedback(senderSsrc, mediaSsrc, uint16_t(begin), feedbackCount_,
+                                 slice->timesUs, mtu, emptyReferenceUs, includeTimestamps);
         if (encoded.status == EncodeStatus::Ok) break;
         size_t count = 0;
         if (encoded.status == EncodeStatus::SplitRequired) count = encoded.splitBefore;
@@ -302,13 +365,22 @@ const PreparedFeedback *FeedbackCoordinator::prepare(int64_t nowUs, uint32_t sen
 bool FeedbackCoordinator::commit(uint64_t ticket, int64_t sentAtUs) {
     if (!pending_ || pending_->report.ticket != ticket || sentAtUs < pending_->preparedAtUs ||
         sentAtUs > (int64_t(1) << 55) || (lastSentAtUs_ && sentAtUs < *lastSentAtUs_)) return false;
-    for (const auto seq : pending_->received)
-        reported_[size_t(uint64_t(seq) & (ArrivalWindow::Capacity - 1))] = seq;
-    if (!pending_->report.overlap) cursor_ = pending_->report.lastSequence + 1;
+    if (mode_ == FeedbackMode::Requested) {
+        auto &request = requests_[requestHead_];
+        request.next = pending_->report.lastSequence + 1;
+        if (request.next > request.last) {
+            requestHead_ = (requestHead_ + 1) % RequestCapacity;
+            --requestCount_;
+        }
+    } else {
+        for (const auto seq : pending_->received)
+            reported_[size_t(uint64_t(seq) & (ArrivalWindow::Capacity - 1))] = seq;
+        if (!pending_->report.overlap) cursor_ = pending_->report.lastSequence + 1;
+    }
     lastSentAtUs_ = sentAtUs;
     ++feedbackCount_;
     pending_.reset();
-    retireHistory();
+    if (mode_ == FeedbackMode::Periodic) retireHistory();
     return true;
 }
 void FeedbackCoordinator::retireHistory() {
@@ -328,6 +400,7 @@ void FeedbackCoordinator::reset() {
     reported_.fill(Empty);
     pending_.reset(); cursor_.reset(); lastSentAtUs_.reset();
     feedbackCount_ = 0;
+    requestHead_ = requestCount_ = 0;
     // Do not reuse a ticket after reset: stale send completions must fail.
 }
 

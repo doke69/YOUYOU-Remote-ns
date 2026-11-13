@@ -27,7 +27,7 @@
     "dependency": "libdatachannel",
     "path": "src/impl/dtlssrtptransport.cpp",
     "upstream_sha256": "02116bedf7e9789fcbd8d0e25422cb5d74c0b1c3fe2fe998e61d32d11d46ad6d",
-    "sha256": "aa779fba24265431738e7d45c243964ca1f7a8b286a2d6156909afba5c553789"
+    "sha256": "085cb093b2414d826dce16e1b996db0ccdd255f13655b759513e485b5946b07a"
   },
   {
     "dependency": "libdatachannel",
@@ -39,7 +39,7 @@
     "dependency": "libdatachannel",
     "path": "src/impl/dtlstransport.cpp",
     "upstream_sha256": "516e7d10f3ae05808655923c3e1a99ba54de937459fe73c15fb08e6951c1fd83",
-    "sha256": "c45a55a98900776e2815902a08e38ac4a090d4bb4b406c03a253c5c9a285af71"
+    "sha256": "7155e4b4d302dd24637f85670cc0204a51df22ded174b88d46b2728e2c758ce7"
   },
   {
     "dependency": "libdatachannel",
@@ -57,7 +57,7 @@
     "dependency": "libdatachannel",
     "path": "src/impl/peerconnection.cpp",
     "upstream_sha256": "3dcbb89a28f950ab2babd17f9d20cc5e8d422985943786ef508dfeafdbae5bb2",
-    "sha256": "80449060754fae37d21b4d061f78219c7aaadea206c58d323ba73659507231e8"
+    "sha256": "75499c4b25e66d0d4e90e58c1ee9d93fa7e38090cf340dde75e3cf96421f1a22"
   },
   {
     "dependency": "libdatachannel",
@@ -115,9 +115,15 @@
   },
   {
     "dependency": "libdatachannel",
+    "path": "include/rtc/rtcpreceivingsession.hpp",
+    "upstream_sha256": "293bbe1d619e13bfd716675c1e02f2deed3ffb2edff9ef91de4c51034216cd2d",
+    "sha256": "9f0716fc9b4f08ebe962ccdb4aa2d452e4992e483c40cac08591cb4899289cc6"
+  },
+  {
+    "dependency": "libdatachannel",
     "path": "src/rtcpreceivingsession.cpp",
     "upstream_sha256": "561deaf604f468b20538a36c5d994fc5f2f63c0d1d63481578d2d9caf956a780",
-    "sha256": "55541e89c2b9b7275f58484af4be132e24154f8dd3705702439ca38b5ba62956"
+    "sha256": "402e52cca1aa436880d05b31ae0884e58214b946fcd6b47ef0ee4872c6ed792f"
   },
   {
     "dependency": "libjuice",
@@ -135,7 +141,7 @@
     "dependency": "libjuice",
     "path": "deps/libjuice/src/conn_poll.c",
     "upstream_sha256": "d0a86b4a781d06e26cd06a0ed886c995b8bf2f094a610d393b066d62bdc0a049",
-    "sha256": "b5f5ae2ed5b16154ad7bbdc5c390e23143fe0a3b3a5629922cd814a5c6d1a04b"
+    "sha256": "4dc35fd0696b5ce5b66845e90c7d2ed7b296d845361ed072303141293b794011"
   },
   {
     "dependency": "libjuice",
@@ -159,7 +165,7 @@
     "dependency": "libjuice",
     "path": "deps/libjuice/src/udp.c",
     "upstream_sha256": "0ba72cd827d67c52e86e33ff385ce14df9d7b868727dd174d303eefcec0cc09b",
-    "sha256": "490e80390374fda988773b9fe8efcbe77b1017e66c6d9fa3feec7d1db6418f8e"
+    "sha256": "28bb766f60c58ac1d4c236f008cc49673ec5f0ee4893124a3ca64c3a4295d96e"
   },
   {
     "dependency": "usrsctp",
@@ -189,12 +195,18 @@
     "dependency": "libdatachannel",
     "path": "src/impl/dtlstransport.hpp",
     "upstream_sha256": "ec3a9ecb29448cdcc16ddc1fdda1db79dbf2088485a936eace231d3bef2ea51b",
-    "sha256": "ad22d2eb83bc20451f310a6cf5e3285e7ca6803f7d208bbb33b6631564085934"
+    "sha256": "c1d0533266f4f7a239d42aecf9546f488a7257091a10e5d9dbcb8beb908bb4f2"
   },
   {
     "dependency": "libjuice",
     "path": "deps/libjuice/src/addr.c",
     "upstream_sha256": "0798c56fb9127b05187d2cf4a0f0cddbf3eb6d1a5e70fbfc1f411f1db0f21234",
     "sha256": "40ff153379f76b24b8ae8c9bad73be62e8a44c78c33afc3766926ba9519d65d1"
+  },
+  {
+    "dependency": "libjuice",
+    "path": "deps/libjuice/src/udp.h",
+    "upstream_sha256": "fc2ac4c7c620c5f733ad2c34218838a2983bd68b5b9f7801ad0d3733c5d087c9",
+    "sha256": "418dbd781d16c0dd79c90f5b7d24472ab08f7f19fa3298efe6cec830d0c437de"
   }
 ]

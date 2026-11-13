@@ -1,5 +1,8 @@
 #include "background.hpp"
 #include "rtc_signaling.hpp"
+#include "dtls_rx_diagnostics.hpp"
+#include <atomic>
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +25,10 @@ int loopback() {
     std::mutex mutex;
     std::condition_variable cv;
     bool input = false, picture = false, audio = false;
+    unsigned pictures=0,inputs=0;uint32_t lastTimestamp=0;bool ordered=true,payloadIntact=true;
+    rtc::binary bulkFrame(1204,std::byte{0x5a});
+    bulkFrame[0]=bulkFrame[1]=bulkFrame[2]=std::byte{0};bulkFrame[3]=std::byte{1};bulkFrame[4]=std::byte{0x65};
+    std::atomic<bool> slowConsumer{false};
     int result = 1;
     {
         rtc::Configuration config;
@@ -79,10 +86,15 @@ int loopback() {
             std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence);
         depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
         receiver->setMediaHandler(depacketizer);
-        receiver->onFrame([&](rtc::binary data, rtc::FrameInfo) {
+        receiver->onFrame([&](rtc::binary data, rtc::FrameInfo info) {
+            // Deliberately slow the synchronous consumer to exercise a queued
+            // authenticated-media burst without relying on machine speed.
+            if(slowConsumer.load())std::this_thread::sleep_for(std::chrono::milliseconds(1));
             std::lock_guard lock(mutex);
+            ordered=ordered && info.timestamp>lastTimestamp;lastTimestamp=info.timestamp;++pictures;
             picture = data == rtc::binary{std::byte{0},    std::byte{0},    std::byte{0},   std::byte{1},
                                           std::byte{0x65}, std::byte{0x42}, std::byte{0x17}};
+            payloadIntact=payloadIntact && (picture || data==bulkFrame);
             cv.notify_all();
         });
         rtc::Description::Video send("0", rtc::Description::Direction::SendOnly);
@@ -109,6 +121,7 @@ int loopback() {
                     std::string value(reinterpret_cast<const char *>(data.data()), data.size());
                     std::lock_guard lock(mutex);
                     input = value == "{\"action\":\"kbd_press\",\"key\":87}";
+                    if(input)++inputs;
                     cv.notify_all();
                 },
                 nullptr);
@@ -140,6 +153,63 @@ int loopback() {
             cv.wait_until(lock, until, [&] { return input && picture && audio; });
             if (input && picture && audio)
                 result = 0;
+            lock.unlock();
+            if(result==0) {
+                constexpr unsigned count=128;
+                const auto before=uu::dtlsRxDiagnostics();
+                slowConsumer=true;
+                std::thread burst([&] {
+                    for(unsigned i=2;i<count+2;++i) {
+                        std::array<uint8_t,1212> rtp;rtp.fill(0x5a);
+                        const uint8_t header[]={0x80,0xe0,uint8_t(i>>8),uint8_t(i),
+                            uint8_t(i>>24),uint8_t(i>>16),uint8_t(i>>8),uint8_t(i),0,0,4,0xd2,0x65};
+                        std::copy(std::begin(header),std::end(header),rtp.begin());
+                        sender->send(reinterpret_cast<const std::byte *>(rtp.data()),rtp.size());
+                    }
+                });
+                {
+                    std::unique_lock ready(mutex);
+                    cv.wait_until(ready,until,[&]{return pictures>=9;});
+                }
+                const auto sentAt=std::chrono::steady_clock::now();
+                control->send(reinterpret_cast<const std::byte *>(message.data()),message.size());
+                const auto controlUs=std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now()-sentAt).count();
+                burst.join();
+                {
+                    std::unique_lock ready(mutex);
+                    cv.wait_until(ready,until,[&]{return pictures>=count+1 && inputs>=2;});
+                    if(pictures!=count+1 || inputs<2 || !ordered || !payloadIntact)result=1;
+                }
+                slowConsumer=false;
+                const auto after=uu::dtlsRxDiagnostics();
+#ifdef UU_RECEIVE_TIMESTAMPS
+                if(after.timingEnabled && after.inputAgeSamples<before.inputAgeSamples+count)result=1;
+#endif
+#ifndef UU_MEDIA_DISPATCH
+                if(after.timingEnabled && after.bounded && after.yields<=before.yields)result=1;
+#endif
+                if(!after.timingEnabled && (after.reads || after.sends || after.inputAgeSamples))result=1;
+                std::cout<<"synthetic-burst frames="<<pictures<<" control-send-us="<<controlUs
+                         <<" timing="<<after.timingEnabled<<" bounded="<<after.bounded
+                         <<" yields="<<(after.yields-before.yields)<<'\n';
+                // Fast-consumer large-packet burst: no artificial sleep and no
+                // timing assertion. Check throughput can progress without loss.
+                for(unsigned i=count+2;i<count+514;++i) {
+                    std::array<uint8_t,1212> rtp;rtp.fill(0x5a);
+                    const uint8_t header[]={0x80,0xe0,uint8_t(i>>8),uint8_t(i),
+                        uint8_t(i>>24),uint8_t(i>>16),uint8_t(i>>8),uint8_t(i),0,0,4,0xd2,0x65};
+                    std::copy(std::begin(header),std::end(header),rtp.begin());
+                    sender->send(reinterpret_cast<const std::byte *>(rtp.data()),rtp.size());
+                }
+                {
+                    std::unique_lock ready(mutex);
+                    cv.wait_until(ready,until,[&]{return pictures>=count+513;});
+                    if(pictures!=count+513 || !ordered || !payloadIntact)result=1;
+                    std::cout<<"fast-burst frames="<<pictures<<" ordered="<<ordered
+                             <<" payload-intact="<<payloadIntact<<'\n';
+                }
+            }
         }
         controller->resetCallbacks();
         host->resetCallbacks();

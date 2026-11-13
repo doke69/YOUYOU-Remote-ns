@@ -10,6 +10,7 @@ struct QualityApplicationTarget {
     int fps=0;
     int quality=0;
     int bitrateMbps=0;
+    bool bitrateRequested=false; // Includes explicit zero used to clear a limit.
 };
 
 // Actual values observed from CaptureSettingSync during the current request.
@@ -32,9 +33,8 @@ struct QualityEvidence {
     }
 };
 
-// A complete match requires the requested capture fields. A Custom bitrate is
-// required only when the request actually carries Custom mode and a positive
-// limit; preset mode may carry a local cap that is not sent to the host.
+// A positive ceiling is sent independently of the native quality enum. It
+// requires its own evidence; acknowledging quality alone cannot confirm it.
 inline bool qualityApplicationMatches(const QualityApplicationTarget &target,
                                       const QualityEvidence &evidence) noexcept {
     if(!evidence.fpsKnown || !evidence.qualityKnown ||
@@ -43,7 +43,7 @@ inline bool qualityApplicationMatches(const QualityApplicationTarget &target,
     if(evidence.fps!=target.fps || evidence.quality!=target.quality ||
        evidence.width!=target.width || evidence.height!=target.height)
         return false;
-    if(target.quality==6 && target.bitrateMbps>0 &&
+    if((target.bitrateMbps>0 || target.bitrateRequested) &&
        (!evidence.bitrateKnown || evidence.bitrateMbps!=target.bitrateMbps))
         return false;
     return true;

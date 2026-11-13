@@ -1,0 +1,70 @@
+{
+  "schema": 1,
+  "date": "2026-11-04",
+  "purpose": "User-required no-change boundary for codec/native GPU/playback; existing local contents are not reset",
+  "source_root": "C:/uu/current/YOUYOU-Remote-ns",
+  "head": "ba4d7f9f8f87f4a47e4d872db3dd0ca526718f8b",
+  "scope_limit": "Listed files only. Shared Client/CMake/dependency hunks require separate review; no full process behavior guarantee.",
+  "files": [
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/source/media.cpp",
+      "exists": true,
+      "sha256": "43c080af6b9de832d6315e22645af37fffafb3e5534557c61917c0bbd21c8244",
+      "bytes": 70309
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/media.hpp",
+      "exists": true,
+      "sha256": "42d14b346e6fe031a975f72599e00a7b4f652a4856db02bd224ebf57f2821a8e",
+      "bytes": 4485
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/source/native_display.cpp",
+      "exists": true,
+      "sha256": "8c7c4a56a62b95fc256ab29e625ea2250464eda8d5a9b79cf977573fef93f433",
+      "bytes": 24073
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/native_display.hpp",
+      "exists": true,
+      "sha256": "7c6bcd7fd52901d87cd9cebd29919a3ea545263d5f80836c7c48eaf4e4adeed6",
+      "bytes": 1132
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/source/strict_video_receiver.cpp",
+      "exists": true,
+      "sha256": "38f7c2f0478c6eb948ba5d55bea7eeabb4538ada915c59c28d1f417b69e7eb55",
+      "bytes": 37114
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/strict_video_receiver.hpp",
+      "exists": true,
+      "sha256": "9383c925e6bd7d01d2c7e6e0c5665643e4945a23f3d234a2b05e284c3088a638",
+      "bytes": 7160
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/source/media_dispatch_queue.cpp",
+      "exists": true,
+      "sha256": "8c8bb97efa3d0241133ac787083c368d4ed5b98befa5d6aa631b157d8f8129f1",
+      "bytes": 4996
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/media_dispatch_queue.hpp",
+      "exists": true,
+      "sha256": "856da28b8c398b4a0b8e4a34fe6e073a5931edf2e2b51bb427b413d4ded43153",
+      "bytes": 2118
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/media_integrity.hpp",
+      "exists": true,
+      "sha256": "cb6dc9899d728d5889f71eae049e02a17fab93b555e0305c182550a067e6bf00",
+      "bytes": 1068
+    },
+    {
+      "path": "C:/uu/current/YOUYOU-Remote-ns/include/playout_policy.hpp",
+      "exists": true,
+      "sha256": "556f2a6898b803cf20a06153fde777893fdd6a6a2d11e9200db2da0c677498dc",
+      "bytes": 866
+    }
+  ]
+}

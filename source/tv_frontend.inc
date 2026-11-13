@@ -4,7 +4,7 @@ namespace tvui {
 constexpr SDL_Color bg{30,30,33,255}, panel{49,53,60,255}, blue{58,123,252,255},
     label{176,179,184,255}, ink{255,255,255,255};
 enum class Page {Home,Devices,Toolbar,Display,Quality,Picture,Peripherals,Gamepad,
-    Schemes,Guide,More,Network,Safety,Windows,Account,Login,Disconnect,Bitrate=18,Resolution,Codec,Touch,Keyboard,Stats,InputMode,Mouse,Audio,QualityPreset,Playout,Logout,About,WindowsConfirm,AppLaunch,StreamPreview,XboxLayout,DecodeProfile,ScreenProtection};
+    Schemes,Guide,More,Network,Safety,Windows,Account,Login,Disconnect,Bitrate=18,Resolution,Codec,Touch,Keyboard,Stats,InputMode,Mouse,Audio,QualityPreset,Playout,Logout,About,WindowsConfirm,AppLaunch,StreamPreview,XboxLayout,DecodeProfile,ScreenProtection,Vibration,ControllerGuide,ControllerLegend};
 struct Frame {Page page; int focus=0;};
 enum class Kind {Button,Menu,Icon,Tile,Shortcut,Tab,Toggle};
 struct Button {SDL_Rect box; std::string title; int action; bool enabled=true; bool chosen=false;std::string value;Kind kind=Kind::Button;};
@@ -253,14 +253,16 @@ void homeHotkeys(SDL_Renderer *r,Fonts &f) {
     aligned(r,f.small,"长按退出应用，返回启动器",{110,582,590,38},label);
     rounded(r,{775,410,420,208},panel,14);
     aligned(r,f.hint,"串流操作",{797,424,376,28},label);
-    key(797,463,false);
-    aligned(r,f.small,"长按切换：手柄 / 键鼠",{842,458,330,38},ink);
-    key(797,519,true);
-    aligned(r,f.small,"打开串流菜单",{842,514,330,38},ink);
-    aligned(r,f.hint,"键鼠模式按一下；手柄模式长按",{797,565,376,28},label);
+    aligned(r,f.small,"在外设中修改操控模式",{797,458,376,38},ink);
+    rounded(r,{797,519,32,30},SDL_Color{64,71,82,255},6);
+    aligned(r,f.small,"L",{797,519,32,30},ink,true);
+    aligned(r,f.small,"+",{833,519,28,30},label,true);
+    key(865,519,true);
+    aligned(r,f.small,"打开 / 收起菜单",{910,514,264,38},ink);
+    aligned(r,f.hint,"按住 L，再按 ＋；两种模式通用",{797,559,376,32},label);
 }
 bool opensPage(int a) {
-    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||a==514||(a>=47 && a<=58)||a==70||a==757||a==613||(a>=74 && a<=76);
+    return (a>=10 && a<=14)||(a>=20 && a<=31)||(a>=42 && a<=45)||a==514||(a>=47 && a<=58)||a==70||a==757||a==613||a==617||a==618||a==784||(a>=74 && a<=76);
 }
 void loginHeader(SDL_Renderer *r,Fonts &f) {
     backdrop(r);brand(r,f);
@@ -286,18 +288,18 @@ void smsLogin(SDL_Renderer *r,Fonts &f,const SmsForm &sms,int remaining,bool bus
 const char *buttonIcon(int action,const std::string &) {
     if(action>=1000 && action<1100)return "device";
     switch(action){case 99:return "back";case 10:return "device";case 90:return "refresh";case 11:return "account";
-    case 13:case 23:case 50:case 53:case 613:return "gamepad";case 14:case 21:return "display";case 20:case 58:return "exit";
+    case 13:case 23:case 50:case 53:case 613:case 617:return "gamepad";case 618:return "guide";case 14:case 21:return "display";case 20:case 58:return "exit";
     case 22:return "safety";case 24:return "more";case 25:return "windows";
     case 30:return "fps";case 31:return "picture";case 51:return "guide";case 48:return "sound";
-    case 54:return "touch";case 55:return "keyboard";case 59:return "mouse";case 70:return "device";case 57:return "account";default:return nullptr;}
+    case 54:return "touch";case 55:case 2316:return "keyboard";case 59:return "mouse";case 70:return "device";case 57:return "account";default:return nullptr;}
 }
 
 bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
     std::vector<Frame> stack{{Page::Login,0}};
     std::vector<Button> buttons;
     int scheme=1,draft=1,fps=snapshot.fps==30?30:60;
-    int resolution=720,codec=1,quality=2,bufferMs=16,touchMode=0,inputMode=0,volume=75,mouseSpeed=2;
-    bool vsync=true,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true,networkOverlay=false,nativeMultitouch=true;
+    int resolution=720,codec=1,quality=2,bufferMs=0,touchMode=0,inputMode=0,volume=75,mouseSpeed=2;
+    bool vsync=false,sound=true,autoUnlock=false,autoLock=false,remoteMute=true,restoreSound=true,networkOverlay=false,nativeMultitouch=true;
     int previewPrivacyMode=1;
     const char *qualityNames[]={"省流","清晰","高清","原画"};
     const int qualityMbps[]={5,12,20,30};
@@ -407,7 +409,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             text(r,f.small,second?"ZL  鼠标右键":"ZL  滚轮向上",100,222,label,320);
             text(r,f.small,second?"L Ctrl   短按 − Tab":"L Alt   短按 − Windows",100,269,label,340);
             text(r,f.small,second?"ZR  鼠标左键":"ZR  滚轮向下",885,222,label,300);
-            text(r,f.small,second?"R Alt   按 + 打开菜单":"R Tab   按 + 打开菜单",885,269,label,300);
+            text(r,f.small,second?"R Alt   L + ＋ 菜单":"R Tab   L + ＋ 菜单",885,269,label,300);
             for(int i=0;i<4;++i) {
                 text(r,f.normal,head[i],90+i*300,408,{149,191,255,255});
                 std::string lines=second?two[i]:one[i];size_t start=0;int line=0;
@@ -425,12 +427,12 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             aligned(r,f.small,nativeMultitouch?"像平板一样，直接触摸电脑画面":"滑动画面移动指针，轻点执行左键",{848,365,376,45},label);
             aligned(r,f.small,nativeMultitouch?"支持多指操作，由电脑应用响应":"按住左键按钮，再用另一指拖动",{848,415,376,45},label);
             aligned(r,f.small,nativeMultitouch?"适合触屏应用与多点手势":"右侧滑动条滚动，旁边按钮为中键",{848,465,376,45},label);break;
-        case Page::Mouse:title="鼠标速度";{const char *names[]={"慢速","标准","快速","很快"};for(int i=0;i<4;++i)row(i,names[i],620+i,true,mouseSpeed==i);}break;
+        case Page::Mouse:title="鼠标设置";{const char *names[]={"慢速","标准","快速","很快"};for(int i=0;i<4;++i)row(i,names[i],620+i,true,mouseSpeed==i);row(4,"恢复鼠标指针",759,false);}break;
         case Page::Audio:title="声音";row(0,"播放声音",630,true,false,sound?"开启":"关闭");{int values[]={25,50,75,100};for(int i=0;i<4;++i)row(i+1,std::to_string(values[i])+"%",640+values[i],true,volume==values[i]);}break;
         case Page::Guide:title="操作说明";
             rounded(r,{90,160,1100,420},panel,12);
-            {const char *left[]={"首页退出","键鼠模式","手柄模式","触屏操作","切换模式"};
-             const char *right[]={"首页长按加号键退出应用，返回启动器","用摇杆和按键操作电脑；按一下加号键打开菜单","长按加号键打开菜单，按一下为游戏菜单键","外设中可选平板多点触控，或手机鼠标指针","串流中长按减号键，在手柄和键鼠操作之间切换"};
+            {const char *left[]={"首页退出","串流菜单","游戏菜单","触屏操作","切换模式"};
+             const char *right[]={"在首页长按 ＋，退出应用并返回启动器","按住 L，再按 ＋ 打开或收起菜单；两种模式通用","手柄直连时单独按 ＋，操作电脑游戏的菜单","外设中可选平板多点触控，或手机鼠标指针","进入外设的输入模式页面，选择后确认切换"};
              for(int i=0;i<5;++i){aligned(r,f.normal,left[i],{120,185+i*72,200,56},ink);aligned(r,f.small,right[i],{355,185+i*72,800,56},label);}}break;
         case Page::More:
         case Page::Network:title=page==Page::More?"更多 · 网络信息":"网络信息";{
@@ -463,8 +465,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             aligned(r,f.hint,"遮蔽电脑画面，远程操作继续",{868,248,336,44},label);
             add(848,320,376,64,"关闭显示屏",756,true,previewPrivacyMode==3,"",Kind::Toggle);
             aligned(r,f.hint,"使用电脑端增强隐私功能",{868,392,336,44},label);
-            aligned(r,f.hint,"两种模式只能开启一种",{848,466,376,40},label);
-            aligned(r,f.hint,"离线演示，不会操作电脑",{848,526,376,80},label);break;
+            aligned(r,f.hint,"离线演示，不会操作电脑",{848,448,376,80},label);break;
         case Page::Windows:title="Windows 快捷操作";
             row(0,"锁定桌面",74);row(1,"重启电脑",75);row(2,"关机",76);
             row(3,"任务管理器",72);row(4,"显示桌面",71);row(5,"切换窗口",73);break;
@@ -548,7 +549,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             }else {
                 const bool arrow=opensPage(b.action);const int left=asset?64:20;
                 const bool radio=page==Page::Quality?(b.action==40 || b.action==41):
-                    page==Page::Bitrate || page==Page::Resolution || page==Page::Codec || page==Page::QualityPreset || page==Page::Playout || page==Page::InputMode || page==Page::Touch || page==Page::Mouse || (page==Page::Audio && b.action!=630);
+                    page==Page::Bitrate || page==Page::Resolution || page==Page::Codec || page==Page::QualityPreset || page==Page::Playout || page==Page::InputMode || page==Page::Touch || (page==Page::Mouse && b.action>=620 && b.action<=623) || (page==Page::Audio && b.action!=630);
                 int right=(arrow||radio)?48:20,vw=0,vh=0;TTF_SizeUTF8(f.small,b.value.c_str(),&vw,&vh);vw=std::min(vw,140);
                 if(asset)image(r,asset,{b.box.x+20,b.box.y+(b.box.h-26)/2,26,26});
                 if(vw)aligned(r,f.small,b.value,{b.box.x+b.box.w-right-vw,b.box.y,vw,b.box.h},tint);
@@ -650,7 +651,7 @@ bool preview(SDL_Renderer *r,Fonts &f,const uu::Snapshot &snapshot) {
             if(page==Page::Playout && action!=99){bufferMs=action-550;back();continue;}
             if(page==Page::InputMode && action!=99){inputMode=action-600;back();continue;}
             if(page==Page::Touch && (action==610 || action==614)){nativeMultitouch=action==614;continue;}
-            if(page==Page::Mouse && action!=99){mouseSpeed=action-620;back();continue;}
+            if(page==Page::Mouse && action>=620 && action<=623){mouseSpeed=action-620;back();continue;}
             if(page==Page::Audio && action>=665){volume=action-640;continue;}
             switch(action) {
             case 99:back();break;case 10:push(Page::Devices);break;case 11:push(Page::Account);break;

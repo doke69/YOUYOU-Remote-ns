@@ -1,5 +1,7 @@
 #pragma once
 #include "rtp_jitter.hpp"
+#include "video_supply_trace.hpp"
+#include "video_repair_trace.hpp"
 #include <cstdint>
 #include <mutex>
 #include <set>
@@ -10,11 +12,12 @@
 
 namespace uu {
 struct NetworkStats {
-    double lossPercent = -1;   // Observed initial sequence gaps; before RTX recovery
+    uint32_t ssrc = 0;         // primary RTP SSRC; zero before the first packet
+    double initialGapPercent = -1; // Initial sequence gaps per newly expected RTP sequence
     double jitterMs = -1;      // RFC 3550 interarrival jitter
     double bitrateMbps = -1;   // RTP bitrate over the last window
     uint64_t packets = 0;      // total RTP packets received
-    uint64_t lost = 0;         // total RTP packets missing (sequence gaps)
+    uint64_t initialGapPackets = 0; // Sequences first observed as missing, before repair
     uint64_t nackSent = 0;     // RTCP NACK packets sent
     uint64_t rtxRecovered = 0; // RTX retransmission packets received
 };
@@ -32,7 +35,12 @@ struct StreamStatsSnapshot {
     std::string localEndpoint = "—", remoteEndpoint = "—";
     double presentFps = -1;
     int requestedFps = 0, maxBitrateMbps = 0;
+    // bitrateFeedbackSent means the local media handler accepted the compound
+    // REMB SRTCP submission. It is not a PC acknowledgement. rembTargetBps is
+    // the last locally accepted target; actual PC output remains video.bitrateMbps.
     bool bitrateFeedbackSent = false;
+    uint32_t rembTargetBps = 0, rembSenderSsrc = 0, rembMediaSsrc = 0;
+    uint64_t rembAcceptedCount = 0, rembDeferredCount = 0;
     uint64_t qualitySent=0,qualityAcked=0,qualityFailed=0;
     uint64_t touchPackets=0,touchFailures=0;unsigned touchPoints=0;
     bool qualityPending=false;
@@ -84,13 +92,14 @@ struct StreamStatsSnapshot {
 // handles NACK/RTX and exposes recovered packets and final AU retirement.
 class RtpTrackStats : public rtc::MediaHandler {
   public:
-    RtpTrackStats(unsigned clockRate, std::string name, bool rtx = false);
+    RtpTrackStats(unsigned clockRate, std::string name, bool rtx = false,
+                  std::shared_ptr<VideoSupplyTrace> trace = {},uint64_t generation = 0,
+                  std::shared_ptr<VideoRepairTrace> repair = {});
     ~RtpTrackStats() override;
     void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override;
     NetworkStats snapshot();
 
   private:
-    void packet(const uint8_t *data, size_t size);
     void info(const uint8_t *data, size_t size);
     void flushDiagnostics();
 
@@ -98,17 +107,19 @@ class RtpTrackStats : public rtc::MediaHandler {
     const unsigned clockRate_;
     const std::string name_;
     const bool rtx_;
+    const std::shared_ptr<VideoSupplyTrace> supplyTrace_;
+    const std::shared_ptr<VideoRepairTrace> repairTrace_;
+    const uint64_t supplyGeneration_;
     bool started_ = false;
     uint32_t expected_ = 0; // extended sequence number of the next packet
-    uint64_t received_ = 0, lost_ = 0;
+    uint64_t received_ = 0, initialGapPackets_ = 0;
     RtpJitterTracker jitterTracker_;
     int64_t windowStart_ = 0;
-    uint64_t windowReceived_ = 0, windowLost_ = 0, windowBytes_ = 0;
-    double windowLoss_ = -1, windowJitter_ = -1, windowBitrate_ = -1;
+    uint64_t windowExpected_ = 0, windowGapPackets_ = 0, windowBytes_ = 0;
+    double windowGapPercent_ = -1, windowJitter_ = -1, windowBitrate_ = -1;
     // RTX / NACK recovery
     uint8_t videoPayloadType_ = 255;
     uint32_t videoSsrc_ = 0;
-    uint32_t latestTimestamp_ = 0;
     std::vector<uint16_t> pendingNack_;
     int64_t lastNackMs_ = 0;
     uint64_t nacksSent_ = 0, rtxPackets_ = 0;

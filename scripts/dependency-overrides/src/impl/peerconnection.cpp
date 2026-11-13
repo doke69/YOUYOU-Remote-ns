@@ -557,10 +557,15 @@ void PeerConnection::forwardMedia([[maybe_unused]] message_ptr message) {
 		message_vector messages{std::move(message)};
 
 		try {
-			handler->incomingChain(messages, [weak_this = weak_from_this()](message_ptr message) {
+			// Bind the feedback endpoint once. Retaining this callback must not
+			// redirect an old report to a replacement authenticated transport.
+			const weak_ptr<DtlsTransport> expected = std::atomic_load(&mDtlsTransport);
+			handler->incomingChain(messages, [weak_this = weak_from_this(), expected](message_ptr message) {
 				auto self = weak_this.lock();
-				if (!self) throw std::runtime_error("Media feedback connection expired");
-				auto transport = std::atomic_load(&self->mDtlsTransport);
+				auto transport = expected.lock();
+				if (!self || !transport || self->closing.load() || self->state.load() == State::Closed ||
+				    std::atomic_load(&self->mDtlsTransport) != transport)
+					throw std::runtime_error("Media feedback transport expired");
 				auto srtpTransport = std::dynamic_pointer_cast<DtlsSrtpTransport>(transport);
 				if (!srtpTransport || !srtpTransport->sendMedia(std::move(message)))
 					throw std::runtime_error("Media feedback submission failed");

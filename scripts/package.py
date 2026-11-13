@@ -13,7 +13,7 @@ parser.add_argument('--allow-private-signing-material',action='store_true',help=
 args=parser.parse_args()
 if not args.allow_private_signing_material:
     parser.error('The NRO embeds locally supplied signing material. Review docs/distribution.md; use --allow-private-signing-material only for a local/private package.')
-version = re.search(r'project\(UURemote-ns VERSION ([\d.]+)',
+version = re.search(r'set\(UU_BUILD_LABEL "([^"]+)"',
                     (ROOT/'CMakeLists.txt').read_text(encoding='utf-8')).group(1)
 source = ROOT/'build-nx/UURemote-ns.nro'
 manifest_source = ROOT/'build-nx/UURemote-ns.manifest.json'
@@ -55,11 +55,14 @@ COMMON_NOTES = """UU Remote NS {version} — 面向 23.0.1 / 大气层(AMS) 1.12
 
 安装
 1. 确认设备已有可用的完整应用模式homebrew环境；本安装包不升级系统或大气层。
-2. 将压缩包内的 switch 目录解压到 SD 卡根目录，得到：
+2. 0.4beta 请全新安装：正常退出旧程序，将旧 switch/UURemote-ns 文件夹备份到电脑，
+   再清空 SD 卡上该文件夹的全部内容。不要将旧配置、会话或其他旧文件复制回新目录。
+3. 将压缩包内的 switch 目录解压到 SD 卡根目录，得到：
    switch/UURemote-ns/UURemote-ns.nro
-3. 在主机上按住 R 键启动任意游戏，进入完整内存模式 hbmenu，再运行 UU Remote NS。
+4. 首次启动需重新登录并设置。
+   在主机上按住 R 键启动任意游戏，进入完整内存模式 hbmenu，再运行 UU Remote NS。
    不支持相册小程序模式（内存不足），程序会给出提示。
-4. 首页底部会显示机型 · 模式 · 系统版本，请确认显示正确。
+5. 首页底部会显示机型 · 模式 · 系统版本，请确认显示正确。
 
 注意
 - 本程序为非官方实验版，需要官方电脑端和账号；此本地NRO内置构建者提供的签名材料，不是已清理的公开发行包。
@@ -76,7 +79,7 @@ LITE_NOTES = COMMON_NOTES + """
 Switch Lite（HDH-001）
 - 无 TV 输出，程序恒为掌机 720p 模式。
 - 触屏始终可用；一体化手柄可直接操作。
-- 新配置默认720p60、20Mbps、H.265、8ms播放缓冲及垂直同步；按实际网络和设备表现调整。
+- 新配置默认720p60、12Mbps、H.265、0ms播放缓冲、垂直同步关闭，手柄布局默认按字母；按实际网络和设备表现调整。
 """
 
 (ROOT/'dist/安装说明-Switch.txt').write_text(

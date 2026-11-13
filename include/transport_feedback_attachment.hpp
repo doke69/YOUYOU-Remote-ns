@@ -4,7 +4,7 @@
 
 namespace uu::twcc {
 class AuthenticatedFeedbackEndpoint;
-enum class FeedbackAttachmentState { Observing, WaitingForEndpoint, Sending, Stopped, Faulted };
+enum class FeedbackAttachmentState { Observing, WaitingForEndpoint, Sending, Stopped, Faulted, WaitingForRequest, WaitingForExtension };
 // One instance for one final validated offer/answer + transport generation.
 // Caller attaches this globally ONLY after inspectNegotiationSdp returns Ready.
 // If another global handler exists, append this as the LAST node: this library's
@@ -21,6 +21,9 @@ class FeedbackAttachment final : public rtc::MediaHandler {
     // for sender identity, rate budget or retry policy.
     bool startSending(std::shared_ptr<SharedRtcpBudget> budget, FeedbackSendPolicy policy,
                       uint32_t senderSsrc, uint32_t mediaSsrc);
+    // Also polls pre-send admission: missing negotiated RTP extensions time
+    // out after media is observed, independently of sender creation. Merely
+    // waiting for the first media packet does not start that deadline.
     FeedbackPollResult poll(int64_t nowUs);
     void stop(); // Waits for an in-flight short submission; never re-enable.
     FeedbackAttachmentState state() const;
@@ -31,6 +34,9 @@ class FeedbackAttachment final : public rtc::MediaHandler {
     std::shared_ptr<AuthenticatedFeedbackEndpoint> endpoint_;
     mutable std::mutex controlMutex_;
     std::unique_ptr<FeedbackSender> sender_;
+    const TransportSequenceVersion version_;
+    std::optional<int64_t> startupSinceUs_, lastPollUs_;
+    FeedbackStopReason faultReason_ = FeedbackStopReason::None;
     FeedbackAttachmentState state_ = FeedbackAttachmentState::Observing;
     std::atomic<bool> sendingRequested_{false};
 };

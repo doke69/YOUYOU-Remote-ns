@@ -104,6 +104,7 @@ FeedbackPollResult FeedbackSender::poll(int64_t nowUs) {
             return FeedbackPollResult::BudgetDeferred;
         }
         bool accepted = false;
+        counters_.attemptedBytes += compound.size();
         try { accepted = submit_(compound); }
         catch (...) { accepted = false; } // Never log callback exception text/input.
         if (!accepted) {
@@ -115,9 +116,10 @@ FeedbackPollResult FeedbackSender::poll(int64_t nowUs) {
             nextAttemptUs_ = nowUs + retryDelayUs_;
             return FeedbackPollResult::SendFailed;
         }
+        ++counters_.submitted;
+        counters_.submittedBytes += compound.size();
         if (!observer_->commit(pending->ticket, nowUs))
             return fail(FeedbackStopReason::CommitRejected);
-        ++counters_.submitted;
         ticket_ = 0; pendingSinceUs_.reset(); consecutiveFailures_ = 0;
         retryDelayUs_ = 0; nextAttemptUs_ = 0;
         return FeedbackPollResult::Submitted;

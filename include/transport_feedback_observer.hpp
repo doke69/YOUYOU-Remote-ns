@@ -12,6 +12,8 @@ struct ObservationCounters {
     uint64_t accepted = 0, duplicates = 0, missingExtension = 0;
     uint64_t malformed = 0, unsupportedProfile = 0, missingTimestamp = 0;
     uint64_t tooOld = 0, windowFull = 0, ambiguous = 0, invalidTime = 0;
+    uint64_t requestsQueued = 0, requestHistoryUnavailable = 0, requestQueueFull = 0, requestInvalid = 0;
+    uint64_t requestsWithUnretainedPrefix = 0;
 };
 // Construct on the heap before streaming. Attach ONLY as the PeerConnection's
 // global authenticated media handler (before per-track RTX unwrap), never at
@@ -34,6 +36,8 @@ class TransportFeedbackObserver final : public rtc::MediaHandler {
     void reset();
   private:
     const uint8_t extensionId_;
+    const TransportSequenceVersion version_;
+    const uint8_t legacyExtensionId_;
     mutable std::mutex mutex_;
     FeedbackCoordinator coordinator_;
     ObservationCounters counters_;

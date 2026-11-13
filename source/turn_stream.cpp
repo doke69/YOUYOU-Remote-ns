@@ -1,4 +1,6 @@
 #include "turn_stream.hpp"
+#include "turn_relay_allocation.hpp"
+#include <mutex>
 #include "diagnostics.hpp"
 #include <atomic>
 #include <chrono>
@@ -48,6 +50,8 @@ struct TurnStreamBridge::Impl {
     bool tls;
     std::atomic<bool> stop{false},failure{false};
     std::thread worker;
+    std::mutex relayMutex;
+    std::optional<TurnRelayAllocation> relay;
     Impl(std::string hostname,uint16_t port,bool secure):host(std::move(hostname)),remotePort(port),tls(secure) {
         if(host.empty() || host.find_first_of("/?#@\r\n")!=std::string::npos || !port)
             throw std::runtime_error("Invalid TURN stream endpoint");
@@ -147,6 +151,11 @@ struct TurnStreamBridge::Impl {
                     while(incoming.size()-used>=4) {
                         const auto frame=framing(incoming.data()+used,incoming.size()-used);
                         if(!frame.wire || incoming.size()-used<frame.wire) break;
+                        // Observe allocation metadata only. libjuice still owns
+                        // TURN authentication and selected-candidate validation.
+                        if(auto allocation=readTurnRelayAllocation(incoming.data()+used,frame.payload)) {
+                            std::lock_guard lock(relayMutex);relay=*allocation;
+                        }
                         const auto sent=sendto(udp,incoming.data()+used,frame.payload,0,reinterpret_cast<sockaddr *>(&client),sizeof(client));
                         if(sent!=static_cast<ssize_t>(frame.payload)) throw std::runtime_error("TURN local delivery failed");
                         used+=frame.wire;
@@ -174,6 +183,18 @@ uint16_t TurnStreamBridge::localPort() const {
     return impl_->boundPort;
 #else
     return 0;
+#endif
+}
+bool TurnStreamBridge::matchesRelay(const std::string &address,uint16_t port) const {
+#ifdef __SWITCH__
+    TurnRelayAllocation candidate;candidate.port=port;
+    if(inet_pton(AF_INET,address.c_str(),candidate.address.data())==1)candidate.family=1;
+    else if(inet_pton(AF_INET6,address.c_str(),candidate.address.data())==1)candidate.family=2;
+    else return false;
+    std::lock_guard lock(impl_->relayMutex);
+    return impl_->relay && *impl_->relay==candidate;
+#else
+    (void)address;(void)port;return false;
 #endif
 }
 bool TurnStreamBridge::failed() const {

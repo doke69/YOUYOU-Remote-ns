@@ -35,7 +35,11 @@ bool MediaDispatchQueue::enqueue(rtc::message_ptr message) {
             ++stats_.overflow;
             return false; // Integration must explicitly handle overload, including SRTCP.
         }
-        queue_.push_back({std::move(message),charge,std::chrono::steady_clock::now()});
+        Item item{std::move(message),charge,{}};
+#ifndef UU_LEAN_STATS
+        item.received=std::chrono::steady_clock::now();
+#endif
+        queue_.push_back(std::move(item));
         ++stats_.accepted;
         stats_.queued=queue_.size();stats_.retainedBytes+=charge;
         stats_.highPackets=std::max(stats_.highPackets,stats_.queued+stats_.inFlight);
@@ -71,9 +75,11 @@ void MediaDispatchQueue::drain() {
             if (stats_.stopped || queue_.empty()) {scheduled_=false;return;}
             item=std::move(queue_.front());queue_.pop_front();
             stats_.queued=queue_.size();stats_.inFlight=1;inFlightBytes_=item.charge;
+#ifndef UU_LEAN_STATS
             const auto waited=std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now()-item.received).count();
             stats_.maxWaitUs=std::max(stats_.maxWaitUs,uint64_t(std::max<int64_t>(0,waited)));
+#endif
         }
         try {
             // No queue lock during media callbacks, feedback or endpoint teardown.

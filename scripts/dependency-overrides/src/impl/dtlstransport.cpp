@@ -27,6 +27,42 @@
 
 using namespace std::chrono;
 
+#include "dtls_rx_diagnostics.hpp"
+#ifdef UU_DTLS_STAGE_TIMING
+namespace {
+std::atomic<uint64_t> diagReads{0},diagYields{0},diagReadTotalUs{0},diagReadMaxUs{0};
+std::atomic<uint64_t> diagSends{0},diagSendWaitTotalUs{0},diagSendWaitMaxUs{0},diagSendTotalUs{0},diagSendMaxUs{0};
+std::atomic<uint64_t> diagInputAgeSamples{0},diagInputAgeMaxUs{0};
+void recordMaximum(std::atomic<uint64_t> &value,uint64_t sample) {
+    auto old=value.load(std::memory_order_relaxed);
+    while(old<sample && !value.compare_exchange_weak(old,sample,std::memory_order_relaxed)) {}
+}
+}
+#endif
+namespace uu {
+DtlsRxDiagnostics dtlsRxDiagnostics() noexcept {
+    DtlsRxDiagnostics result;
+#ifdef UU_DTLS_RX_BUDGET
+    result.bounded=true;
+#endif
+#ifdef UU_DTLS_STAGE_TIMING
+    result.timingEnabled=true;
+    result.reads=diagReads.load(std::memory_order_relaxed);
+    result.yields=diagYields.load(std::memory_order_relaxed);
+    result.readTotalUs=diagReadTotalUs.load(std::memory_order_relaxed);
+    result.readMaxUs=diagReadMaxUs.load(std::memory_order_relaxed);
+    result.sends=diagSends.load(std::memory_order_relaxed);
+    result.sendWaitTotalUs=diagSendWaitTotalUs.load(std::memory_order_relaxed);
+    result.sendWaitMaxUs=diagSendWaitMaxUs.load(std::memory_order_relaxed);
+    result.sendTotalUs=diagSendTotalUs.load(std::memory_order_relaxed);
+    result.sendMaxUs=diagSendMaxUs.load(std::memory_order_relaxed);
+    result.inputAgeSamples=diagInputAgeSamples.load(std::memory_order_relaxed);
+    result.inputAgeMaxUs=diagInputAgeMaxUs.load(std::memory_order_relaxed);
+#endif
+    return result;
+}
+}
+
 namespace rtc::impl {
 
 void DtlsTransport::enqueueRecv() {
@@ -484,13 +520,28 @@ bool DtlsTransport::send(message_ptr message) {
 
 	int ret;
 	do {
+#ifdef UU_DTLS_STAGE_TIMING
+		const auto waitStarted=steady_clock::now();
+#endif
 		std::lock_guard lock(mSslMutex);
+#ifdef UU_DTLS_STAGE_TIMING
+		const auto sendStarted=steady_clock::now();
+		const auto waitUs=uint64_t(duration_cast<microseconds>(sendStarted-waitStarted).count());
+		diagSendWaitTotalUs.fetch_add(waitUs,std::memory_order_relaxed);
+		recordMaximum(diagSendWaitMaxUs,waitUs);
+#endif
 		if (message->size() > size_t(mbedtls_ssl_get_max_out_record_payload(&mSsl)))
 			return false;
 
 		mCurrentDscp = message->dscp;
 		ret = mbedtls_ssl_write(&mSsl, reinterpret_cast<const unsigned char *>(message->data()),
 		                        message->size());
+#ifdef UU_DTLS_STAGE_TIMING
+		const auto sendUs=uint64_t(duration_cast<microseconds>(steady_clock::now()-sendStarted).count());
+		diagSends.fetch_add(1,std::memory_order_relaxed);
+		diagSendTotalUs.fetch_add(sendUs,std::memory_order_relaxed);
+		recordMaximum(diagSendMaxUs,sendUs);
+#endif
 	} while (!mbedtls::check(ret));
 
 	return mOutgoingResult;
@@ -572,13 +623,36 @@ void DtlsTransport::doRecv() {
 		if (state() == State::Connected) {
 			while (true) {
 				int ret;
+				bool yielded=false;
 				{
 					std::lock_guard lock(mSslMutex);
+					mReadMediaCount=0;mReadYielded=false;
+#ifdef UU_DTLS_RX_BUDGET
+					mReadBudgetActive=true;
+#endif
+#if defined(UU_DTLS_STAGE_TIMING) || defined(UU_DTLS_RX_BUDGET)
+					mReadStarted=steady_clock::now();
+#endif
 					ret = mbedtls_ssl_read(&mSsl, reinterpret_cast<unsigned char *>(buffer),
 					                       bufferSize);
+					mReadBudgetActive=false;yielded=mReadYielded;
+#ifdef UU_DTLS_STAGE_TIMING
+					const auto readUs=uint64_t(duration_cast<microseconds>(steady_clock::now()-mReadStarted).count());
+					diagReads.fetch_add(1,std::memory_order_relaxed);
+					diagReadTotalUs.fetch_add(readUs,std::memory_order_relaxed);
+					recordMaximum(diagReadMaxUs,readUs);
+#endif
 				}
 
 				if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+					if(yielded) {
+#ifdef UU_DTLS_STAGE_TIMING
+						diagYields.fetch_add(1,std::memory_order_relaxed);
+#endif
+						// Reserve the next existing-pool job before returning. The
+						// usual CAS coalesces arrivals and timers; the FIFO stays intact.
+						enqueueRecv();
+					}
 					return;
 				}
 
@@ -660,8 +734,30 @@ int DtlsTransport::ReadCallback(void *ctx, unsigned char *buf, size_t len) {
 			}
 
 			message_ptr message = std::move(*next);
-			if (t->demuxMessage(message))
+
+#if defined(UU_RECEIVE_TIMESTAMPS) && defined(UU_DTLS_STAGE_TIMING)
+			// Same steady-clock domain as IceTransport::RecvCallback. Observe
+			// local scheduling/queue age without replacing the feedback timestamp.
+			if(message->receivedAtUs>=0) {
+				const auto nowUs=duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+				const auto ageUs=nowUs-message->receivedAtUs;
+				if(ageUs>=0) {
+					diagInputAgeSamples.fetch_add(1,std::memory_order_relaxed);
+					recordMaximum(diagInputAgeMaxUs,uint64_t(ageUs));
+				}
+			}
+#endif
+			if (t->demuxMessage(message)) {
+				if(t->mReadBudgetActive) {
+					++t->mReadMediaCount;
+					if(t->mReadMediaCount>=64 ||
+					   steady_clock::now()-t->mReadStarted>=milliseconds(2)) {
+						t->mReadYielded=true;
+						return MBEDTLS_ERR_SSL_WANT_READ;
+					}
+				}
 				continue;
+			}
 			if (t->state() == State::Connecting && !t->mDiagHandshakeRx.exchange(true)) {
 				PLOG_INFO << "UU_DIAG_DTLS_RX_DELIVERED";
 			}

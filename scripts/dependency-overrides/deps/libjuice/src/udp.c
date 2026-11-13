@@ -16,6 +16,46 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#if defined(__SWITCH__) && defined(UU_UDP_RX_CPU_TIMING)
+#include <switch/arm/counter.h>
+#include <switch/kernel/svc.h>
+#include <switch/kernel/thread.h>
+#include <switch/result.h>
+#endif
+
+#ifdef UU_UDP_SEND_TIMING
+#include "udp_send_diagnostics.h"
+static uu_udp_stage_sample uu_udp_totals[UU_UDP_STAGE_COUNT];
+uint64_t uu_udp_now_us(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter,frequency;
+    QueryPerformanceCounter(&counter);QueryPerformanceFrequency(&frequency);
+    return (uint64_t)(counter.QuadPart / frequency.QuadPart)*1000000 +
+           (uint64_t)(counter.QuadPart % frequency.QuadPart)*1000000/(uint64_t)frequency.QuadPart;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC,&now);
+    return (uint64_t)now.tv_sec*1000000+(uint64_t)now.tv_nsec/1000;
+#endif
+}
+void uu_udp_record(enum uu_udp_stage stage,uint64_t elapsed) {
+    uu_udp_stage_sample *s=&uu_udp_totals[stage];
+    __atomic_fetch_add(&s->calls,1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&s->total_us,elapsed,__ATOMIC_RELAXED);
+    if(elapsed>=16000)__atomic_fetch_add(&s->ge16ms,1,__ATOMIC_RELAXED);
+    uint64_t maximum=__atomic_load_n(&s->max_us,__ATOMIC_RELAXED);
+    while(elapsed>maximum && !__atomic_compare_exchange_n(&s->max_us,&maximum,elapsed,1,
+                                                         __ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+}
+void uu_udp_snapshot(uu_udp_stage_sample result[UU_UDP_STAGE_COUNT]) {
+    for(int i=0;i<UU_UDP_STAGE_COUNT;++i) {
+        result[i].calls=__atomic_load_n(&uu_udp_totals[i].calls,__ATOMIC_RELAXED);
+        result[i].total_us=__atomic_load_n(&uu_udp_totals[i].total_us,__ATOMIC_RELAXED);
+        result[i].max_us=__atomic_load_n(&uu_udp_totals[i].max_us,__ATOMIC_RELAXED);
+        result[i].ge16ms=__atomic_load_n(&uu_udp_totals[i].ge16ms,__ATOMIC_RELAXED);
+    }
+}
+#endif
 
 #ifdef __SWITCH__
 // Setup-only numeric readback from the actual ICE socket. No packet payload,
@@ -244,11 +284,59 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 	return INVALID_SOCKET;
 }
 
+#if defined(UU_UDP_RX_TRACE) && defined(__SWITCH__)
+static int udp_recvfrom_impl(socket_t sock, char *buffer, size_t size, addr_record_t *src,
+                             uu_udp_rx_sample *sample) {
+#else
 int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+#endif
 	while (true) {
 		src->len = sizeof(src->addr);
+#if defined(UU_UDP_RX_TRACE) && defined(__SWITCH__)
+#ifdef UU_UDP_RX_CPU_TIMING
+		u64 cpu_before = 0;
+		Result cpu_status = 0;
+		uint64_t cpu_window_start = 0;
+		if (sample) {
+			cpu_window_start = uu_udp_now_us();
+			cpu_status = svcGetInfo(&cpu_before, InfoType_ThreadTickCount,
+			                        threadGetCurHandle(), TickCountInfo_Total);
+		}
+#endif
+		const uint64_t call_start = sample ? uu_udp_now_us() : 0;
+#endif
 		int len =
 		    recvfrom(sock, buffer, (socklen_t)size, 0, (struct sockaddr *)&src->addr, &src->len);
+#if defined(UU_UDP_RX_TRACE) && defined(__SWITCH__)
+		if (sample) {
+			const int saved_errno = errno;
+			const uint64_t call_end = uu_udp_now_us();
+			const uint64_t elapsed = call_end - call_start;
+			if (elapsed >= 8000) {
+				++sample->recv_slow_calls;
+				if (elapsed > sample->recv_end_us - sample->recv_start_us) {
+					sample->recv_start_us = call_start;
+					sample->recv_end_us = call_end;
+					sample->recv_batch = 0;
+#ifdef UU_UDP_RX_CPU_TIMING
+					u64 cpu_after = 0;
+					if (R_SUCCEEDED(cpu_status))
+						cpu_status = svcGetInfo(&cpu_after, InfoType_ThreadTickCount,
+						                        threadGetCurHandle(), TickCountInfo_Total);
+					const uint64_t cpu_window_end = uu_udp_now_us();
+					const bool valid = R_SUCCEEDED(cpu_status) && cpu_after >= cpu_before;
+					sample->recv_cpu_window_us = cpu_window_end - cpu_window_start;
+					sample->recv_cpu_us = valid ? armTicksToNs(cpu_after - cpu_before) / 1000 : 0;
+					sample->recv_cpu_valid = valid;
+					sample->recv_cpu_status = cpu_status;
+#endif
+					sample->recv_result = len;
+					sample->recv_errno = len < 0 ? saved_errno : 0;
+				}
+			}
+			errno = saved_errno;
+		}
+#endif
 		if (len >= 0) {
 			addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
 
@@ -268,21 +356,67 @@ int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
 	}
 }
 
-int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
+#if defined(UU_UDP_RX_TRACE) && defined(__SWITCH__)
+int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+	return udp_recvfrom_impl(sock, buffer, size, src, NULL);
+}
+
+int udp_recvfrom_traced(socket_t sock, char *buffer, size_t size, addr_record_t *src,
+                        uu_udp_rx_sample *sample) {
+	return udp_recvfrom_impl(sock, buffer, size, src, sample);
+}
+#endif
+
+int udp_sendto_family(socket_t sock, const char *data, size_t size, const addr_record_t *dst, int family) {
+#ifdef UU_UDP_SEND_TIMING
+    const uint64_t address_start=uu_udp_now_us();
+#endif
 #ifndef __linux__
 	addr_record_t tmp = *dst;
-	addr_record_t name;
-	name.len = sizeof(name.addr);
-	if (getsockname(sock, (struct sockaddr *)&name.addr, &name.len) == 0) {
-		if (name.addr.ss_family == AF_INET6)
-			addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-	} else {
-		JLOG_WARN("getsockname failed, errno=%d", sockerrno);
-	}
-	return sendto(sock, data, (socklen_t)size, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
+    if(family==AF_UNSPEC) {
+        addr_record_t name;name.len=sizeof(name.addr);
+        if(getsockname(sock,(struct sockaddr *)&name.addr,&name.len)==0)
+            family=name.addr.ss_family;
+        else JLOG_WARN("getsockname failed, errno=%d",sockerrno);
+    }
+    if(family==AF_INET6)addr_map_inet6_v4mapped(&tmp.addr,&tmp.len);
+#ifdef UU_UDP_SEND_TIMING
+    uu_udp_record(UU_UDP_ADDRESS,uu_udp_now_us()-address_start);
+    const uint64_t syscall_start=uu_udp_now_us();
+    int ret=sendto(sock,data,(socklen_t)size,0,(const struct sockaddr *)&tmp.addr,tmp.len);
 #else
-	return sendto(sock, data, size, 0, (const struct sockaddr *)&dst->addr, dst->len);
+    return sendto(sock,data,(socklen_t)size,0,(const struct sockaddr *)&tmp.addr,tmp.len);
 #endif
+#else
+    (void)family;
+#ifdef UU_UDP_SEND_TIMING
+    (void)address_start;
+    const uint64_t syscall_start=uu_udp_now_us();
+    int ret=sendto(sock,data,size,0,(const struct sockaddr *)&dst->addr,dst->len);
+#else
+    return sendto(sock,data,size,0,(const struct sockaddr *)&dst->addr,dst->len);
+#endif
+#endif
+#ifdef UU_UDP_SEND_TIMING
+    const int saved_error=sockerrno;
+    const uint64_t syscall_end = uu_udp_now_us();
+    const uint64_t elapsed = syscall_end - syscall_start;
+    uu_udp_record(UU_UDP_SYSCALL, elapsed);
+#if defined(__SWITCH__) && defined(UU_UDP_RX_TRACE)
+    if (elapsed >= UU_UDP_SEND_SLOW_US)
+        uu_udp_send_slow_record(syscall_start, syscall_end);
+#endif
+#ifdef _WIN32
+    WSASetLastError(saved_error);
+#else
+    errno=saved_error;
+#endif
+    return ret;
+#endif
+}
+
+int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
+    return udp_sendto_family(sock,data,size,dst,AF_UNSPEC);
 }
 
 int udp_sendto_self(socket_t sock, const char *data, size_t size) {
@@ -312,24 +446,19 @@ int udp_sendto_self(socket_t sock, const char *data, size_t size) {
 #endif
 }
 
-int udp_set_diffserv(socket_t sock, int ds) {
+int udp_set_diffserv_family(socket_t sock, int ds, int family) {
 #ifdef _WIN32
 	// IP_TOS has been intentionally broken on Windows in favor of a convoluted proprietary
 	// mechanism called qWave. Thank you Microsoft!
 	// TODO: Investigate if DSCP can be still set directly without administrator flow configuration.
 	(void)sock;
 	(void)ds;
+	(void)family;
 	JLOG_INFO("IP Differentiated Services are not supported on Windows");
 	return -1;
 #else
-	addr_record_t name;
-	name.len = sizeof(name.addr);
-	if (getsockname(sock, (struct sockaddr *)&name.addr, &name.len) < 0) {
-		JLOG_WARN("getsockname failed, errno=%d", sockerrno);
-		return -1;
-	}
 
-	switch (name.addr.ss_family) {
+	switch (family) {
 	case AF_INET:
 #ifdef IP_TOS
 		if (setsockopt(sock, IPPROTO_IP, IP_TOS, &ds, sizeof(ds)) < 0) {
@@ -360,6 +489,20 @@ int udp_set_diffserv(socket_t sock, int ds) {
 	default:
 		return -1;
 	}
+#endif
+}
+
+int udp_set_diffserv(socket_t sock, int ds) {
+#ifdef _WIN32
+    return udp_set_diffserv_family(sock,ds,AF_UNSPEC);
+#else
+	addr_record_t name;
+	name.len = sizeof(name.addr);
+	if (getsockname(sock, (struct sockaddr *)&name.addr, &name.len) < 0) {
+		JLOG_WARN("getsockname failed, errno=%d", sockerrno);
+		return -1;
+	}
+    return udp_set_diffserv_family(sock,ds,name.addr.ss_family);
 #endif
 }
 

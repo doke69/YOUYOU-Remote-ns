@@ -1,5 +1,9 @@
 # Transport-wide 反馈基础模块（未接入串流）
 
+> 以下为按阶段追加的历史记录，其中“未测试/未链接”仅描述对应阶段。最新状态见[2026-11-08版本协商与回退](./tv-adaptation-v2-negotiation-2026-11-08.md)和[移植计划](./tv-bitrate-adaptation-plan-2026-11-04.md)：01实验包已有真机提交/画质反馈，02协商与请求发送组件已通过离线测试和完整ELF链接，02广告默认关闭、未打新NRO或真机验证。不能用早期历史状态替代当前结论。
+
+> 同日后续：[02边界/双版本/T=0复核](./tv-adaptation-v2-boundaries-2026-11-08.md)、[REMB统一准入与旧目标撤销](./tv-adaptation-remb-admission-2026-11-08.md)已离线验证。传统接收带宽估计器尚未完成。
+
 `include/transport_feedback.hpp` 和 `source/transport_feedback.cpp` 是独立、无网络副作用的协议辅助代码。未加入应用构建目标、未声明 SDP 能力、未改变 v72 安装包。仅完成 ARM64 编译和静态审核，没有运行测试套件或真机互通验证。
 
 另有 `transport_feedback_negotiation.hpp/.cpp` 检查现有 libdatachannel 的已解析媒体能力，单独归档，尚未接入主程序。可选早期时间元数据和全局 SRTCP 路由修正也只完成库侧构建，不能把各阶段静态库混装成应用。

@@ -1,8 +1,10 @@
 #pragma once
+#include "transport_feedback.hpp"
 #include <cstdint>
 #include <string_view>
 #include <string>
 #include <optional>
+#include <vector>
 #include <rtc/description.hpp>
 
 namespace uu::twcc {
@@ -14,6 +16,32 @@ struct NegotiationResult {
     NegotiationStatus status = NegotiationStatus::NotNegotiated;
     uint8_t extensionId = 0;
     unsigned videoPayloads = 0;
+    TransportSequenceVersion version = TransportSequenceVersion::V1;
+    uint8_t legacyExtensionId = 0; // Optional negotiated 01 fallback in 02 mode.
+};
+// Common feedback state. Client must also match the raw snapshots to the
+// current stable installed descriptions before using it for REMB admission.
+// It does not replace the stricter TWCC extension/transport admission below.
+enum class TransportExtensionVersion { V1, V2 };
+struct ReceiveTransportExtension {
+    TransportExtensionVersion version;
+    uint8_t localId, remoteId;
+    bool attributesSupported;
+};
+struct MediaFeedbackCapabilities {
+    std::string mid, codec;
+    int payloadType = 0, clockRate = 0;
+    std::vector<std::string> feedback;
+    std::vector<int> rtxPayloadTypes;
+    std::vector<ReceiveTransportExtension> transportExtensions;
+    // Zero unless both sides map the URI to the same plain one-way-usable ID.
+    uint8_t absSendTimeId = 0, transmissionOffsetId = 0;
+};
+struct FeedbackCapabilitiesResult {
+    NegotiationStatus status = NegotiationStatus::NotNegotiated;
+    bool localIsOfferer = false;
+    std::vector<MediaFeedbackCapabilities> media;
+    bool allowsRemb(std::string_view videoMid, int primaryVideoPayloadType) const;
 };
 // Store only the bounded, validated capability projection between asynchronous
 // signaling events. No ICE credentials/candidates/fingerprint/raw SDP retained.
@@ -26,6 +54,9 @@ class NegotiationCapabilities {
                singleTransport_ == other.singleTransport_;
     }
     rtc::Description::Type type() const { return type_; }
+    // Comparison only, never an admission source. The SDK serializer may
+    // repeat its synthesized BUNDLE group alongside the original attribute.
+    bool matchesInstalledDescription(const rtc::Description &installed) const;
   private:
     NegotiationCapabilities(std::string projection, rtc::Description::Type type, bool singleTransport)
         : projection_(std::move(projection)), type_(type), singleTransport_(singleTransport) {}
@@ -34,7 +65,12 @@ class NegotiationCapabilities {
     bool singleTransport_;
     friend NegotiationResult inspectNegotiationCapabilities(const NegotiationCapabilities &,
                                                             const NegotiationCapabilities &, int);
+    friend FeedbackCapabilitiesResult inspectMediaFeedbackCapabilities(
+        const NegotiationCapabilities &, const NegotiationCapabilities &, int);
 };
+FeedbackCapabilitiesResult inspectMediaFeedbackCapabilities(const NegotiationCapabilities &local,
+                                                             const NegotiationCapabilities &remote,
+                                                             int primaryVideoPayloadType = 96);
 NegotiationResult inspectNegotiationCapabilities(const NegotiationCapabilities &local,
                                                  const NegotiationCapabilities &remote,
                                                  int primaryVideoPayloadType = 96);

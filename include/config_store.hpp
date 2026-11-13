@@ -2,6 +2,8 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <exception>
+#include "runtime/latest_snapshot_worker.hpp"
 
 namespace uu {
 // Ensures sdmc:/switch/UURemote-ns/config.ini exists and is migrated to the
@@ -15,6 +17,42 @@ void ensureDefaultConfig() noexcept;
 // are retained. Frame pacing keeps the first parsed value (including 0 #comment).
 void saveQualityConfig(int width, int height, int fps, int quality, bool vsync,
                        int playoutDelay, int maxBitrateMbps, bool hevc);
+
+struct QualityConfigValues {
+    int width,height,fps,quality,cap,delay;bool vsync,hevc;
+    bool isBitrateOnlyChangeFrom(const QualityConfigValues &previous) const noexcept {
+        return quality==6 && previous.quality==6 && cap!=previous.cap &&
+            width==previous.width && height==previous.height && fps==previous.fps &&
+            delay==previous.delay && vsync==previous.vsync && hevc==previous.hevc;
+    }
+};
+
+// A single writer owns disk I/O; the latest complete pending snapshot replaces
+// older pending targets. shutdown waits for all accepted remaining work.
+class QualityConfigWriter {
+  public:
+    using Save=std::function<void(const QualityConfigValues &)>;
+    struct Result {
+        uint64_t order=0,elapsedUs=0,maxUs=0,completed=0,failures=0;
+        std::exception_ptr error;
+    };
+    QualityConfigWriter();
+    explicit QualityConfigWriter(Save save);
+    bool submit(uint64_t order,const QualityConfigValues &values);
+    Result snapshot() const;
+    runtime::SnapshotWorkerStats stats() const {return worker_.stats();}
+    void shutdown() {worker_.shutdown();}
+  private:
+    struct Job {
+        uint64_t order;
+        QualityConfigValues values;
+        size_t retainedBytes() const noexcept {return sizeof(Job);}
+    };
+    mutable std::mutex resultMutex_;
+    Result result_;
+    // Destroy/join the worker before the result it publishes into.
+    runtime::LatestSnapshotWorker<Job> worker_;
+};
 
 // Thread-safe read-only view of config.ini for all modules. Reload replaces the
 // map atomically; readers never observe a partially parsed file.

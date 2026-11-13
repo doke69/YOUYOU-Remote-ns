@@ -80,6 +80,10 @@ protected:
 	mbedtls_ssl_context mSsl;
 
 	std::recursive_mutex mSslMutex;
+	// Owned by mSslMutex; active only inside an application-data ssl_read.
+	bool mReadBudgetActive = false, mReadYielded = false;
+	unsigned mReadMediaCount = 0;
+	std::chrono::steady_clock::time_point mReadStarted;
 
 	uint32_t mFinMs = 0, mIntMs = 0;
 	std::chrono::time_point<std::chrono::steady_clock> mTimerSetAt;

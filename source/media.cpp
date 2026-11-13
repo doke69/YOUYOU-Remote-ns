@@ -1,5 +1,7 @@
 #include "cpu_diagnostics.hpp"
 #include "media.hpp"
+#include "video_packet.hpp"
+#include "frame_trace.hpp"
 #include "media_integrity.hpp"
 #include "playout_policy.hpp"
 #include "background.hpp"
@@ -207,8 +209,7 @@ const char *diagDirectory() {
 struct Media::Impl {
     std::mutex mutex, audioMutex;
     std::condition_variable cv;
-    struct PacketFree { void operator()(AVPacket *value) const noexcept { av_packet_free(&value); } };
-    using PacketRef = std::unique_ptr<AVPacket, PacketFree>;
+    using PacketRef = VideoPacket;
     struct EncodedUnit {
         PacketRef packet;
         size_t byteSize=0;
@@ -249,14 +250,14 @@ struct Media::Impl {
     uint64_t ageBreakdownSamples = 0;
     uint64_t skipDue = 0, skipBound = 0;
     int selectedLateMs = 0;
-    std::deque<std::string> playoutTrace;
+    std::deque<PlayoutTraceRow> playoutTrace;
     void tracePicture(const Picture &picture, int64_t now, const char *reason, int64_t targetMs = 0) {
         // Bounded numeric-only trace, independent of the AU/video dump switch.
         // 6000 rows (~60-100 s at 60 fps) is still a few hundred KiB and makes
         // the presentation-drop trigger analyzable after a reset.
         if(playoutTrace.size()>=6000) playoutTrace.pop_front();
-        playoutTrace.push_back(std::to_string(picture.mediaTimestamp)+","+std::to_string(picture.decodedMs)+","+
-            std::to_string(picture.dueMs)+","+std::to_string(now)+","+reason+","+std::to_string(targetMs?targetMs:now)+","+std::to_string(picture.originalDueMs));
+        playoutTrace.push_back({picture.mediaTimestamp,picture.decodedMs,picture.dueMs,now,
+            targetMs?targetMs:now,picture.originalDueMs,reason});
     }
     void resetPlayout() {
         ready.clear();readyBytes=0;latest={};
@@ -328,7 +329,10 @@ struct Media::Impl {
         for(size_t i=0;i<consume;++i) {
             selected=std::move(ready.front());ready.pop_front();
             readyBytes-=selected.pixelBytes();
-            if(i+1<consume) {++presentationSkipped;++skipDue;}
+            if(i+1<consume) {
+                tracePicture(selected,now,"overdue",now);
+                ++presentationSkipped;++skipDue;
+            }
         }
         latest=std::move(selected);
         latest.selectedMs = now;
@@ -449,7 +453,7 @@ struct Media::Impl {
         flushDiagnostics();
     }
     struct DiagnosticDump {
-        std::deque<std::string> playoutTrace;
+        std::deque<PlayoutTraceRow> playoutTrace;
         std::vector<uint8_t> auDump_;
         Picture diagnosticPicture_;
         std::string codecText, encoderText;
@@ -475,7 +479,7 @@ struct Media::Impl {
         // diagnostic that cannot use it, especially across slow storage writes.
         dump.diagnosticPicture_.hardwareFrame.reset();
         size_t bytes=dump.auDump_.capacity();
-        for(const auto &line:dump.playoutTrace) bytes+=line.capacity();
+        bytes+=dump.playoutTrace.size()*sizeof(PlayoutTraceRow);
         if(dump.diagnosticPicture_.pixels) bytes+=dump.diagnosticPicture_.pixels->capacity();
         try {
             std::lock_guard lock(diagnosticSubmitMutex);
@@ -777,9 +781,13 @@ struct Media::Impl {
         auto *&ctx=resources.context;
         // Diagnostic stage EMAs (microseconds): send, receive/drain, frame
         // processing + publish. Existing decodeMs semantics are unchanged.
+#ifndef UU_LEAN_STATS
         double stageSendUs=0, stageRecvUs=0, stagePublishUs=0;
+#endif
         bool receiveEofLogged=false;
+#ifndef UU_LEAN_STATS
         auto ema=[](double value,double sample){return value<=0?sample:value+(sample-value)*kDecodeStageEmaAlpha;};
+#endif
         // Codec state belongs only to this worker. Generation checks protect
         // publication; reset never touches a live codec or waits for its fence.
         uint64_t stageEpoch=generation.load();
@@ -823,7 +831,9 @@ struct Media::Impl {
             const uint64_t activeGeneration=generation.load();
             if(activeGeneration!=stageEpoch) {
                 // Never blend local EMA values across session generations.
+#ifndef UU_LEAN_STATS
                 stageSendUs=stageRecvUs=stagePublishUs=0;
+#endif
                 stageEpoch=activeGeneration;
             }
             if (currentGeneration != activeGeneration)
@@ -855,14 +865,20 @@ struct Media::Impl {
             // returns (its blocking time includes NVTEGRA post-process wait);
             // publishNs = from a successful receive return through frame
             // handling, queue publication and av_frame_unref (RAII timer).
+#ifndef UU_LEAN_STATS
             int64_t sendNs=0, recvNs=0, publishNs=0;
+#endif
             auto drain = [&] {
                 while (true) {
+#ifndef UU_LEAN_STATS
                     const auto receiveStarted=std::chrono::steady_clock::now();
+#endif
                     const int receiveResult=avcodec_receive_frame(ctx,frame);
+#ifndef UU_LEAN_STATS
                     const auto frameReceived=std::chrono::steady_clock::now();
                     recvNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                                frameReceived-receiveStarted).count();
+#endif
                     const auto disposition=classifyReceiveResult(receiveResult,AVERROR(EAGAIN),AVERROR_EOF);
                     if(disposition==ReceiveDisposition::Again) break;
                     if(disposition==ReceiveDisposition::Eof) {
@@ -898,7 +914,9 @@ struct Media::Impl {
                         break;
                     }
                     receiveEofLogged=false;
+#ifndef UU_LEAN_STATS
                     StageTimer publishTimer(publishNs,frameReceived);
+#endif
                     bool validEpoch=false;
                     {
                         std::lock_guard lock(mutex);
@@ -1067,10 +1085,14 @@ struct Media::Impl {
             };
             const auto decodeStart = std::chrono::steady_clock::now();
             auto timedSend = [&](AVPacket *value) {
+#ifndef UU_LEAN_STATS
                 const auto sendStarted=std::chrono::steady_clock::now();
+#endif
                 const int sent=avcodec_send_packet(ctx,value);
+#ifndef UU_LEAN_STATS
                 sendNs+=std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now()-sendStarted).count();
+#endif
                 return sent;
             };
             int result = timedSend(packet);
@@ -1101,11 +1123,13 @@ struct Media::Impl {
             if(decodeMicros>33000) ++decodeGt33;
             const double previous = decodeMs.load();
             decodeMs = previous <= 0 ? millis : previous + (millis - previous) * kDecodeStageEmaAlpha;
+#ifndef UU_LEAN_STATS
             stageSendUs=ema(stageSendUs,double(sendNs)/1000.0);
             stageRecvUs=ema(stageRecvUs,double(recvNs)/1000.0);
             stagePublishUs=ema(stagePublishUs,double(publishNs)/1000.0);
 #ifdef __SWITCH__
             LiveTelemetry::setDecodeStages(stageSendUs,stageRecvUs,stagePublishUs);
+#endif
 #endif
         }
     done:
@@ -1116,17 +1140,30 @@ Media::Media() : impl_(std::make_unique<Impl>()) {}
 Media::~Media() = default;
 void Media::video(const uint8_t *data, size_t size, uint64_t generation, std::optional<uint32_t> timestamp, bool hevc,
                   std::optional<bool> validatedKeyframe) {
+    submitVideo(data,size,generation,timestamp,hevc,validatedKeyframe,nullptr);
+}
+void Media::video(std::vector<uint8_t> data, uint64_t generation, std::optional<uint32_t> timestamp, bool hevc,
+                  bool validatedKeyframe) {
+    submitVideo(data.data(),data.size(),generation,timestamp,hevc,validatedKeyframe,&data);
+}
+void Media::submitVideo(const uint8_t *data, size_t size, uint64_t generation, std::optional<uint32_t> timestamp, bool hevc,
+                        std::optional<bool> validatedKeyframe, std::vector<uint8_t> *owner) {
     if (!size || !data || impl_->decoderFailed.load() || generation != impl_->generation.load())
         return;
-    // Allocate the FFmpeg-owned padded packet once, before taking the shared
-    // queue/UI mutex. Ownership moves to the decoder without another AU copy.
+    // Create the padded packet before the queue/UI mutex. Validated receiver
+    // AUs transfer their storage; borrowed inputs retain the copy boundary.
     // Match receiver's 4MB limit for 1080p high bitrate support.
     constexpr size_t maxFrameSize = 4 * 1024 * 1024;
     Impl::PacketRef owned;
     if (size <= maxFrameSize) {
-        owned.reset(av_packet_alloc());
-        if (!owned || av_new_packet(owned.get(),int(size))<0) return;
-        std::copy(data,data+size,owned->data);
+        if(owner) {
+            owned=videoPacket(std::move(*owner));
+            if(!owned) return;
+        } else {
+            owned.reset(av_packet_alloc());
+            if (!owned || av_new_packet(owned.get(),int(size))<0) return;
+            std::copy(data,data+size,owned->data);
+        }
     }
     {
         std::lock_guard lock(impl_->mutex);

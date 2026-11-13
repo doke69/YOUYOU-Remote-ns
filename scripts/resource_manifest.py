@@ -26,6 +26,7 @@ LICENSES = [
     "libdatachannel-MPL-2.0.txt", "libjuice-MPL-2.0.txt",
     "libsrtp-BSD-3-Clause.txt", "mbedtls-Apache-2.0.txt",
     "plog-MIT.txt", "qrcodegen-notices.md", "usrsctp-BSD-3-Clause.txt",
+    "webrtc-BSD-3-Clause.txt", "webrtc-PATENTS.txt", "webrtc-AUTHORS.txt", "abseil-Apache-2.0.txt",
 ]
 ICON = "assets/youyou-icon.jpg"
 EXPECTED_UI = set(PRIVATE_UI) | set(OWN_UI)
@@ -112,10 +113,11 @@ def verify(mode, root, asset_dir=None, romfs_dir=None):
 
 def controlled_files(root):
     files = []
-    for pattern in ("CMakeLists.txt", "source/*.cpp", "source/*.inc", "include/**/*.hpp",
+    for pattern in ("CMakeLists.txt", "source/*.cpp", "source/*.c", "source/*.inc", "include/**/*.hpp",
                     "include/**/*.h", "shaders/*", "assets/fonts/*", "licenses/*",
                     "scripts/resource_manifest.py", "scripts/fix_nacp_title.py",
-                    "cmake/**/*.cmake", "scripts/dependency-overrides/**/*"):
+                    "cmake/**/*.cmake", "cmake/webrtc-rbe/*", "scripts/fetch_rbe_sources.py",
+                    "scripts/dependency-overrides/**/*"):
         for p in sorted(root.glob(pattern)):
             if p.is_file():
                 files.append(p)
@@ -131,12 +133,25 @@ def manifest(args):
     root = Path(args.root)
     romfs = Path(args.romfs_dir)
     resources = {}
+    notice = romfs / "licenses/libnx-ISC.txt"
+    if not notice.is_file() or sha256(notice) != sha256(root / "licenses/libnx-ISC.txt"):
+        raise ValueError("Packed libnx license missing/changed")
+    resources["licenses/libnx-ISC.txt"] = sha256(notice)
     for p in sorted((romfs / "ui-tv").glob("*.rgba")):
         resources[f"ui-tv/{p.name}"] = sha256(p)
     for p in sorted((romfs / "fonts").glob("*")):
         resources[f"fonts/{p.name}"] = sha256(p)
     for p in sorted((romfs / "shaders").glob("*.dksh")):
         resources[f"shaders/{p.name}"] = sha256(p)
+    rbe_dependency = None
+    if args.rbe_source_dir:
+        from fetch_rbe_sources import read_lock, verify_sources
+        rbe_dependency = verify_sources(Path(args.rbe_source_dir), read_lock())
+        for name in ("webrtc-BSD-3-Clause.txt", "webrtc-PATENTS.txt", "webrtc-AUTHORS.txt", "abseil-Apache-2.0.txt"):
+            packed = romfs / "licenses" / name
+            if not packed.is_file() or sha256(packed) != sha256(root / "licenses" / name):
+                raise ValueError('RBE packed license missing/changed: ' + name)
+            resources[f"licenses/{name}"] = sha256(packed)
     sources = {p.relative_to(root).as_posix(): sha256(p) for p in controlled_files(root)}
     options = {}
     for item in args.option or []:
@@ -155,6 +170,7 @@ def manifest(args):
             sha256(root / "scripts/dependency-overrides/manifest.json")
             if (root / "scripts/dependency-overrides/manifest.json").is_file() else None),
         "build_options": options,
+        "rbe_dependency": rbe_dependency,
         "resources": resources,
         "nro": {"path": "UURemote-ns.nro", "sha256": sha256(args.nro),
                 "size": Path(args.nro).stat().st_size},
@@ -184,6 +200,7 @@ def main(argv=None):
     m.add_argument("--version", required=True)
     m.add_argument("--label", required=True)
     m.add_argument("--option", action="append", default=[])
+    m.add_argument("--rbe-source-dir")
     args = ap.parse_args(argv)
     if args.command == "verify":
         code, errors = verify(args.mode, Path(args.root),

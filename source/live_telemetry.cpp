@@ -64,7 +64,7 @@ struct LiveTelemetry::Impl {
     double loopUs=0,loopMaxUs=0;
     std::array<uint32_t,kGapBins> histogram{};
     Impl() {
-#ifdef __SWITCH__
+#if defined(__SWITCH__) && !defined(UU_LEAN_STATS)
         std::ifstream file("sdmc:/switch/UURemote-ns/telemetry.ini");
         std::map<std::string,std::string> settings;
         std::string line;
@@ -197,6 +197,8 @@ void LiveTelemetry::publish(const StreamStatsSnapshot &s,bool vsync,bool nv12,do
         groups[0].update(Json{
             {"version",UU_VERSION},{"width",s.width},{"height",s.height},{"requested_fps",s.requestedFps},
             {"codecflag",s.codec.rfind("H.265",0)==0?1:0},{"actualmbps",r(s.video.bitrateMbps)},
+            // feedback is local media-handler acceptance of the compound REMB
+            // submission, not a PC acknowledgement; actualmbps is PC output.
             {"targetcap",s.maxBitrateMbps},{"feedback",s.bitrateFeedbackSent?1:0},{"vsync",vsync?1:0},
             {"buffer",s.playoutDelayMs},{"pacing",s.pacing?1:0},
             {"snapshot_age_ms",s.sampledMs?std::max<int64_t>(0,nowMs-s.sampledMs):-1},
@@ -213,8 +215,8 @@ void LiveTelemetry::publish(const StreamStatsSnapshot &s,bool vsync,bool nv12,do
             {"udp_rx_errno",udpReceiveError},{"udp_tx_errno",udpSendError}});
         groups[1]=base("network");
         groups[1].update(Json{
-            {"rtt_ms",s.rttMs},{"jitter_ms",r(s.video.jitterMs)},{"initial_gap_pct",r(s.video.lossPercent)},
-            {"packets",s.video.packets},{"lost",s.video.lost},
+            {"rtt_ms",s.rttMs},{"jitter_ms",r(s.video.jitterMs)},{"initial_gap_pct",r(s.video.initialGapPercent)},
+            {"packets",s.video.packets},{"lost",s.video.initialGapPackets}, // Legacy schema key for initial gaps.
             {"accepted",s.receiverAccepted},{"rx_drop",s.receiverDropped},{"wait_idr",s.receiverWaitingIdr},
             {"idr_ff",s.receiverFastForwards},{"wait_recent",s.receiverRecentWaitMs},{"wait_max",s.receiverMaxWaitMs},
             {"pending",s.receiverPending},{"block_ms",s.receiverBlockedMs},{"repair_ms",r(s.repairRttMs)},

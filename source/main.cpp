@@ -3,6 +3,7 @@
 #include "client.hpp"
 #include "config_store.hpp"
 #include "cpu_diagnostics.hpp"
+#include "switch_thread_affinity.hpp"
 #include "diagnostics.hpp"
 #include "device_selection.hpp"
 #include "safety_settings.hpp"
@@ -13,6 +14,8 @@
 #include "quality_presets.hpp"
 #include "rtc_diagnostics.hpp"
 #include "runtime_profile.hpp"
+#include "vibration.hpp"
+#include "gamepad_input.hpp"
 #include <SDL_ttf.h>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +40,13 @@
 // Content: account and connection status, computer list, QR/desktop workspace, controls.
 // Interaction: eased focus movement, a restrained busy pulse, toggleable stream overlay.
 namespace {
+Uint64 profilingTick() {
+#ifdef UU_LEAN_STATS
+    return 0;
+#else
+    return SDL_GetPerformanceCounter();
+#endif
+}
 #ifdef __SWITCH__
 // Console profile: used to adapt the UI/output to Switch vs Switch Lite and to
 // record the environment in connection.log for on-device diagnosis.
@@ -179,7 +189,7 @@ void statsPanel(SDL_Renderer *renderer, TTF_Font *font, const uu::StreamStatsSna
         "  ·  解码 "+fpsText(s.decodeFps)+" FPS");
     line("播放调度",s.pacing ? "缓冲 "+std::to_string(s.readyFrames)+" 帧 / "+std::to_string(s.playoutDelayMs)+
          " ms  ·  跳过 "+std::to_string(s.presentationSkipped)+"  ·  缺时间戳 "+std::to_string(s.missingTimestamps) : "关闭");
-    std::string video = "初传缺口 " + formatPercent(s.video.lossPercent) + "  ·  抖动 " +
+    std::string video = "初传缺口 " + formatPercent(s.video.initialGapPercent) + "  ·  抖动 " +
                         formatMillis(s.video.jitterMs) + "  ·  码率 " + formatMbps(s.video.bitrateMbps);
     line("视频", video);
     line("重传", "NACK " + std::to_string(s.nackSent) + " 次  ·  RTX 回填 " +
@@ -202,54 +212,68 @@ void statsPanel(SDL_Renderer *renderer, TTF_Font *font, const uu::StreamStatsSna
     decode += "  ·  解码错误 " + std::to_string(s.decodeErrors) + "  ·  丢帧 " +
               std::to_string(s.droppedFrames);
     line("解码", decode);
-    std::string keys = "请求 " + std::to_string(s.keyframeRequests) + " 次  ·  最近恢复 " +
+    std::string keys = "客户端 " + std::to_string(s.keyframeRequests) + "  ·  接收器 " +
+                       std::to_string(s.receiverPli) + "  ·  客户端恢复 " +
                        (s.keyframeRecoveryMs >= 0 ? std::to_string(s.keyframeRecoveryMs) + " ms" : "—");
     line("关键帧", keys);
-    std::string audio = "Opus  ·  码率 " + formatMbps(s.audio.bitrateMbps) + "  ·  丢包 " +
-                        formatPercent(s.audio.lossPercent);
+    std::string audio = "Opus  ·  码率 " + formatMbps(s.audio.bitrateMbps) + "  ·  初传缺口 " +
+                        formatPercent(s.audio.initialGapPercent);
     line("音频", audio);
 }
 // Compact bottom-left overlay with a subdued backdrop:
 // session time, transport, fps, realtime video Mbps, RTT, frame time, loss,
 // configured video bitrate.
+struct NetworkInfoLayout {
+    struct Row {std::string text;SDL_Color color;};
+    Row rows[8];
+    int lineHeight=0,panelW=0,panelH=0;
+    Uint32 statsAt=0,elapsedSeconds=0;
+    TTF_Font *font=nullptr;
+    bool valid=false;
+};
 void compactNetworkInfo(SDL_Renderer *renderer,TTF_Font *font,const uu::StreamStatsSnapshot &s,
-                        Uint32 elapsedSeconds) {
-    const SDL_Color normal{235,235,235,240},warning{253,138,0,235},bad{250,75,90,235};
-    auto number=[](double v){if(v<0)return std::string("--");char out[32];std::snprintf(out,sizeof out,"%.1f",v);return std::string(out);};
-    auto duration=[&](Uint32 seconds){char out[32];std::snprintf(out,sizeof out,"%02u:%02u:%02u",
-        unsigned(seconds/3600),unsigned((seconds/60)%60),unsigned(seconds%60));return std::string(out);};
-    std::string path="UDP";
-    if(s.transport.find("私网地址直连")!=std::string::npos || s.transport.find("局域网直连")!=std::string::npos)path="UDP LAN";
-    else if(s.transport.find("TURN")!=std::string::npos || s.transport.find("远端中继")!=std::string::npos)path="TURN";
-    else if(s.transport.find("P2P")!=std::string::npos || s.transport.find("公网")!=std::string::npos)path="UDP WAN";
-    struct Row{std::string text;SDL_Color color;};
-    const Row rows[8]={
-        {duration(elapsedSeconds),normal},
-        {path,normal},
-        {number(s.presentFps)+" fps",normal},
-        {formatMbps(s.video.bitrateMbps),normal},
-        {s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("-- ms"),normal},
-        {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm",normal},
-        {formatPercent(s.video.lossPercent)+" loss",
-            s.video.lossPercent>=10?bad:s.video.lossPercent>=5?warning:normal},
-        {s.maxBitrateMbps>0?std::to_string(s.maxBitrateMbps)+" Mbps":std::string("-- Mbps"),normal},
-    };
-    std::string display[8];int maxWidth=0;
-    for(int i=0;i<8;++i){
-        display[i]=rows[i].text;int w=0,h=0;if(TTF_SizeUTF8(font,display[i].c_str(),&w,&h)!=0)continue;
-        while(w>300 && !display[i].empty()){
-            size_t n=display[i].size()-1;while(n>0 && (static_cast<unsigned char>(display[i][n])&0xc0)==0x80)--n;
-            display[i].resize(n);TTF_SizeUTF8(font,display[i].c_str(),&w,&h);
+                        Uint32 elapsedSeconds,Uint32 statsAt,NetworkInfoLayout &layout) {
+    if(!layout.valid || layout.statsAt!=statsAt || layout.elapsedSeconds!=elapsedSeconds || layout.font!=font) {
+        const SDL_Color normal{235,235,235,240},warning{253,138,0,235},bad{250,75,90,235};
+        auto number=[](double v){if(v<0)return std::string("--");char out[32];std::snprintf(out,sizeof out,"%.1f",v);return std::string(out);};
+        auto duration=[&](Uint32 seconds){char out[32];std::snprintf(out,sizeof out,"%02u:%02u:%02u",
+            unsigned(seconds/3600),unsigned((seconds/60)%60),unsigned(seconds%60));return std::string(out);};
+        std::string path="UDP";
+        if(s.transport.find("私网地址直连")!=std::string::npos || s.transport.find("局域网直连")!=std::string::npos)path="UDP LAN";
+        else if(s.transport.find("TURN")!=std::string::npos || s.transport.find("远端中继")!=std::string::npos)path="TURN";
+        else if(s.transport.find("P2P")!=std::string::npos || s.transport.find("公网")!=std::string::npos)path="UDP WAN";
+        const NetworkInfoLayout::Row rows[8]={
+            {duration(elapsedSeconds),normal},
+            {path,normal},
+            {number(s.presentFps)+" fps",normal},
+            {formatMbps(s.video.bitrateMbps),normal},
+            {s.rttMs>=0?std::to_string(s.rttMs)+" ms":std::string("-- ms"),normal},
+            {(s.decodeMs>0?number(s.decodeMs):std::string("--"))+" ms frm",normal},
+            {formatPercent(s.video.initialGapPercent)+" 初传缺口",
+                s.video.initialGapPercent>=10?bad:s.video.initialGapPercent>=5?warning:normal},
+            {s.maxBitrateMbps>0?std::to_string(s.maxBitrateMbps)+" Mbps":std::string("-- Mbps"),normal},
+        };
+        int maxWidth=0;
+        for(int i=0;i<8;++i){
+            layout.rows[i]=rows[i];int w=0,h=0;if(TTF_SizeUTF8(font,layout.rows[i].text.c_str(),&w,&h)!=0)continue;
+            while(w>300 && !layout.rows[i].text.empty()){
+                size_t n=layout.rows[i].text.size()-1;while(n>0 && (static_cast<unsigned char>(layout.rows[i].text[n])&0xc0)==0x80)--n;
+                layout.rows[i].text.resize(n);TTF_SizeUTF8(font,layout.rows[i].text.c_str(),&w,&h);
+            }
+            maxWidth=std::max(maxWidth,w);
         }
-        maxWidth=std::max(maxWidth,w);
+        const int lineHeight=std::max(24,TTF_FontHeight(font)+2);
+        constexpr int lineCount=8,padX=12,padY=10;
+        const int panelW=std::min(340,maxWidth+padX*2),panelH=lineCount*lineHeight+padY*2;
+        layout.lineHeight=lineHeight;layout.panelW=panelW;layout.panelH=panelH;
+        layout.statsAt=statsAt;layout.elapsedSeconds=elapsedSeconds;layout.font=font;layout.valid=true;
     }
-    const int lineHeight=std::max(24,TTF_FontHeight(font)+2);
-    constexpr int lineCount=8,padX=12,padY=10;
-    const int panelW=std::min(340,maxWidth+padX*2),panelH=lineCount*lineHeight+padY*2;
+    constexpr int padX=12,padY=10;
+    const int panelW=layout.panelW,panelH=layout.panelH,lineHeight=layout.lineHeight;
     const int panelX=16,panelY=720-16-panelH;
     tvui::rounded(renderer,{panelX,panelY,panelW,panelH},SDL_Color{0,0,0,115},5);
     for(int i=0;i<8;++i)
-        text(renderer,font,display[i],panelX+padX,panelY+padY+i*lineHeight,rows[i].color,panelW-padX*2);
+        text(renderer,font,layout.rows[i].text,panelX+padX,panelY+padY+i*lineHeight,layout.rows[i].color,panelW-padX*2);
 }
 std::optional<std::string> numericInput(const char *title, const std::string &value, int minimum,
                                         int maximum) {
@@ -363,6 +387,7 @@ std::string read(const std::string &path) {
     return std::string(std::istreambuf_iterator<char>(f), {});
 }
 #include "tv_frontend.inc"
+#include "controller_diagram.inc"
 #include "live_frontend.inc"
 #include "touch_gestures.inc"
 #include "phone_mouse.inc"
@@ -384,6 +409,7 @@ struct FocusHook {
                 if ((type == AppletHookType_OnFocusState &&
                      appletGetFocusState() != AppletFocusState_InFocus) ||
                     type == AppletHookType_OnExitRequest) {
+                    uu::vibration::stop();
                     static_cast<uu::Client *>(data)->command("release");
                 }
             },
@@ -398,13 +424,14 @@ struct FocusHook {
 
 int main(int, char **) {
 #ifdef __SWITCH__
+    uu::initializeThreadAffinity();
     if (appletGetAppletType() != AppletType_Application &&
         appletGetAppletType() != AppletType_SystemApplication) {
         consoleInit(nullptr);
         printf("UU Remote NS requires full application mode.\nHold R while launching a game, then start this "
                "NRO.\nPress + to exit.\n");
         PadState p;
-        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+        padConfigureInput(2, HidNpadStyleSet_NpadStandard);
         padInitializeDefault(&p);
         while (appletMainLoop()) {
             padUpdate(&p);
@@ -460,9 +487,13 @@ int main(int, char **) {
         productModelText = "Switch";
         break;
     }
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padConfigureInput(2, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
+    PadState secondPad;padInitialize(&secondPad,HidNpadIdType_No2);
+    PadState externalPad,handheldPad;
+    padInitialize(&externalPad,HidNpadIdType_No1);
+    padInitialize(&handheldPad,HidNpadIdType_Handheld);
     hidInitializeTouchScreen();
     appletSetMediaPlaybackState(true);
 #endif
@@ -554,6 +585,7 @@ int main(int, char **) {
             if (key.size() != 24)
                 throw std::runtime_error("Missing signing.key: run scripts/extract_key.py and rebuild");
             uu::diagnostic("app-start-" UU_VERSION);
+            uu::diagnostic("connection-diagnostics-0375-v1");
             uu::diagnostic("ui-font-source-memory");
 #ifdef UU_SRTP_MBEDTLS
             uu::diagnostic("srtp-payload-backend-mbedtls");
@@ -610,9 +642,11 @@ int main(int, char **) {
                 uu::LiveTelemetry telemetry;
                 Uint32 lastCpuLedgerSample=0;
                 Uint32 texFormat=0;
+                std::optional<bool> failedVsync;
                 bool actualVsync=(rendererInfo.flags & SDL_RENDERER_PRESENTVSYNC)!=0;
                 const bool requestedVsync=client.snapshot().vsync;
                 if(uu::display::vsync(renderer,requestedVsync?1:0)==0) actualVsync=requestedVsync;
+                if(actualVsync!=requestedVsync)failedVsync=requestedVsync;
                 uu::diagnostic(actualVsync?"display-vsync-on":"display-vsync-off");
 #ifdef __SWITCH__
                 FocusHook focusHook(client);
@@ -632,11 +666,15 @@ int main(int, char **) {
                 bool nativeFallback = false, nativeOversizeNotice = false;
                 uint64_t nativeOutputEpoch = media->generation();
                 unsigned lastArrowMask=0;
-                bool nativePadRequested=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
-                Uint32 nativePadSentAt=0,plusAt=0,minusAt=0;std::string lastNativePad;
+                struct RemotePad {bool requested=false;Uint32 sentAt=0;std::string last;uu::PadMenuChord plus;uu::PadNavigation navigation;};
+                std::array<RemotePad,2> remotePads;
+
                 bool homePlusPending=false;Uint32 homePlusAt=0;
-                auto padPacket=[&](uint32_t buttons,int lx,int ly,int rx,int ry,int lt,int rt){
-                    return uu::Json{{"action","gpd_update"},{"index",0},{"buttons",buttons},{"left_trigger",lt},{"right_trigger",rt},
+                bool vibrationStreaming=false;
+                uu::vibration::setHoldMs(uu::ConfigStore::instance().integer("vibration_hold_ms",uu::vibration::kDefaultHoldMs,
+                                                                             uu::vibration::kMinHoldMs,uu::vibration::kMaxHoldMs));
+                auto padPacket=[&](int index,uint32_t buttons,int lx,int ly,int rx,int ry,int lt,int rt){
+                    return uu::Json{{"action","gpd_update"},{"index",index},{"buttons",buttons},{"left_trigger",lt},{"right_trigger",rt},
                         {"left_thumb_x",lx},{"left_thumb_y",ly},{"right_thumb_x",rx},{"right_thumb_y",ry}};
                 };
                 StreamTouch streamTouch;NativeTouch nativeTouch;PhoneMouse phoneMouse;
@@ -661,12 +699,14 @@ int main(int, char **) {
                 uint64_t renderLoops=0,uploadCount=0,slowLoops=0;
                 uint64_t presentSkippedFrames=0,gpuSubmitCalls=0,sdlPresentCalls=0;
                 uint64_t gpuSubmittedFrames=0,sdlPresentedFrames=0;
+                bool firstVideoSubmitLogged=false;
                 uint64_t lastNewPresentAt=0,presentGapCount=0,presentGapGt17=0,presentGapGt25=0,presentGapGt33=0,presentGapGt50=0;
                 double presentGapSumMs=0,presentGapMaxMs=0;
                 uint64_t lastDecoded=0,lastPublished=0,lastSelected=0,lastEmpty=0,lastNoReady=0,lastFuture=0;
                 uint64_t lastSelectedAgeTotal=0,lastSelectedAgeSamples=0;
                 uint64_t lastBreakdownSamples=0,lastDecodeToQueueTotal=0,lastQueueWaitTotal=0,lastStatsEpoch=0;
                 uu::StreamStatsSnapshot panelStats; Uint32 panelStatsAt=0;
+                NetworkInfoLayout networkInfoLayout;
                 SDL_Texture *video = nullptr;
                 std::string qrUrl;
                 std::unique_ptr<qrcodegen::QrCode> qr;
@@ -679,6 +719,7 @@ int main(int, char **) {
                 bool previousMultitouch=liveUi.multitouch();
                 // Restore a validated local session first; scan only when absent/revoked.
                 client.command("startup");
+                uu::Snapshot state;
                 while (running) {
                     const auto loopStarted=SDL_GetPerformanceCounter();
 #ifdef __SWITCH__
@@ -688,12 +729,26 @@ int main(int, char **) {
                     Uint32 now = SDL_GetTicks();
                     float dt = std::min((now - previous) / 1000.f, .05f);
                     previous = now;
-                    auto state = client.snapshot();
+                    client.refreshSnapshot(state);
+                    {
+                        bool rumbleAllowed=state.streaming && liveUi.gamepadMode() && !liveUi.captures() &&
+                                           uu::vibration::strength()>0;
+#ifdef __SWITCH__
+                        rumbleAllowed=rumbleAllowed && appletGetFocusState()==AppletFocusState_InFocus;
+                        uu::vibration::tick(uu::monotonicMs(),padGetStyleSet(&pad),rumbleAllowed,0);
+                        uu::vibration::tick(uu::monotonicMs(),padGetStyleSet(&secondPad),rumbleAllowed,1);
+#else
+                        (void)rumbleAllowed;
+#endif
+                        if(vibrationStreaming && !state.streaming)uu::vibration::endSession();
+                        vibrationStreaming=state.streaming;
+                    }
                     const auto mediaEpoch=media->generation();
                     if(mediaEpoch!=nativeOutputEpoch) {
                         // The media reset is the authoritative session boundary;
                         // a fast reconnect can skip an observed streaming=false.
                         nativeOutputEpoch=mediaEpoch;
+                        uu::vibration::endSession();
                         media->setNativeOutput(uu::display::active());
                         nativeImportFailures=0;nativeFallback=false;nativeOversizeNotice=false;
                         lastVideoFormat=0;lastVideoHardware=false;
@@ -704,6 +759,7 @@ int main(int, char **) {
                         presentGapGt33=0;presentGapGt50=0;presentGapSumMs=0;presentGapMaxMs=0;
                         presentSkippedFrames=gpuSubmitCalls=sdlPresentCalls=0;
                         gpuSubmittedFrames=sdlPresentedFrames=0;
+                        firstVideoSubmitLogged=false;
                         slotWaitMaxUs=acquireMaxUs=submitMaxUs=presentImageMaxUs=0;
                         uu::display::resetVideo();
                         if(video) {uu::display::destroyTexture(video);video=nullptr;}
@@ -713,14 +769,21 @@ int main(int, char **) {
                         uu::diagnostic(uu::display::active()?"display-native-policy-session-restored-on":
                                                             "display-native-policy-session-restored-off");
                     }
-                    liveUi.sync(state);
+                    if(!state.qualityPending && failedVsync!=state.vsync){
+                        failedVsync.reset();
+                        if(actualVsync!=state.vsync){
+                            if(uu::display::vsync(renderer,state.vsync?1:0)==0)actualVsync=state.vsync;
+                            else failedVsync=state.vsync;
+                        }
+                    }
+                    liveUi.sync(state,failedVsync.has_value());
+#ifndef UU_LEAN_STATS
                     syncMaxUs=std::max(syncMaxUs,(SDL_GetPerformanceCounter()-loopStarted)*counterToUs);
-                    if(!state.qualityPending && actualVsync!=state.vsync && uu::display::vsync(renderer,state.vsync?1:0)==0)
-                        actualVsync=state.vsync;
+#endif
                     selected = std::clamp(selected, 0, std::max(0, int(state.devices.size()) - 1));
                     Controls c;
                     SDL_Event event;
-                    const auto pollStarted=SDL_GetPerformanceCounter();
+                    const auto pollStarted=profilingTick();
                     while (SDL_PollEvent(&event)) {
                         if (event.type == SDL_QUIT)
                             running = false;
@@ -728,7 +791,7 @@ int main(int, char **) {
                         if (event.type == SDL_WINDOWEVENT &&
                             event.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                             client.command("release");
-                            streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;homePlusPending=false;
+                            streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);for(auto &remote:remotePads){remote.plus={};}homePlusPending=false;
                         }
                         if (event.type == SDL_KEYDOWN && !event.key.repeat) {
                             auto k = event.key.keysym.sym;
@@ -765,17 +828,46 @@ int main(int, char **) {
 #endif
                     }
 #ifdef __SWITCH__
-                    padUpdate(&pad);
-                    uint64_t pressed = padGetButtonsDown(&pad);
-                    c.held = padGetButtons(&pad);
-                    const bool minusHeld=(c.held&HidNpadButton_Minus)!=0;selectPulse=false;
-                    if(state.streaming && !liveUi.active()){
-                        if(pressed&HidNpadButton_Minus){minusPending=true;minusAt=now;}
-                        if(minusPending && minusHeld && now-minusAt>=650){liveUi.toggleInputMode();minusPending=false;plusPending=startPulse=false;}
-                        if(minusPending && !minusHeld){selectPulse=true;minusPending=false;}
-                        c.held&=~uint64_t(HidNpadButton_Minus);
-                        if(selectPulse && !liveUi.gamepadMode())c.held|=HidNpadButton_Minus;
-                    }else minusPending=false;
+                    // Prefer the assigned external player 1. Handheld is the
+                    // fallback, so Lite controls cannot merge into a single Joy-Con.
+                    padUpdate(&externalPad);padUpdate(&handheldPad);
+                    pad=padIsConnected(&externalPad)?externalPad:handheldPad;
+                    padUpdate(&secondPad);
+                    std::array<PadState*,2> devices{{&pad,&secondPad}};
+                    std::array<uu::PadSample,2> samples;
+                    std::array<uu::PadLayout,2> layouts;
+                    std::array<bool,2> starts{};
+                    std::array<std::string,2> names;
+                    std::array<bool,2> controllerConnected{},controllerFixedSwitch{};uint64_t menuDirections=0;
+                    uint64_t physicalHeld=0;
+                    for(int i=0;i<2;++i){
+                        const auto style=padGetStyleSet(devices[i]);
+                        layouts[i]=(style&HidNpadStyleTag_NpadJoyLeft)?uu::PadLayout::LeftJoy:
+                            (style&HidNpadStyleTag_NpadJoyRight)?uu::PadLayout::RightJoy:uu::PadLayout::Full;
+                        const auto left=padGetStickPos(devices[i],0),right=padGetStickPos(devices[i],1);
+                        const auto held=padGetButtons(devices[i]);
+                        physicalHeld|=held & ~uint64_t(0xff0000); // stick pseudo-buttons are not held keys.
+                        samples[i]=uu::normalizePad({held,left.x,left.y,right.x,right.y},layouts[i]);
+                        const bool single=layouts[i]!=uu::PadLayout::Full;
+                        controllerConnected[i]=padIsConnected(devices[i]);
+                        controllerFixedSwitch[i]=(style&(HidNpadStyleTag_NpadHandheld|HidNpadStyleTag_NpadJoyDual|HidNpadStyleTag_NpadJoyLeft|HidNpadStyleTag_NpadJoyRight))!=0;
+                        menuDirections|=remotePads[i].navigation.update(samples[i],liveUi.active());
+                        names[i]=!padIsConnected(devices[i])?"未连接":single?
+                            (layouts[i]==uu::PadLayout::LeftJoy?"左 Joy-Con":"右 Joy-Con"):
+                            padIsHandheld(devices[i])?"掌机手柄":(style&HidNpadStyleTag_NpadJoyDual)?"双 Joy-Con":"完整手柄";
+                        const auto down=uu::normalizePad({padGetButtonsDown(devices[i]),0,0,0,0},layouts[i]).held;
+                        const bool shortcuts=state.streaming && (liveUi.active() || !liveUi.captures());
+                        const int plus=remotePads[i].plus.update(samples[i].held,down,shortcuts);
+                        if(plus==2)c.help=true;
+                        starts[i]=plus==1;
+                        if(state.streaming)samples[i].held&=~uint64_t(HidNpadButton_Plus);
+                    }
+                    liveUi.controllers(std::move(names),layouts,controllerConnected,controllerFixedSwitch);
+                    const auto normalizedDown=uu::normalizePad({padGetButtonsDown(&pad),0,0,0,0},layouts[0]);
+                    uint64_t pressed=normalizedDown.held|menuDirections;
+                    if(liveUi.active())pressed|=uu::normalizePad({padGetButtonsDown(&secondPad),0,0,0,0},layouts[1]).held;
+                    c.held=samples[0].held;
+
                     c.confirm |= pressed & HidNpadButton_A;
                     c.back |= pressed & HidNpadButton_B;
                     c.refresh |= pressed & HidNpadButton_Y;
@@ -796,19 +888,13 @@ int main(int, char **) {
                             break;
                         }
                     } else homePlusPending=false;
-                    if(!homeExitAllowed && !liveUi.gamepadMode())c.help |= pressed & HidNpadButton_Plus;
-                    else if(state.streaming){
-                        if(pressed&HidNpadButton_Plus){plusPending=true;plusAt=now;}
-                        if(plusPending && (c.held&HidNpadButton_Plus) && now-plusAt>=600){c.help=true;plusPending=false;}
-                        if(plusPending && !(c.held&HidNpadButton_Plus)){startPulse=true;plusPending=false;}
-                    }
                     // R3 belongs to the active keyboard mapping; network details are in More.
                     if(!liveUi.gamepadMode())c.keyboard |= pressed & HidNpadButton_StickL;
                     // Minus is mapped to a remote key; disconnect is confirmed in the toolbar.
                     c.exit |= !state.authenticated && !state.streaming && (pressed & HidNpadButton_Plus);
-                    auto stick = padGetStickPos(&pad, 0), right = padGetStickPos(&pad, 1);
+                    const auto stick=HidAnalogStickState{samples[0].lx,samples[0].ly},right=HidAnalogStickState{samples[0].rx,samples[0].ry};
                     auto axis = [](int v) {
-                        float n = v / 32767.f;
+                        float n = std::clamp(v / 32767.f,-1.f,1.f);
                         return std::abs(n) > .15f ? std::copysign((std::abs(n) - .15f) / .85f, n) : 0.f;
                     };
                     c.mx = liveUi.mapping()==1?axis(stick.x):axis(right.x);
@@ -827,12 +913,26 @@ int main(int, char **) {
                     if(state.authenticated){
                         tvui::LiveInput input;input.confirm=c.confirm;input.cancel=c.back;input.up=c.up;input.down=c.down;input.left=c.left;input.right=c.right;
                         input.toolbar=c.help;input.network=c.stats;input.qualityMenu=c.quality;input.keyboard=c.keyboard;input.disconnect=c.disconnect;input.held=c.held;
+#ifdef __SWITCH__
+                        input.held=physicalHeld;
+#endif
                         captureMenuInput=liveUi.input(input,state,menuTouchHeld);
                         if(captureMenuInput){c.confirm=c.back=c.refresh=c.logout=c.up=c.down=c.help=c.stats=c.quality=c.keyboard=c.disconnect=false;c.mx=c.my=c.scroll=0;c.held=0;}
+#ifdef __SWITCH__
+                        if(liveUi.takeControllerSetup()){
+                            client.command("release");uu::vibration::stop();
+                            HidLaControllerSupportArg arg;hidLaCreateControllerSupportArg(&arg);
+                            arg.hdr.player_count_min=1;arg.hdr.player_count_max=2;arg.hdr.enable_single_mode=0;
+                            const Result setup=hidLaShowControllerSupport(nullptr,&arg);
+                            uu::diagnostic(R_SUCCEEDED(setup)?"controller-setup-returned":"controller-setup-cancelled-or-failed");
+                            previous=SDL_GetTicks();continue;
+                        }
+#endif
                         std::string draft;
                         if(liveUi.takeKeyboardEdit(draft)){
                             streamTouch.cancel(send);nativeTouch.cancel(send);phoneMouse.cancel(send);
                             client.command("release");
+                            uu::vibration::stop();
 #ifdef __SWITCH__
                             liveUi.finishKeyboardEdit(textInput(draft));
 #else
@@ -854,24 +954,27 @@ int main(int, char **) {
                         }
                         if(liveUi.gamepadMode()) {
 #ifdef __SWITCH__
-                            if(!nativePadRequested){send({{"action","gpd_connect"},{"index",0}});nativePadRequested=true;lastNativePad.clear();}
-                            uint32_t mask=0;
-                            const auto physical=captureMenuInput?uint64_t(0):c.held;
-                            for(auto [button,bit]:std::initializer_list<std::pair<uint64_t,uint32_t>>{
-                                {HidNpadButton_Up,1},{HidNpadButton_Down,2},{HidNpadButton_Left,4},{HidNpadButton_Right,8},
-                                {HidNpadButton_StickL,64},{HidNpadButton_StickR,128},
-                                {HidNpadButton_L,256},{HidNpadButton_R,512},
-                                {HidNpadButton_B,liveUi.xboxByLetter()?8192:4096},{HidNpadButton_A,liveUi.xboxByLetter()?4096:8192},{HidNpadButton_Y,liveUi.xboxByLetter()?32768:16384},{HidNpadButton_X,liveUi.xboxByLetter()?16384:32768}})if(physical&button)mask|=bit;
-                            if(startPulse && !captureMenuInput)mask|=16;
-                            if(selectPulse && !captureMenuInput)mask|=32;
-                            auto nativeAxis=[&](int v){return captureMenuInput?0:int(std::round(axis(v)*32767));};
-                            const auto packet=padPacket(mask,nativeAxis(stick.x),nativeAxis(stick.y),nativeAxis(right.x),nativeAxis(right.y),physical&HidNpadButton_ZL?255:0,physical&HidNpadButton_ZR?255:0);
-                            const auto encoded=packet.dump();
-                            if(encoded!=lastNativePad || now-nativePadSentAt>=500){send(packet);lastNativePad=encoded;nativePadSentAt=now;}
-                            startPulse=false;
+                            for(int i=0;i<2;++i){
+                                auto &remote=remotePads[i];
+                                if(!padIsConnected(devices[i])){
+                                    if(remote.requested){send(padPacket(i,0,0,0,0,0,0,0));send({{"action","gpd_disconnect"},{"index",i}});remote={};}
+                                    continue;
+                                }
+                                if(!remote.requested){send({{"action","gpd_connect"},{"index",i}});remote.requested=true;remote.last.clear();}
+                                auto physical=captureMenuInput?uint64_t(0):samples[i].held;
+                                if(starts[i] && !captureMenuInput)physical|=HidNpadButton_Plus;
+
+                                const auto mapped=uu::xboxButtons(physical,liveUi.remoteSwitchHabit(i),layouts[i]);
+                                auto nativeAxis=[&](int v){return captureMenuInput?0:int(std::round(axis(v)*32767));};
+                                const auto packet=padPacket(i,mapped.buttons,nativeAxis(samples[i].lx),nativeAxis(samples[i].ly),nativeAxis(samples[i].rx),nativeAxis(samples[i].ry),mapped.leftTrigger,mapped.rightTrigger);
+                                const auto encoded=packet.dump();
+                                if(encoded!=remote.last || now-remote.sentAt>=500){send(packet);remote.last=encoded;remote.sentAt=now;}
+                            }
 #endif
                             c.held=0;c.mx=c.my=c.scroll=0;
-                        }else if(nativePadRequested){send(padPacket(0,0,0,0,0,0,0));send({{"action","gpd_disconnect"},{"index",0}});nativePadRequested=false;}
+                        }else for(int i=0;i<2;++i)if(remotePads[i].requested){
+                            send(padPacket(i,0,0,0,0,0,0,0));send({{"action","gpd_disconnect"},{"index",i}});remotePads[i]={};
+                        }
                         cursorX = std::clamp(cursorX + c.mx * dt * liveUi.pointerSpeed(), 0.f, 1.f);
                         cursorY = std::clamp(cursorY + c.my * dt * liveUi.pointerSpeed(), 0.f, 1.f);
                         if ((c.mx || c.my) && now - lastPointer >= 16) {
@@ -906,8 +1009,7 @@ int main(int, char **) {
                         if(liveUi.mapping()==1 && !liveUi.gamepadMode() && !captureNetworkInput){
                             arrowMask=(axis(right.x)<-.5f?1u:0u)|(axis(right.x)>.5f?2u:0u)|(axis(right.y)>.5f?4u:0u)|(axis(right.y)<-.5f?8u:0u);
                             if((c.held&HidNpadButton_StickR) && !(lastHeld&HidNpadButton_StickR)){
-                                send({{"action","kbd_press"},{"key",91}});send({{"action","kbd_press"},{"key",68}});
-                                send({{"action","kbd_release"},{"key",68}});send({{"action","kbd_release"},{"key",91}});
+                                send({{"action","kbd_chord"},{"keys",{91,68}}});
                             }
                         }
                         const int arrowKeys[]={37,39,38,40};
@@ -940,10 +1042,10 @@ int main(int, char **) {
                         }
 #endif
                     } else {
-                        nativePadRequested=false;lastNativePad.clear();plusPending=startPulse=false;
+                        for(auto &remote:remotePads)remote={};
                         if (wasStreaming) {
                             nativeTouch.forgetPointer();phoneMouse.forgetPointer();
-                            streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);phoneMouse.cancel(send);minusPending=false;
+                            streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);phoneMouse.cancel(send);for(auto &remote:remotePads){remote.plus={};}
                             uu::display::resetVideo();
                             if (video) {
                                 uu::display::destroyTexture(video);
@@ -1022,10 +1124,11 @@ int main(int, char **) {
                             }
                         }
                     }
-                    pollMaxUs=std::max(pollMaxUs,(SDL_GetPerformanceCounter()-pollStarted)*counterToUs);
+                    pollMaxUs=std::max(pollMaxUs,(profilingTick()-pollStarted)*counterToUs);
                     lastHeld = c.held;
                     if(state.streaming && !wasStreaming) streamingSince=SDL_GetTicks();
                     if(!state.streaming) streamingSince=0;
+                    if(!state.streaming || !wasStreaming || !persistentNetwork || liveUi.active())networkInfoLayout.valid=false;
                     wasStreaming = state.streaming;
                     color(renderer, {13, 19, 25, 255});
                     uu::display::clear(renderer);
@@ -1039,9 +1142,9 @@ int main(int, char **) {
                         // refresh lookahead. Keep one presentation policy.
                         const int leadMs=0;
                         leadSumMs+=leadMs;++leadSamples;
-                        const auto pictureStarted=SDL_GetPerformanceCounter();
+                        const auto pictureStarted=profilingTick();
                         auto p = media->picture(serial);
-                        pictureMaxUs=std::max(pictureMaxUs,(SDL_GetPerformanceCounter()-pictureStarted)*counterToUs);
+                        pictureMaxUs=std::max(pictureMaxUs,(profilingTick()-pictureStarted)*counterToUs);
                         if(p.serial) {
                             // An empty poll must not erase the last real frame's
                             // display format or turn it into a false CPU report.
@@ -1049,9 +1152,9 @@ int main(int, char **) {
                             lastVideoHardware=p.hardwareFrame!=nullptr;
                         }
                         if(p.serial>serial && uu::display::active()) {
-                            const auto started=SDL_GetPerformanceCounter();
+                            const auto started=profilingTick();
                             const bool accepted=uu::display::acceptVideo(p);
-                            acceptMaxUs=std::max(acceptMaxUs,(SDL_GetPerformanceCounter()-started)*counterToUs);
+                            acceptMaxUs=std::max(acceptMaxUs,(profilingTick()-started)*counterToUs);
                             bool consume=true;
                             if(accepted) {
                                 nativeImportFailures=0;nativeOversizeNotice=false;
@@ -1086,7 +1189,7 @@ int main(int, char **) {
                                     consume=false;
                                 }
                             }
-                            frameUploadUs=(SDL_GetPerformanceCounter()-started)*counterToUs;uploadUs+=frameUploadUs;
+                            frameUploadUs=(profilingTick()-started)*counterToUs;uploadUs+=frameUploadUs;
                             if(consume) {
                                 serial=p.serial;texFormat=p.pixelFormat;
                                 const float scale=std::min(1280.f/p.width,720.f/p.height);
@@ -1113,7 +1216,7 @@ int main(int, char **) {
                                 texW = p.width;
                                 texH = p.height;
                             }
-                            const auto uploadStarted=SDL_GetPerformanceCounter();
+                            const auto uploadStarted=profilingTick();
                             int uploadResult=-1;
                             if(video && p.pixels) {
                                 if(p.pixelFormat==SDL_PIXELFORMAT_NV12) {
@@ -1133,10 +1236,10 @@ int main(int, char **) {
                                 media->setYuvOutput(false);
                                 uu::diagnostic("display-nv12-update-failed-rgba-fallback");
                             }
-                            frameUploadUs=(SDL_GetPerformanceCounter()-uploadStarted)*counterToUs;
+                            frameUploadUs=(profilingTick()-uploadStarted)*counterToUs;
                             uploadUs+=frameUploadUs;
                         }
-                        const auto drawStarted=SDL_GetPerformanceCounter();
+                        const auto drawStarted=profilingTick();
                         const auto touchView=streamTouch.view(viewport);
                         if(uu::display::active()) uu::display::drawVideo(touchView);
                         else if (video)
@@ -1146,11 +1249,13 @@ int main(int, char **) {
 
                         if (overlay) {
                             std::string hints = liveUi.gamepadMode()
-                                ? "手柄直连  ·  长按 − 切换模式  ·  长按 + 打开菜单"
+                                ? "手柄直连  ·  L + ＋ 打开菜单  ·  外设中切换输入模式"
                                 : liveUi.mapping()==1
                                     ? "左摇杆 鼠标  ·  Y/X 左右键  ·  B 回车  ·  A Esc"
                                     : "右摇杆 鼠标  ·  ZR/ZL 左右键  ·  B 回车  ·  A Esc";
 #ifdef __SWITCH__
+                            if(layouts[0]!=uu::PadLayout::Full)
+                                hints="单 Joy-Con 横握  ·  SL/SR 肩键  ·  右手柄 SL + ＋ 打开菜单";
                             if (appletGetOperationMode() == AppletOperationMode_Console)
                                 hints += "  ·  TV 模式触屏不可用";
 #endif
@@ -1158,8 +1263,12 @@ int main(int, char **) {
                             text(renderer, fonts.normal, "YOUYOU远程", 28, 18);
                             text(renderer, fonts.small, hints, 200, 24, muted);
                             rect(renderer, 0, 650, 1280, 70, {13, 19, 25, 225});
-                            text(renderer, fonts.small, liveUi.gamepadMode()
-                                 ? "按 + 游戏菜单  ·  长按 + 本地菜单  ·  长按 − 切换模式"
+                            text(renderer, fonts.small,
+#ifdef __SWITCH__
+                                 layouts[0]!=uu::PadLayout::Full?"输入模式请在本地菜单中切换  ·  SL/SR 对应肩键":
+#endif
+                                 liveUi.gamepadMode()
+                                 ? "单按 ＋ 游戏菜单  ·  L + ＋ 本地菜单"
                                  : liveUi.mapping()==1
                                      ? "方向键 Ctrl/Shift/退格/Delete  ·  L3 键盘  ·  短按 − Windows"
                                      : "方向键 上/下/左/右  ·  Y 空格  ·  X 退格  ·  L3 键盘  ·  短按 − Tab",
@@ -1175,16 +1284,21 @@ int main(int, char **) {
                         }
                         if (liveUi.active() || persistentNetwork) {
                             const auto now=SDL_GetTicks();
-                            if(!panelStatsAt || Uint32(now-panelStatsAt)>=250) {
+#ifdef UU_LEAN_STATS
+                            constexpr Uint32 panelSampleMs=1000;
+#else
+                            constexpr Uint32 panelSampleMs=250;
+#endif
+                            if(!panelStatsAt || Uint32(now-panelStatsAt)>=panelSampleMs) {
                                 panelStats=client.streamStats();panelStats.presentFps=presentFps;panelStatsAt=now;
                             }
                             if(persistentNetwork && !liveUi.active())compactNetworkInfo(renderer,fonts.hint,panelStats,
-                                streamingSince?Uint32((now-streamingSince)/1000):0U);
+                                streamingSince?Uint32((now-streamingSince)/1000):0U,panelStatsAt,networkInfoLayout);
                         }
                         if(!liveUi.multitouch() && !liveUi.captures())
                             phoneMouse.draw(renderer,fonts);
                         liveUi.draw(renderer,fonts,state,panelStats);
-                        drawMaxUs=std::max(drawMaxUs,(SDL_GetPerformanceCounter()-drawStarted)*counterToUs);
+                        drawMaxUs=std::max(drawMaxUs,(profilingTick()-drawStarted)*counterToUs);
                     } else {
                         if(state.authenticated)liveUi.draw(renderer,fonts,state,panelStats);
                         else {
@@ -1299,7 +1413,7 @@ int main(int, char **) {
 #endif
                     }
                     }
-                    const auto presentStarted=SDL_GetPerformanceCounter();
+                    const auto presentStarted=profilingTick();
                     const auto presentResult=uu::display::present(renderer);
                     if(state.streaming) {
                         slotWaitMaxUs=std::max(slotWaitMaxUs,double(presentResult.slotWaitUs));
@@ -1366,17 +1480,29 @@ int main(int, char **) {
                     // preset that only acts as a cap is distinguishable from
                     // a request that never reached the sender.
                     static Uint32 lastRateLogSample=0;
-                    if(state.streaming && (!lastRateLogSample || presentedAt-lastRateLogSample>=5000)){
+#ifdef UU_LEAN_STATS
+                    constexpr Uint32 rateLogMs=10000;
+#else
+                    constexpr Uint32 rateLogMs=5000;
+#endif
+                    if(state.streaming && (!lastRateLogSample || presentedAt-lastRateLogSample>=rateLogMs)){
                         const auto rate=client.streamStats();
-                        char rateLine[192];
+                        // actual-mbps is the computer's measured RTP output.
+                        // feedback/remb-local report only local media-handler
+                        // acceptance of the compound SRTCP submission; neither
+                        // proves the PC applied the REMB target.
+                        char rateLine[512];
                         std::snprintf(rateLine,sizeof rateLine,
-                            "stream-rate actual-mbps=%.3f target-mbps=%d loss=%.2f nack=%llu rtx=%llu feedback=%d",
-                            rate.video.bitrateMbps,rate.maxBitrateMbps,rate.video.lossPercent,
+                            "stream-rate actual-mbps=%.3f target-mbps=%d initial-gap-pct=%.2f nack=%llu rtx=%llu feedback=%d remb-target-bps=%u remb-sender-ssrc=%u remb-media-ssrc=%u remb-accepted=%llu remb-deferred=%llu",
+                            rate.video.bitrateMbps,rate.maxBitrateMbps,rate.video.initialGapPercent,
                             (unsigned long long)rate.nackSent,(unsigned long long)rate.rtxRecovered,
-                            rate.bitrateFeedbackSent?1:0);
+                            rate.bitrateFeedbackSent?1:0,rate.rembTargetBps,rate.rembSenderSsrc,
+                            rate.rembMediaSsrc,(unsigned long long)rate.rembAcceptedCount,
+                            (unsigned long long)rate.rembDeferredCount);
                         uu::diagnostic(rateLine);
+#ifndef UU_LEAN_STATS
                         const auto effective=media->stats();
-                        char effectiveLine[512];
+                        char effectiveLine[768];
                         std::snprintf(effectiveLine,sizeof effectiveLine,
                             "effective-state target-fps=%d applied-fps-%d actual-fps-%.1f target-quality-%d applied-quality-%d target-media-%dx%d actual-media-%dx%d decode-ms-%.2f hw-%d fallback-%d applied-valid-%d applied-fps-known-%d applied-quality-known-%d applied-size-known-%d setting-apply-pending-%d setting-accepted-%d setting-applied-%d setting-rejected-%d setting-error-%d setting-source-%s",
                             state.fps,state.appliedFps,effective.fps,state.quality,state.appliedQuality,
@@ -1389,14 +1515,18 @@ int main(int, char **) {
                             state.settingSource.empty()?"none":state.settingSource.c_str());
                         uu::diagnostic(effectiveLine);
                         std::snprintf(effectiveLine,sizeof effectiveLine,
-                            "encoder-bitrate-status target-bps=%llu host-known=%d host-mbps=%d actual-mbps=%.3f ack=%d apply-pending=%d applied=%d source=%s",
+                            "encoder-bitrate-status target-bps=%llu host-known=%d host-mbps=%d actual-mbps=%.3f ack=%d apply-pending=%d applied=%d source=%s remb-local=%d remb-target-bps=%u remb-sender-ssrc=%u remb-media-ssrc=%u",
                             (unsigned long long)(state.quality==6?uint64_t(state.maxBitrateMbps)*1000000u:0),
                             state.appliedBitrateKnown?1:0,state.appliedBitrateMbps,
                             rate.video.bitrateMbps,state.settingAccepted?1:0,state.settingApplyPending?1:0,
-                            state.settingApplied?1:0,state.settingSource.empty()?"none":state.settingSource.c_str());
+                            state.settingApplied?1:0,state.settingSource.empty()?"none":state.settingSource.c_str(),
+                            rate.bitrateFeedbackSent?1:0,rate.rembTargetBps,rate.rembSenderSsrc,
+                            rate.rembMediaSsrc);
                         uu::diagnostic(effectiveLine);
+#endif
                         lastRateLogSample=presentedAt;
                     }
+#ifndef UU_LEAN_STATS
                     const double telemetryWorkUs=(presentStarted-loopStarted)*counterToUs;
                     const double telemetryPresentUs=(presentFinished-presentStarted)*counterToUs;
                     const double telemetryLoopUs=(presentFinished-loopStarted)*counterToUs;
@@ -1417,6 +1547,7 @@ int main(int, char **) {
                         cpuLedgerMaxUs=std::max(cpuLedgerMaxUs,(SDL_GetPerformanceCounter()-ledgerStarted)*counterToUs);
                         lastCpuLedgerSample=presentedAt;
                     }
+#endif
                     if (state.streaming) {
                         const auto workUs=(presentStarted-loopStarted)*counterToUs;
                         cpuUs+=workUs;presentUs+=(presentFinished-presentStarted)*counterToUs;
@@ -1426,6 +1557,10 @@ int main(int, char **) {
                         if(gpuSubmittedNewFrame) ++gpuSubmittedFrames;
                         if(sdlPresentedNewFrame) ++sdlPresentedFrames;
                         if (submittedNewFrame) ++presentedFrames;
+                        if(submittedNewFrame && !firstVideoSubmitLogged) {
+                            firstVideoSubmitLogged=true;
+                            uu::diagnostic("display-first-video-submit");
+                        }
                         if(submittedNewFrame) {
                             if(lastNewPresentAt) {
                                 const double gapMs=(presentFinished-lastNewPresentAt)*counterToUs/1000.0;
@@ -1442,6 +1577,13 @@ int main(int, char **) {
                         if(elapsed>=2000) {
                             presentFps=double(presentedFrames)*1000/elapsed;
                             char timing[640];
+#ifdef UU_LEAN_STATS
+                            std::snprintf(timing,sizeof timing,
+                                "perf-window-ms-%u-fps-%.2f-frames-%llu-gap-max-ms-%.2f-gt50-%llu",
+                                unsigned(elapsed),presentFps,(unsigned long long)presentedFrames,
+                                presentGapMaxMs,(unsigned long long)presentGapGt50);
+                            uu::diagnostic(timing);
+#else
                             std::snprintf(timing,sizeof timing,
                                 "render-window-loops-%llu-uploads-%llu-panel-%d-cpu-avg-us-%.0f-cpu-max-us-%.0f-upload-avg-us-%.0f-present-avg-us-%.0f-over25ms-%llu",
                                 static_cast<unsigned long long>(renderLoops),static_cast<unsigned long long>(uploadCount),int(statsVisible),
@@ -1529,13 +1671,16 @@ int main(int, char **) {
                                 (unsigned long long)sdlPresentCalls,
                                 (unsigned long long)presentSkippedFrames,unsigned(elapsed));
                             uu::diagnostic(timing);
+#endif
                             leadSumMs=0;leadSamples=0;
                             cpuUs=uploadUs=presentUs=maxCpuUs=0;renderLoops=uploadCount=slowLoops=0;
                             presentSkippedFrames=gpuSubmitCalls=sdlPresentCalls=0;
                             gpuSubmittedFrames=sdlPresentedFrames=0;
                             slotWaitMaxUs=acquireMaxUs=submitMaxUs=presentImageMaxUs=0;
                             presentedFrames=0;presentWindow=presentedAt;
-                            lastNewPresentAt=0;presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;
+                            // A report boundary is not a new stream. Keep the previous
+                            // submission so the next window includes cross-window gaps.
+                            presentGapCount=presentGapGt17=presentGapGt25=presentGapGt33=presentGapGt50=0;
                             presentGapSumMs=presentGapMaxMs=0;
                             syncMaxUs=pollMaxUs=pictureMaxUs=acceptMaxUs=drawMaxUs=presentMaxUs=cpuLedgerMaxUs=0;
                         }
@@ -1555,6 +1700,7 @@ int main(int, char **) {
                     uu::display::destroyTexture(video);
             }
             const auto shutdownStarted=SDL_GetTicks();
+            uu::vibration::shutdown();
             rtc::Cleanup().wait();
             uu::waitBackgroundTasks();
             media.reset();
@@ -1565,12 +1711,16 @@ int main(int, char **) {
             uu::diagnostic(("shutdown-cleanup-ms-"+std::to_string(SDL_GetTicks()-shutdownStarted)).c_str());
         }
         curl_global_cleanup();
+#ifdef __SWITCH__
+        uu::reportThreadAffinity("exit");
+#endif
         uu::flushDiagnosticsLog();
         TTF_Quit();
         SDL_Quit();
     } catch (const std::exception &e) {
         result = 1;
         uu::diagnosticException("main-exception", std::current_exception());
+        uu::vibration::shutdown();
         try {
             rtc::Cleanup().wait();
             uu::waitBackgroundTasks();
