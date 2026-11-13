@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- [0.4beta](v0.4beta.md)：已检阅的源码更新说明，Release 附件另行发布。
+- [0.4beta](v0.4beta.md)：公开预发布测试版；[下载附件](https://github.com/doke69/YOUYOU-Remote-ns/releases/tag/v0.4beta)。
 
 ## 已发布与历史版本
 

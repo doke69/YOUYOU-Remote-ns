@@ -10,7 +10,7 @@
 
 [安装使用](#安装使用) · [按键操作](#按键操作) · [当前限制](#当前限制) · [源码构建](#源码构建) · [文档导航](docs/README.md) · [更新记录](CHANGELOG.md)
 
-> **当前源码版本：0.4beta（内部版本 0.4.0）。** 本版整合 R67 性能优化、TV 反馈适配、两路手柄与外设界面，以及连接、断开、屏幕保护和指针修复。更新说明已检阅；NRO 发布附件另行提供。完整变化及验证边界见[更新说明](docs/releases/v0.4beta.md)。
+> **当前源码版本：0.4beta（内部版本 0.4.0）。** 本版整合 R67 性能优化、TV 反馈适配、两路手柄与外设界面，以及连接、断开、屏幕保护和指针修复。测试 NRO、源码快照、校验值和许可文件见 [0.4beta 预发布](https://github.com/doke69/YOUYOU-Remote-ns/releases/tag/v0.4beta)。完整变化及验证边界见[更新说明](docs/releases/v0.4beta.md)。
 
 ## 功能与验证状态
 
@@ -40,7 +40,7 @@
 准备可运行自制程序的 Switch、安装官方 UU远程并登录的电脑，以及用于扫码的手机。只连接你有权控制的电脑。
 
 1. **0.4beta 请全新安装。** 正常退出旧程序，将需要留存的旧文件夹备份到电脑，然后清空 SD 卡上的 `switch/UURemote-ns/` 文件夹全部内容。不要把旧配置、会话或其他旧文件复制回新目录。
-2. 查看 [Releases](https://github.com/doke69/YOUYOU-Remote-ns/releases) 是否已有 **0.4beta 对应附件**；若尚未提供，可按[源码构建说明](docs/build.md)自行构建。将对应版本 NRO 放入清空后的目录，得到 `switch/UURemote-ns/UURemote-ns.nro`。首次启动需重新登录并配置；旧版附件不代表本次源码。
+2. 从 [0.4beta 预发布](https://github.com/doke69/YOUYOU-Remote-ns/releases/tag/v0.4beta) 下载 `UURemote-ns.nro`，或按[源码构建说明](docs/build.md)自行构建。放入清空后的目录，得到 `switch/UURemote-ns/UURemote-ns.nro`。首次启动需重新登录并配置。下载后可用附件 `SHA256SUMS.txt` 核对文件。
 3. 在电脑上打开官方 UU远程，登录并保持在线。
 4. 在 Switch 使用 **完整应用模式**进入 sphaira / hbmenu，例如按住 **R** 启动游戏，再打开 YOUYOU远程；不要以相册小程序模式比较性能。
 5. 使用手机官方 App 扫码确认，或选择短信登录。已有有效会话时程序会尝试恢复登录。
