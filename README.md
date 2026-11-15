@@ -53,7 +53,7 @@ SD 卡根目录/
         └── UURemote-ns.nro
 ```
 
-完整流程、配置和故障排查见[使用手册](docs/user-guide.md)。
+完整流程、配置和故障排查见[使用手册](docs/user-guide.md)。遇到问题可使用[问题反馈表单](https://github.com/doke69/YOUYOU-Remote-ns/issues/new?template=bug_report.yml)，按提示填写版本、现象、复现步骤和脱敏日志。
 
 ## 按键操作
 

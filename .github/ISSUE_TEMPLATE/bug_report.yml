@@ -1,0 +1,85 @@
+name: 问题反馈
+description: 反馈连接、画面、声音、操作或设置方面的问题。
+title: "[问题反馈] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢帮助改进 YOUYOU远程！请尽量描述实际现象和操作过程，不确定的信息可写“不清楚”。
+        提交前可先搜索已有 Issue，避免遗漏同类问题的进展。
+        **Issue 为公开内容。** 日志、截图请先去除手机号、账号、设备标识、网络地址、二维码和凭据；不要上传整个程序文件夹，也不要上传 `session.json`、`client-id`、`telemetry.ini`、`signing.key` 或主机密钥。
+  - type: input
+    id: version
+    attributes:
+      label: YOUYOU远程版本
+      description: 填写首页显示的完整版本号；自行构建的版本请注明提交号，记不清请写“不清楚”。
+      placeholder: "例如：0.4beta（GitHub Release 下载）"
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Switch 型号
+      options:
+        - Switch 标准版
+        - Switch Lite
+        - Switch OLED
+        - 其他／不清楚
+    validations:
+      required: false
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？请写出提示文字、出现时机和发生频率；截图也可放在这里。
+      placeholder: "例如：第一次串流正常，断开后第二次连接一直停在建立音视频通道；每次都会出现。"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 按顺序写出操作；偶现或无法稳定复现时，请说明出问题前做了什么。
+      placeholder: |
+        1. 启动程序，选择……
+        2. 进入……，调整……
+        3. 执行……后出现问题
+        发生频率：每次／偶尔／只出现一次
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期表现
+      description: 你希望正常情况下如何工作？
+      placeholder: "例如：第二次连接也能正常出现画面和声音。"
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境与设置
+      description: 填写你知道的信息即可；不用提供账号、IP 地址或配对文件。
+      placeholder: |
+        电脑系统及官方 UU远程版本：
+        启动方式：完整应用模式／相册小程序模式／桌面入口／不清楚
+        网络：同一局域网／跨网络；Wi-Fi／有线
+        连接通道：P2P／TURN 中继／尚未连接／不清楚
+        编码、分辨率、帧率、画质档位：
+        垂直同步、播放缓冲：
+        是否使用 VPN／代理、是否开启隐私保护或关闭显示屏：
+        上个正常版本或已尝试的办法：
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志与补充材料
+      description: 可粘贴脱敏后的相关日志片段，或拖入日志／截图附件。没有日志也可以提交，请说明原因。
+      placeholder: |
+        正常退出程序后，在 SD:/switch/UURemote-ns/ 找到 connection.log。
+        如果本次失败发生在更早的记录中，也可补充相关的 connection.log.1 或 connection.log.2。
+        仅提供发生问题前后所需的内容，上传前去除账号、地址及其他敏感信息。
+        请注明问题发生的大致时间；没有日志时可写“未取得日志”。
+    validations:
+      required: false
